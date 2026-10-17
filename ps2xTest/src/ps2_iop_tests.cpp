@@ -84,7 +84,7 @@ void register_ps2_iop_tests()
             t.IsTrue(scmdResult.handled, "Scmd requests must be claimed by the cdvdman HLE");
             t.Equals(scmdResult.resultAddress, scmdRequest.receive.address,
                      "the reply must be delivered from the receive buffer");
-            t.IsTrue(host.word(0x800u) != 0u,
+            t.Equals(host.word(0x800u), 1u,
                      "Scmd 0x27 must report success in its first result word: SLUS_215.97's libcdvd "
                      "polls SifCallRpc(scmd, 0x27) in a loop that only exits on a nonzero first word");
 
