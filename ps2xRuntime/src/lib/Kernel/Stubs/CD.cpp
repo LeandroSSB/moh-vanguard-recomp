@@ -44,15 +44,32 @@ namespace ps2_stubs
         std::mutex g_cdCallbackMutex;
         uint32_t g_cdEventCallback = 0u;
 
-        void deliverCdEventCallbackCompletion(PS2Runtime *runtime, uint32_t result)
+        void deliverCdEventCallbackCompletion(PS2Runtime *runtime, R5900Context *ctx, uint32_t result)
         {
             uint32_t callback = 0u;
             {
                 std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
                 callback = g_cdEventCallback;
             }
-            if (runtime == nullptr || callback == 0u || !runtime->hasFunction(callback))
+            if (runtime == nullptr || callback == 0u)
             {
+                return;
+            }
+            if (!runtime->hasFunction(callback))
+            {
+                // The game registered a completion handler that is not a
+                // mapped function: the read finished but the event would be
+                // silently dropped. Log it (rate-limited) instead of losing
+                // the completion without a trace.
+                static uint32_t dropLogCount = 0u;
+                if (dropLogCount < 8u)
+                {
+                    RUNTIME_LOG("[cd] completion callback 0x" << std::hex << callback
+                                                              << " dropped: not a mapped function (pc=0x"
+                                                              << (ctx != nullptr ? ctx->pc : 0u)
+                                                              << std::dec << ")" << std::endl);
+                    ++dropLogCount;
+                }
                 return;
             }
 
@@ -60,6 +77,9 @@ namespace ps2_stubs
             invocation.kind = GuestInvocationKind::RpcCallback;
             invocation.context.pc = callback;
             SET_GPR_U32(&invocation.context, 4, result);
+            // $gp travels with the stub's calling context so callback code
+            // that addresses globals through it reads the game's data.
+            SET_GPR_U32(&invocation.context, 28, ctx != nullptr ? getRegU32(ctx, 28) : 0u);
             SET_GPR_U32(&invocation.context, 29, 0u); // the executor binds the invocation stack
             SET_GPR_U32(&invocation.context, 31, 0u); // returning from the handler ends the invocation
             runtime->eeScheduler().queueInvocation(std::move(invocation));
@@ -354,7 +374,7 @@ namespace ps2_stubs
             // drive-completion event to the registered handler so the game's
             // async pipeline advances. Queued here in stub context — sceCdRead
             // executes on the EE executor, which owns the invocation queue.
-            deliverCdEventCallbackCompletion(runtime, 1u);
+            deliverCdEventCallbackCompletion(runtime, ctx, 1u);
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }

@@ -173,10 +173,12 @@ namespace
     constexpr uint32_t kCdReadDriverPc = 0x00160600u;
     constexpr uint32_t kCdCompletionCallbackPc = 0x00160610u;
     constexpr uint32_t kCdReadBufAddr = GUEST_BUFFER_AREA_START + 0x1D80;
+    constexpr uint32_t kCdReadDriverGp = 0x00160620u;
 
     std::atomic<uint32_t> g_cdCompletionDeliveries{0u};
     std::vector<uint32_t> g_cdCompletionResults;
     std::vector<uint32_t> g_cdCompletionStacks;
+    std::vector<uint32_t> g_cdCompletionGps;
     int32_t g_cdDriverReadReturn = 0;
     bool g_cdPhaseSchedulerThrew = false;
 
@@ -200,6 +202,7 @@ namespace
         g_cdCompletionDeliveries.store(0u, std::memory_order_release);
         g_cdCompletionResults.clear();
         g_cdCompletionStacks.clear();
+        g_cdCompletionGps.clear();
         g_cdDriverReadReturn = 0;
         g_cdPhaseSchedulerThrew = false;
     }
@@ -212,6 +215,7 @@ namespace
         setRegU32(readCtx, 4, 0u);
         setRegU32(readCtx, 5, 1u);
         setRegU32(readCtx, 6, kCdReadBufAddr);
+        setRegU32(readCtx, 28, kCdReadDriverGp);
         ps2_stubs::sceCdRead(rdram, &readCtx, runtime);
         g_cdDriverReadReturn = getRegS32(&readCtx, 2);
         ctx->pc = 0u;
@@ -223,6 +227,7 @@ namespace
     {
         g_cdCompletionResults.push_back(getRegU32(ctx, 4));
         g_cdCompletionStacks.push_back(getRegU32(ctx, 29));
+        g_cdCompletionGps.push_back(getRegU32(ctx, 28));
         g_cdCompletionDeliveries.fetch_add(1u, std::memory_order_release);
         ctx->pc = 0u;
         runtime->requestStop();
@@ -931,6 +936,8 @@ void register_ps2_runtime_io_tests()
                      "the delivery should target the registered handler with result 1");
             t.IsTrue(g_cdCompletionStacks.size() == 1u && g_cdCompletionStacks.front() != 0u,
                      "the executor should bind the handler stack the stub left zero");
+            t.IsTrue(g_cdCompletionGps.size() == 1u && g_cdCompletionGps.front() == kCdReadDriverGp,
+                     "the delivered handler should see the sceCdRead caller's $gp");
 
             // Registering zero deregisters the handler; later reads deliver nothing.
             clearContext(test.ctx);
@@ -1022,6 +1029,7 @@ void register_ps2_runtime_io_tests()
             setRegU32(readCtx, 4, 0u);
             setRegU32(readCtx, 5, 1u);
             setRegU32(readCtx, 6, kCdReadBufAddr);
+            setRegU32(readCtx, 28, kCdReadDriverGp);
             ps2_stubs::sceCdRead(test.rdram.data(), &readCtx, &test.runtime);
 
             t.Equals(getRegS32(&readCtx, 2), 1, "sceCdRead should succeed on the executor-bound context");
@@ -1048,6 +1056,8 @@ void register_ps2_runtime_io_tests()
                      "exactly one completion should have been queued with result 1");
             t.IsTrue(g_cdCompletionStacks.size() == 1u && g_cdCompletionStacks.front() != 0u,
                      "the executor should bind the handler stack the stub left zero");
+            t.IsTrue(g_cdCompletionGps.size() == 1u && g_cdCompletionGps.front() == kCdReadDriverGp,
+                     "the completion should inherit the sceCdRead caller's $gp");
 
             ps2_stubs::resetCdEventCallbackState();
         });
