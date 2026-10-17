@@ -358,6 +358,7 @@ public:
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);
     static void configureIoPathsFromElf(const std::string &elfPath);
+    static void setCdImagePath(const std::string &imagePath);
 
     void SignalException(R5900Context *ctx, PS2Exception exception);
 

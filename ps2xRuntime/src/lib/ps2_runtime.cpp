@@ -1068,6 +1068,13 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     setIoPaths(paths);
 }
 
+void PS2Runtime::setCdImagePath(const std::string &imagePath)
+{
+    IoPaths paths = runtimeIoPaths();
+    paths.cdImage = normalizeAbsolutePath(std::filesystem::path(imagePath));
+    setIoPaths(paths);
+}
+
 namespace
 {
     bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)

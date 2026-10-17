@@ -742,5 +742,40 @@ void register_ps2_runtime_io_tests()
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,
                      "sceCdRead should copy sector data from the configured image");
         });
+
+        tc.Run("setCdImagePath enables raw LBN reads and preserves the other IoPaths", [](TestCase &t)
+        {
+            TestContext test;
+
+            constexpr uint32_t kSectorSize = 2048u;
+            constexpr uint32_t kProbeLbn = 5u;
+            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x1D00;
+            const std::filesystem::path imagePath = test.paths.base / "disc-setter.iso";
+            {
+                std::vector<uint8_t> image(kSectorSize * (kProbeLbn + 1u), 0);
+                const char payload[] = "cd-image-setter";
+                std::memcpy(image.data() + kSectorSize * kProbeLbn, payload, sizeof(payload) - 1);
+
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(image.data()),
+                          static_cast<std::streamsize>(image.size()));
+            }
+
+            PS2Runtime::setCdImagePath(imagePath.string());
+            t.Equals(PS2Runtime::getIoPaths().cdImage, imagePath,
+                     "setCdImagePath should publish the configured image path");
+            t.Equals(PS2Runtime::getIoPaths().cdRoot, std::filesystem::path(test.paths.cdRoot),
+                     "setCdImagePath must not disturb the extracted cdRoot");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kProbeLbn);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, bufAddr);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, nullptr);
+
+            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should resolve the probe LBN from the image");
+            t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image-setter", 15), 0,
+                     "sceCdRead should copy the probe sector payload");
+        });
     });
 }

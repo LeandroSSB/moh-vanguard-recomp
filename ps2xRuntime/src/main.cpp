@@ -220,6 +220,14 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        if (argc >= 3 && argv[2] && argv[2][0] != '\0')
+        {
+            // Optional raw-CDVD backend: sector reads (sceCdRead) resolve
+            // against this image when a game addresses the disc by LBN.
+            PS2Runtime::setCdImagePath(argv[2]);
+            std::cout << "Using argv CD image path" << std::endl;
+        }
+
         if (!runtime.loadELF(filePathStr))
         {
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
