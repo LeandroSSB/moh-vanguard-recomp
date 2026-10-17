@@ -38,6 +38,17 @@ namespace ps2_syscalls
         }
 
         const int32_t descriptor = runtime->vfs().open(ps2Path, static_cast<uint32_t>(flags), currentVfsMounts(), runtime->romDevice());
+#if PS2X_ENGINE_SYNC_WATCH
+        {
+            static int openLogCount = 0;
+            if (openLogCount < 64)
+            {
+                RUNTIME_LOG("[fio] open \"" << ps2Path << "\" flags=0x" << std::hex << flags
+                                            << " -> fd=" << std::dec << descriptor);
+                ++openLogCount;
+            }
+        }
+#endif
         setReturnS32(ctx, descriptor);
     }
 
@@ -95,6 +106,19 @@ namespace ps2_syscalls
         uint32_t bufAddr = getRegU32(ctx, 5); // $a1
         size_t size = getRegU32(ctx, 6);      // $a2
 
+#if PS2X_ENGINE_SYNC_WATCH
+        {
+            static int readLogCount = 0;
+            if (readLogCount < 64)
+            {
+                RUNTIME_LOG("[fio] read fd=" << ps2Fd << " buf=0x" << std::hex << bufAddr
+                                             << " size=0x" << size << std::dec
+                                             << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u) << std::dec);
+                ++readLogCount;
+            }
+        }
+#endif
+
         uint8_t *hostBuf = getMemPtr(rdram, bufAddr);
         if (!hostBuf)
         {
@@ -115,6 +139,16 @@ namespace ps2_syscalls
         }
 
         const int64_t readResult = runtime->vfs().read(ps2Fd, hostBuf, size);
+#if PS2X_ENGINE_SYNC_WATCH
+        {
+            static int readRetLogCount = 0;
+            if (readRetLogCount < 64)
+            {
+                RUNTIME_LOG("[fio] read fd=" << ps2Fd << " -> " << readResult);
+                ++readRetLogCount;
+            }
+        }
+#endif
         if (readResult < 0)
         {
             setReturnS32(ctx, -1);
@@ -199,6 +233,19 @@ namespace ps2_syscalls
         int ps2Fd = (int)getRegU32(ctx, 4);  // $a0
         int32_t offset = getRegU32(ctx, 5);  // $a1 (PS2 seems to use 32-bit offset here commonly)
         int whence = (int)getRegU32(ctx, 6); // $a2 (PS2 FIO_SEEK constants)
+
+#if PS2X_ENGINE_SYNC_WATCH
+        {
+            static int lseekLogCount = 0;
+            if (lseekLogCount < 64)
+            {
+                RUNTIME_LOG("[fio] lseek fd=" << ps2Fd << " off=" << offset
+                                              << " whence=" << whence
+                                              << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u) << std::dec);
+                ++lseekLogCount;
+            }
+        }
+#endif
 
         if (!runtime)
         {

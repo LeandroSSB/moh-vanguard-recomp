@@ -2439,6 +2439,41 @@ void PS2Runtime::run()
                                                << " vif=" << curVif
                                                << std::endl);
 
+                // Vanguard bring-up diagnostics: dump the engine's stage gate
+                // (0x642DC0), the deferred-call record (0x6480B8..BC) and the
+                // main loop's pending message-wait (sub_0033F208 saves its
+                // handle argument at 0(sp); the handle indexes a 48-byte
+                // record table whose base lives at 0x647F70 — result word at
+                // +8 is what the spin waits on).
+                {
+                    const uint32_t gateWord = m_memory.read32(0x642DC0);
+                    const uint32_t deferredFlag = m_memory.read32(0x6480B8);
+                    const uint32_t deferredFunc = m_memory.read32(0x6480BC);
+                    const uint32_t waitHandle = m_memory.read32(dbgSp);
+                    const uint32_t msgTable = m_memory.read32(0x647F70);
+                    RUNTIME_LOG("[engine-state] gate=0x" << std::hex << gateWord
+                                                         << " deferredFlag=" << deferredFlag
+                                                         << " deferredFunc=0x" << deferredFunc
+                                                         << " waitHandle=0x" << waitHandle
+                                                         << " msgTable=0x" << msgTable);
+                    if (waitHandle != 0 && msgTable != 0 && (msgTable < 0x02000000u))
+                    {
+                        const uint32_t recAddr = msgTable + (waitHandle >> 24) * 48u;
+                        if (recAddr < 0x02000000u)
+                        {
+                            RUNTIME_LOG("[engine-state] rec=0x" << std::hex << recAddr
+                                                                << " key=0x" << m_memory.read32(recAddr)
+                                                                << " [+4]=0x" << m_memory.read32(recAddr + 4)
+                                                                << " result=0x" << m_memory.read32(recAddr + 8)
+                                                                << std::dec);
+                        }
+                    }
+                    else
+                    {
+                        RUNTIME_LOG(std::dec);
+                    }
+                }
+
             }
         });
         uint32_t presentWidth = FB_WIDTH;

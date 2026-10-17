@@ -237,6 +237,42 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+#ifndef PS2X_ENGINE_SYNC_WATCH
+#define PS2X_ENGINE_SYNC_WATCH 0
+#endif
+
+#if PS2X_ENGINE_SYNC_WATCH
+inline bool ps2EngineSyncWatchHit(uint32_t guestAddr, const uint8_t *rdram)
+{
+    // Engine sync struct: stage gate 0x642DC0, DF70 repeat counter 0x642DD0,
+    // stream ring state 0x642DE8..
+    if (guestAddr - 0x642DC0u < 0x30u)
+    {
+        return true;
+    }
+    // Deferred file-I/O arm record: flag 0x6480B8, fd 0x6480BC, buf 0x6480C0, size 0x6480C8.
+    if (guestAddr - 0x6480B8u < 0x18u)
+    {
+        return true;
+    }
+    // Pending-completion pointer consumed by the pump sub_00340320.
+    if (guestAddr == 0x647F6Cu)
+    {
+        return true;
+    }
+    // Request records (48 bytes each) of the table whose base sits at 0x647F70.
+    if (rdram != nullptr)
+    {
+        const uint32_t tableBase = *reinterpret_cast<const uint32_t *>(rdram + 0x647F70u);
+        if (tableBase != 0u && guestAddr - tableBase < 64u * 48u)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -245,14 +281,34 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const char *op,
                                const R5900Context *ctx)
 {
+    (void)valueHi;
+    (void)op;
+#if PS2X_ENGINE_SYNC_WATCH
+    // Vanguard bring-up diagnostic: log guest writes into the engine's
+    // cooperative sync state (gate/counter/ring, deferred I/O record,
+    // completion pointer, request records) with the writing PC, rate-limited.
+    if (size <= 8u && rdram != nullptr)
+    {
+        static std::atomic<uint32_t> watchLogged{0};
+        if (watchLogged.load(std::memory_order_relaxed) < 2048 &&
+            ps2EngineSyncWatchHit(guestAddr, rdram))
+        {
+            watchLogged.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t pc = ctx ? ctx->pc : 0u;
+            RUNTIME_LOG("[gsync-watch] " << op << " pc=0x" << std::hex << pc
+                                         << " addr=0x" << guestAddr
+                                         << " val=0x" << valueLo << std::dec
+                                         << std::endl);
+        }
+    }
+#else
     (void)rdram;
     (void)guestAddr;
     (void)size;
     (void)valueLo;
-    (void)valueHi;
-    (void)op;
     (void)ctx;
     // TODO we dont need this anymore so on next release it will be deleted
+#endif
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,

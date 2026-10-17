@@ -405,7 +405,19 @@ endif()
 if(PS2X_ENABLE_AGRESSIVE_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         AGRESSIVE_LOGS=1
-        PS2_FUNCTION_LOG_TRACKER=1
+    )
+    option(PS2X_ENABLE_FUNCTION_TRACKER "Emit per-function enter/exit trace from recompiled code" ON)
+    if(PS2X_ENABLE_FUNCTION_TRACKER)
+        target_compile_definitions(ps2_runtime PUBLIC
+            PS2_FUNCTION_LOG_TRACKER=1
+        )
+    endif()
+endif()
+
+option(PS2X_ENABLE_ENGINE_SYNC_WATCH "Log guest writes to the Vanguard engine sync words (gate/deferred/completion)" OFF)
+if(PS2X_ENABLE_ENGINE_SYNC_WATCH)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENGINE_SYNC_WATCH=1
     )
 endif()
 
