@@ -27,6 +27,16 @@ namespace ps2x::iop::detail
             return request.sid == kScmdSid && request.function == 0x27u;
         }
 
+        void writeBootHandshakeReply(IopHost &host, const RpcRequest &request)
+        {
+            // SLUS_215.97 polls SifCallRpc(Scmd, 0x27, ..., 12-byte receive) and
+            // only leaves the poll when the first result word is nonzero; the
+            // next two words are copied into its drive-state record. Report
+            // success with neutral state.
+            const std::array<uint32_t, 3> words{1u, 0u, 0u};
+            (void)writeRpcWords(host, request.receive, words);
+        }
+
         class CdvdmanService final : public IopService
         {
         public:
@@ -62,13 +72,17 @@ namespace ps2x::iop::detail
                 // here yet, so reply with the neutral "ready, no error, zero
                 // data" payload; command-specific semantics follow observed
                 // traffic. Unmodeled commands are logged for diagnosis.
-                if (!isObservedBootCommand(request))
+                if (isObservedBootCommand(request))
+                {
+                    writeBootHandshakeReply(m_host, request);
+                }
+                else
                 {
                     logUnknown(request);
-                }
-                if (request.receive.address != 0u && request.receive.size != 0u)
-                {
-                    (void)m_host.zeroGuest(request.receive.address, request.receive.size);
+                    if (request.receive.address != 0u && request.receive.size != 0u)
+                    {
+                        (void)m_host.zeroGuest(request.receive.address, request.receive.size);
+                    }
                 }
                 return response;
             }
