@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "Stubs/CD.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
@@ -776,6 +777,96 @@ void register_ps2_runtime_io_tests()
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should resolve the probe LBN from the image");
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image-setter", 15), 0,
                      "sceCdRead should copy the probe sector payload");
+        });
+
+        tc.Run("sceCdCallback registers the completion handler that sceCdRead queues", [](TestCase &t)
+        {
+            TestContext test;
+            ps2_stubs::resetCdEventCallbackState();
+
+            constexpr uint32_t kSectorSize = 2048u;
+            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x1D80;
+            const std::filesystem::path imagePath = test.paths.base / "disc-callback.iso";
+            {
+                std::vector<uint8_t> image(kSectorSize, 0);
+                const char payload[] = "cd-callback";
+                std::memcpy(image.data(), payload, sizeof(payload) - 1);
+
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(image.data()),
+                          static_cast<std::streamsize>(image.size()));
+            }
+
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            constexpr uint32_t kCallbackAddr = GUEST_STRING_AREA_START + 0x40;
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kCallbackAddr);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
+
+            t.Equals(ps2_stubs::cdEventCallbackAddress(), kCallbackAddr,
+                     "sceCdCallback should keep the registered completion handler");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, bufAddr);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, &test.runtime);
+
+            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed with the image configured");
+            t.Equals(ps2_stubs::pendingCdCallbackCompletions(), 1u,
+                     "a completed sceCdRead should queue one completion for the registered handler");
+
+            uint32_t address = 0;
+            uint32_t result = 0;
+            t.IsTrue(ps2_stubs::takePendingCdCallbackCompletion(address, result),
+                     "the queued completion should be retrievable");
+            t.Equals(address, kCallbackAddr, "the completion should target the registered handler");
+            t.Equals(result, 1u, "a successful read should complete with result 1");
+            t.Equals(ps2_stubs::pendingCdCallbackCompletions(), 0u, "the queue should drain one entry at a time");
+        });
+
+        tc.Run("sceCdRead without a registered callback queues no completion", [](TestCase &t)
+        {
+            TestContext test;
+            ps2_stubs::resetCdEventCallbackState();
+
+            constexpr uint32_t kSectorSize = 2048u;
+            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x1E00;
+            const std::filesystem::path imagePath = test.paths.base / "disc-nocallback.iso";
+            {
+                std::vector<uint8_t> image(kSectorSize, 0);
+                const char payload[] = "cd-nocallback";
+                std::memcpy(image.data(), payload, sizeof(payload) - 1);
+
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(image.data()),
+                          static_cast<std::streamsize>(image.size()));
+            }
+
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, bufAddr);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, &test.runtime);
+
+            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed without a handler");
+            t.Equals(ps2_stubs::pendingCdCallbackCompletions(), 0u,
+                     "no completion should queue when no handler is registered");
         });
     });
 }

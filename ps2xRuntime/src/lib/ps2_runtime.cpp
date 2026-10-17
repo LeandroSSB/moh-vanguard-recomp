@@ -8,6 +8,7 @@
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
+#include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
@@ -2409,6 +2410,27 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        // Deliver completed CD reads to the game's registered completion
+        // handler (sceCdCallback/sceCdInitEeCB). Reads finish synchronously
+        // here, so the handler is queued as a guest invocation at this safe
+        // point — the drive-completion event the console would raise.
+        {
+            uint32_t callbackAddress = 0u;
+            uint32_t callbackResult = 0u;
+            while (ps2_stubs::takePendingCdCallbackCompletion(callbackAddress, callbackResult))
+            {
+                if (callbackAddress != 0u && m_eeScheduler)
+                {
+                    GuestInvocation invocation{};
+                    invocation.kind = GuestInvocationKind::RpcCallback;
+                    invocation.context.pc = callbackAddress;
+                    SET_GPR_U32(&invocation.context, 4, callbackResult);
+                    SET_GPR_U32(&invocation.context, 29, m_eeScheduler->invocationStackTop());
+                    SET_GPR_U32(&invocation.context, 31, 0u);
+                    m_eeScheduler->queueInvocation(std::move(invocation));
+                }
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)

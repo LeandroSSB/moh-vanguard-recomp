@@ -3,6 +3,9 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#include <mutex>
+#include <utility>
+
 namespace ps2_stubs
 {
     namespace
@@ -30,6 +33,24 @@ namespace ps2_stubs
 
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
+
+        // CD completion callback (sceCdCallback / sceCdInitEeCB). The runtime
+        // performs reads synchronously, so the handler the game registers is
+        // queued after each successful sceCdRead and delivered by the runner
+        // loop as a queued guest invocation — the drive-completion event order.
+        std::mutex g_cdCallbackMutex;
+        uint32_t g_cdEventCallback = 0u;
+        std::vector<std::pair<uint32_t, uint32_t>> g_pendingCdCallbacks;
+
+        void queueCdEventCallbackCompletion(uint32_t result)
+        {
+            std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+            if (g_cdEventCallback == 0u)
+            {
+                return;
+            }
+            g_pendingCdCallbacks.emplace_back(g_cdEventCallback, result);
+        }
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
@@ -316,6 +337,10 @@ namespace ps2_stubs
         if (ok)
         {
             g_cdStreamingLbn = selected.lbn + selected.sectors;
+            // The read is already complete (synchronous model); deliver the
+            // drive-completion event to the registered handler so the game's
+            // async pipeline advances.
+            queueCdEventCallbackCompletion(1u);
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -353,9 +378,51 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+    void resetCdEventCallbackState()
+    {
+        std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+        g_cdEventCallback = 0u;
+        g_pendingCdCallbacks.clear();
+    }
+
+    uint32_t cdEventCallbackAddress()
+    {
+        std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+        return g_cdEventCallback;
+    }
+
+    size_t pendingCdCallbackCompletions()
+    {
+        std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+        return g_pendingCdCallbacks.size();
+    }
+
+    bool takePendingCdCallbackCompletion(uint32_t &address, uint32_t &result)
+    {
+        std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+        if (g_pendingCdCallbacks.empty())
+        {
+            return false;
+        }
+
+        address = g_pendingCdCallbacks.front().first;
+        result = g_pendingCdCallbacks.front().second;
+        g_pendingCdCallbacks.erase(g_pendingCdCallbacks.begin());
+        return true;
+    }
+
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        (void)rdram;
+        (void)runtime;
+        const uint32_t callback = getRegU32(ctx, 4);
+        uint32_t previous = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+            previous = g_cdEventCallback;
+            g_cdEventCallback = callback;
+        }
+        setReturnS32(ctx, static_cast<int32_t>(previous));
     }
 
     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -404,6 +471,17 @@ namespace ps2_stubs
 
     void sceCdInitEeCB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        (void)rdram;
+        (void)runtime;
+        // cdvdfsv's EE event callback registration shares the completion
+        // state with sceCdCallback: the game arms whichever notification path
+        // its engine uses, and completed reads deliver to it.
+        const uint32_t callback = getRegU32(ctx, 4);
+        if (callback != 0u)
+        {
+            std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+            g_cdEventCallback = callback;
+        }
         setReturnS32(ctx, 1);
     }
 
