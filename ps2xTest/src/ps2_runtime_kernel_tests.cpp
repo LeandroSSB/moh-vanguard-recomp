@@ -1079,12 +1079,39 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(setupSp & 0xFu, 0u, "SetupThread should always return a 16-byte aligned stack pointer");
         });
 
+        tc.Run("SetupThread anchors the automatic main stack at the top of RDRAM", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kMainStackSize = 0x00028000u;
+            constexpr uint32_t kExpectedStack = PS2_RAM_SIZE - 0x10u;
+
+            env.ctx.pc = 0x00100000u;
+            setRegU32(env.ctx, 29, 0u); // crt0 zeroes $sp before asking the kernel
+            setRegU32(env.ctx, 4, 0u);  // gp
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            setRegU32(env.ctx, 6, kMainStackSize);
+            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "SetupThread syscall should dispatch");
+            t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
+                     "automatic main stack must be anchored at the top of RDRAM");
+
+            // Regression (MOH:Vanguard, SLUS_215.97): the game links a static
+            // arena that ends at 0x1FD81C0. Placing the automatic stack at
+            // PS2_RAM_SIZE - stack_size (0x1FD8000) put the live init frames
+            // inside that arena, so the game's 0x10200-byte zero-fill smashed
+            // its own saved $ra; the main thread then went dormant with pc=0
+            // and the boot stalled. Anchoring at the top of RDRAM keeps the
+            // stack clear of any arena the game linked near the top of RAM.
+            t.IsTrue(kExpectedStack > PS2_RAM_SIZE - kMainStackSize,
+                     "anchored stack must sit above the requested-size placement");
+        });
+
         tc.Run("SetupThread exposes stable main stack metadata through ReferThreadStatus", [](TestCase &t)
         {
             TestEnv env;
-            constexpr uint32_t kInitialLoaderSp = PS2_RAM_SIZE - 0x10u;
+            constexpr uint32_t kInitialLoaderSp = PS2_RAM_SIZE - 0x100u;
             constexpr uint32_t kMainStackSize = 0x00020000u;
-            constexpr uint32_t kExpectedStack = PS2_RAM_SIZE - kMainStackSize;
+            constexpr uint32_t kExpectedStack = PS2_RAM_SIZE - 0x10u;
             constexpr uint32_t kMainGp = 0x0036A7F0u;
 
             env.ctx.pc = 0x00100000u;
@@ -1095,7 +1122,7 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
                      "SetupThread syscall should dispatch");
             t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
-                     "automatic main stack should start below the reserved top-of-RDRAM area");
+                     "automatic main stack should be anchored at the top of RDRAM");
 
             // ReferThreadStatus can be called after many nested frames have moved $sp.
             // It must report the initial stack recorded by SetupThread, not this live snapshot.
