@@ -3,10 +3,13 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "runtime/ee_scheduler.h"
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <cstring>
@@ -163,6 +166,107 @@ namespace
             PS2Runtime::setIoPaths(ioPaths);
         }
     };
+
+    // CD completion delivery harness. The completion invocation is queued by
+    // the sceCdRead stub itself on the EE executor, so delivery is observed by
+    // running only the scheduler (PS2Runtime::run() is never involved).
+    constexpr uint32_t kCdReadDriverPc = 0x00160600u;
+    constexpr uint32_t kCdCompletionCallbackPc = 0x00160610u;
+    constexpr uint32_t kCdReadBufAddr = GUEST_BUFFER_AREA_START + 0x1D80;
+
+    std::atomic<uint32_t> g_cdCompletionDeliveries{0u};
+    std::vector<uint32_t> g_cdCompletionResults;
+    std::vector<uint32_t> g_cdCompletionStacks;
+    int32_t g_cdDriverReadReturn = 0;
+    bool g_cdPhaseSchedulerThrew = false;
+
+    template <typename Predicate>
+    bool waitUntilCd(Predicate pred, std::chrono::milliseconds timeout)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (pred())
+            {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return pred();
+    }
+
+    void resetCdCompletionDeliveryState()
+    {
+        g_cdCompletionDeliveries.store(0u, std::memory_order_release);
+        g_cdCompletionResults.clear();
+        g_cdCompletionStacks.clear();
+        g_cdDriverReadReturn = 0;
+        g_cdPhaseSchedulerThrew = false;
+    }
+
+    // Guest "main" that performs one sceCdRead from scheduler context. The
+    // stub runs on the executor thread that owns the invocation queue.
+    void cdCompletionReadDriver(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        R5900Context readCtx{};
+        setRegU32(readCtx, 4, 0u);
+        setRegU32(readCtx, 5, 1u);
+        setRegU32(readCtx, 6, kCdReadBufAddr);
+        ps2_stubs::sceCdRead(rdram, &readCtx, runtime);
+        g_cdDriverReadReturn = getRegS32(&readCtx, 2);
+        ctx->pc = 0u;
+    }
+
+    // The registered completion handler, dispatched as a queued guest
+    // invocation by the scheduler alone.
+    void cdCompletionGuestHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_cdCompletionResults.push_back(getRegU32(ctx, 4));
+        g_cdCompletionStacks.push_back(getRegU32(ctx, 29));
+        g_cdCompletionDeliveries.fetch_add(1u, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // Runs one scheduler phase with the given driver entry; returns whether
+    // the expected number of completions was delivered before the timeout.
+    bool runCdCompletionSchedulerPhase(TestContext &test, uint32_t driverPc, uint32_t expectedDeliveries)
+    {
+        resetCdCompletionDeliveryState();
+        (void)test.runtime.registerFunction(kCdReadDriverPc, cdCompletionReadDriver);
+        R5900Context mainContext{};
+        mainContext.pc = driverPc;
+        std::thread gameThread([&]()
+        {
+            try
+            {
+                test.runtime.eeScheduler().reset(test.rdram.data(), mainContext);
+                test.runtime.eeScheduler().run();
+            }
+            catch (...)
+            {
+                g_cdPhaseSchedulerThrew = true;
+            }
+        });
+
+        bool delivered = false;
+        if (expectedDeliveries > 0u)
+        {
+            delivered = waitUntilCd([expectedDeliveries]()
+                                    { return g_cdCompletionDeliveries.load(std::memory_order_acquire) >= expectedDeliveries; },
+                                    std::chrono::milliseconds(500));
+        }
+        else
+        {
+            // No delivery is expected: hold the scheduler up long enough for a
+            // wrongly-queued completion to surface before stopping.
+            waitUntilCd([]() { return false; }, std::chrono::milliseconds(200));
+            delivered = g_cdCompletionDeliveries.load(std::memory_order_acquire) == 0u;
+        }
+        test.runtime.requestStop();
+        gameThread.join();
+        return delivered;
+    }
 }
 
 void register_ps2_runtime_io_tests()
@@ -785,7 +889,6 @@ void register_ps2_runtime_io_tests()
             ps2_stubs::resetCdEventCallbackState();
 
             constexpr uint32_t kSectorSize = 2048u;
-            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x1D80;
             const std::filesystem::path imagePath = test.paths.base / "disc-callback.iso";
             {
                 std::vector<uint8_t> image(kSectorSize, 0);
@@ -805,7 +908,10 @@ void register_ps2_runtime_io_tests()
             ioPaths.cdImage = imagePath;
             PS2Runtime::setIoPaths(ioPaths);
 
-            constexpr uint32_t kCallbackAddr = GUEST_STRING_AREA_START + 0x40;
+            t.IsTrue(test.runtime.registerFunction(kCdCompletionCallbackPc, cdCompletionGuestHandler),
+                     "the guest completion handler should register");
+
+            constexpr uint32_t kCallbackAddr = kCdCompletionCallbackPc;
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, kCallbackAddr);
             ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
@@ -813,23 +919,31 @@ void register_ps2_runtime_io_tests()
             t.Equals(ps2_stubs::cdEventCallbackAddress(), kCallbackAddr,
                      "sceCdCallback should keep the registered completion handler");
 
+            // The read runs on the scheduler's executor; the completion must
+            // be queued by the stub and delivered by the scheduler alone.
+            t.IsTrue(runCdCompletionSchedulerPhase(test, kCdReadDriverPc, 1u),
+                     "the scheduler should deliver the queued completion");
+            t.IsFalse(g_cdPhaseSchedulerThrew, "the delivery phase should not throw");
+            t.Equals(g_cdDriverReadReturn, 1, "sceCdRead should succeed with the image configured");
+            t.Equals(g_cdCompletionDeliveries.load(std::memory_order_acquire), 1u,
+                     "a completed sceCdRead should queue exactly one completion for the registered handler");
+            t.IsTrue(g_cdCompletionResults.size() == 1u && g_cdCompletionResults.front() == 1u,
+                     "the delivery should target the registered handler with result 1");
+            t.IsTrue(g_cdCompletionStacks.size() == 1u && g_cdCompletionStacks.front() != 0u,
+                     "the executor should bind the handler stack the stub left zero");
+
+            // Registering zero deregisters the handler; later reads deliver nothing.
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, 0u);
-            setRegU32(test.ctx, 5, 1u);
-            setRegU32(test.ctx, 6, bufAddr);
-            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, &test.runtime);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
+            t.Equals(ps2_stubs::cdEventCallbackAddress(), 0u,
+                     "sceCdCallback should deregister the handler when passed zero");
 
-            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed with the image configured");
-            t.Equals(ps2_stubs::pendingCdCallbackCompletions(), 1u,
-                     "a completed sceCdRead should queue one completion for the registered handler");
+            t.IsTrue(runCdCompletionSchedulerPhase(test, kCdReadDriverPc, 0u),
+                     "no completion should deliver after sceCdCallback(0)");
+            t.Equals(g_cdDriverReadReturn, 1, "the deregistered read should still succeed");
 
-            uint32_t address = 0;
-            uint32_t result = 0;
-            t.IsTrue(ps2_stubs::takePendingCdCallbackCompletion(address, result),
-                     "the queued completion should be retrievable");
-            t.Equals(address, kCallbackAddr, "the completion should target the registered handler");
-            t.Equals(result, 1u, "a successful read should complete with result 1");
-            t.Equals(ps2_stubs::pendingCdCallbackCompletions(), 0u, "the queue should drain one entry at a time");
+            ps2_stubs::resetCdEventCallbackState();
         });
 
         tc.Run("sceCdRead without a registered callback queues no completion", [](TestCase &t)
@@ -838,7 +952,6 @@ void register_ps2_runtime_io_tests()
             ps2_stubs::resetCdEventCallbackState();
 
             constexpr uint32_t kSectorSize = 2048u;
-            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x1E00;
             const std::filesystem::path imagePath = test.paths.base / "disc-nocallback.iso";
             {
                 std::vector<uint8_t> image(kSectorSize, 0);
@@ -858,15 +971,85 @@ void register_ps2_runtime_io_tests()
             ioPaths.cdImage = imagePath;
             PS2Runtime::setIoPaths(ioPaths);
 
-            clearContext(test.ctx);
-            setRegU32(test.ctx, 4, 0u);
-            setRegU32(test.ctx, 5, 1u);
-            setRegU32(test.ctx, 6, bufAddr);
-            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, &test.runtime);
+            t.IsTrue(runCdCompletionSchedulerPhase(test, kCdReadDriverPc, 0u),
+                     "no completion should deliver when no handler is registered");
+            t.Equals(g_cdDriverReadReturn, 1, "sceCdRead should succeed without a handler");
 
-            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed without a handler");
-            t.Equals(ps2_stubs::pendingCdCallbackCompletions(), 0u,
-                     "no completion should queue when no handler is registered");
+            ps2_stubs::resetCdEventCallbackState();
+        });
+
+        tc.Run("CD completion delivery requires no run-loop drain: sceCdRead queues on the executor", [](TestCase &t)
+        {
+            TestContext test;
+            ps2_stubs::resetCdEventCallbackState();
+            resetCdCompletionDeliveryState();
+
+            constexpr uint32_t kSectorSize = 2048u;
+            const std::filesystem::path imagePath = test.paths.base / "disc-executor.iso";
+            {
+                std::vector<uint8_t> image(kSectorSize, 0);
+                const char payload[] = "cd-executor";
+                std::memcpy(image.data(), payload, sizeof(payload) - 1);
+
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(image.data()),
+                          static_cast<std::streamsize>(image.size()));
+            }
+
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            t.IsTrue(test.runtime.registerFunction(kCdCompletionCallbackPc, cdCompletionGuestHandler),
+                     "the guest completion handler should register");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kCdCompletionCallbackPc);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &test.runtime);
+
+            // Bind this thread as the EE executor — the same context a stub
+            // dispatch runs in — and call sceCdRead directly. Queueing the
+            // completion from any other thread would violate the scheduler's
+            // executor contract; PS2Runtime::run() never takes part here.
+            R5900Context bindCtx{};
+            test.runtime.eeScheduler().bindMainContextForSyscall(bindCtx, test.rdram.data());
+
+            R5900Context readCtx{};
+            setRegU32(readCtx, 4, 0u);
+            setRegU32(readCtx, 5, 1u);
+            setRegU32(readCtx, 6, kCdReadBufAddr);
+            ps2_stubs::sceCdRead(test.rdram.data(), &readCtx, &test.runtime);
+
+            t.Equals(getRegS32(&readCtx, 2), 1, "sceCdRead should succeed on the executor-bound context");
+
+            // The scheduler alone must deliver the queued completion. The
+            // watchdog keeps the run bounded even if nothing is delivered.
+            std::thread watchdog([&]()
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                test.runtime.requestStop();
+            });
+            try
+            {
+                test.runtime.eeScheduler().run();
+            }
+            catch (...)
+            {
+            }
+            watchdog.join();
+
+            t.Equals(g_cdCompletionDeliveries.load(std::memory_order_acquire), 1u,
+                     "the completion must be delivered without any run-loop drain");
+            t.IsTrue(g_cdCompletionResults.size() == 1u && g_cdCompletionResults.front() == 1u,
+                     "exactly one completion should have been queued with result 1");
+            t.IsTrue(g_cdCompletionStacks.size() == 1u && g_cdCompletionStacks.front() != 0u,
+                     "the executor should bind the handler stack the stub left zero");
+
+            ps2_stubs::resetCdEventCallbackState();
         });
     });
 }

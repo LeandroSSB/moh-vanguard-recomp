@@ -36,20 +36,33 @@ namespace ps2_stubs
 
         // CD completion callback (sceCdCallback / sceCdInitEeCB). The runtime
         // performs reads synchronously, so the handler the game registers is
-        // queued after each successful sceCdRead and delivered by the runner
-        // loop as a queued guest invocation — the drive-completion event order.
+        // queued after each successful sceCdRead as a guest invocation — the
+        // drive-completion event order. sceCdRead itself runs on the EE
+        // executor, so the invocation is queued right here in stub context
+        // (the queueInvocation contract forbids any other thread) and the
+        // scheduler delivers it; no runner-loop participation is involved.
         std::mutex g_cdCallbackMutex;
         uint32_t g_cdEventCallback = 0u;
-        std::vector<std::pair<uint32_t, uint32_t>> g_pendingCdCallbacks;
 
-        void queueCdEventCallbackCompletion(uint32_t result)
+        void deliverCdEventCallbackCompletion(PS2Runtime *runtime, uint32_t result)
         {
-            std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
-            if (g_cdEventCallback == 0u)
+            uint32_t callback = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+                callback = g_cdEventCallback;
+            }
+            if (runtime == nullptr || callback == 0u || !runtime->hasFunction(callback))
             {
                 return;
             }
-            g_pendingCdCallbacks.emplace_back(g_cdEventCallback, result);
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.context.pc = callback;
+            SET_GPR_U32(&invocation.context, 4, result);
+            SET_GPR_U32(&invocation.context, 29, 0u); // the executor binds the invocation stack
+            SET_GPR_U32(&invocation.context, 31, 0u); // returning from the handler ends the invocation
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
@@ -339,8 +352,9 @@ namespace ps2_stubs
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             // The read is already complete (synchronous model); deliver the
             // drive-completion event to the registered handler so the game's
-            // async pipeline advances.
-            queueCdEventCallbackCompletion(1u);
+            // async pipeline advances. Queued here in stub context — sceCdRead
+            // executes on the EE executor, which owns the invocation queue.
+            deliverCdEventCallbackCompletion(runtime, 1u);
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -382,33 +396,12 @@ namespace ps2_stubs
     {
         std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
         g_cdEventCallback = 0u;
-        g_pendingCdCallbacks.clear();
     }
 
     uint32_t cdEventCallbackAddress()
     {
         std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
         return g_cdEventCallback;
-    }
-
-    size_t pendingCdCallbackCompletions()
-    {
-        std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
-        return g_pendingCdCallbacks.size();
-    }
-
-    bool takePendingCdCallbackCompletion(uint32_t &address, uint32_t &result)
-    {
-        std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
-        if (g_pendingCdCallbacks.empty())
-        {
-            return false;
-        }
-
-        address = g_pendingCdCallbacks.front().first;
-        result = g_pendingCdCallbacks.front().second;
-        g_pendingCdCallbacks.erase(g_pendingCdCallbacks.begin());
-        return true;
     }
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

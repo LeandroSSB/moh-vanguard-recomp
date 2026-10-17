@@ -44,11 +44,10 @@ namespace ps2_stubs
     // CD completion callback (sceCdCallback / sceCdInitEeCB). The runtime
     // completes reads synchronously, so the handler registered by the game is
     // queued for guest invocation right after each successful sceCdRead — the
-    // delivery order the drive completion event would produce.
+    // delivery order the drive completion event would produce. The invocation
+    // is queued from the sceCdRead stub itself, which runs on the EE executor.
     void resetCdEventCallbackState();
     uint32_t cdEventCallbackAddress();
-    size_t pendingCdCallbackCompletions();
-    bool takePendingCdCallbackCompletion(uint32_t &address, uint32_t &result);
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
