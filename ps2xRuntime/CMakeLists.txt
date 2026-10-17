@@ -421,6 +421,13 @@ if(PS2X_ENABLE_ENGINE_SYNC_WATCH)
     )
 endif()
 
+option(PS2X_ENABLE_DRAW_COUNTER "Log total GS backend draws with milestone counts (bring-up)" OFF)
+if(PS2X_ENABLE_DRAW_COUNTER)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_DRAW_COUNTER=1
+    )
+endif()
+
 if(PS2X_ENABLE_IOP_RPC_TRACE)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2X_ENABLE_IOP_RPC_TRACE=1

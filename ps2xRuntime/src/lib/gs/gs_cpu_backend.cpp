@@ -101,6 +101,14 @@ namespace
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
 
+#if PS2X_DRAW_COUNTER
+    // Bring-up instrumentation (PS2X_ENABLE_DRAW_COUNTER, default OFF): total
+    // backend draws with milestone logging. The aggressive [gs:prim] trace
+    // stops after 64 entries and only exists on aggressive builds; this
+    // answers "did the backend draw at all, and how much?" on any long run.
+    std::atomic<uint64_t> s_bringupDrawCount{0};
+#endif
+
     int wrapTextureCoordinate(int coordinate,
                               int textureSize,
                               uint8_t mode,
@@ -710,6 +718,15 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
 
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
+#if PS2X_DRAW_COUNTER
+    {
+        const uint64_t totalDraws = s_bringupDrawCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (totalDraws <= 16u || (totalDraws % 1024u) == 0u)
+        {
+            RUNTIME_LOG("[gs:draw-counter] draws=" << totalDraws << std::endl);
+        }
+    }
+#endif
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
     PS2_IF_AGRESSIVE_LOGS({
