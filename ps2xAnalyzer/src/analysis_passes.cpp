@@ -549,6 +549,66 @@ namespace ps2recomp
             }
         }
 
+        // Second source: pointers formed in code as `lui rd, hi` +
+        // `addiu/daddiu rd, rd, lo` pairs and handed straight to
+        // registration syscalls (SetAlarm's handler argument, thread entry
+        // arguments). These never touch data memory, so the word scan
+        // cannot see them.
+        for (const auto &section : sections)
+        {
+            if (section.data == nullptr || section.isBSS || section.size < 8u)
+            {
+                continue;
+            }
+
+            const size_t wordCount = section.size / 4u;
+            for (size_t index = 0; index + 1u < wordCount; ++index)
+            {
+                uint32_t word = 0u;
+                std::memcpy(&word, section.data + index * 4u, sizeof(word));
+                if ((word >> 26) != 0x0Fu)
+                {
+                    continue; // not lui
+                }
+
+                const uint32_t rd = (word >> 16) & 0x1Fu;
+                const uint32_t hi = word & 0xFFFFu;
+                for (size_t j = index + 1u; j < std::min(index + 13u, wordCount); ++j)
+                {
+                    uint32_t lo = 0u;
+                    std::memcpy(&lo, section.data + j * 4u, sizeof(lo));
+                    const uint32_t loOp = lo >> 26;
+                    if (loOp != 0x09u && loOp != 0x18u)
+                    {
+                        continue; // not addiu/daddiu
+                    }
+                    if (((lo >> 21) & 0x1Fu) != rd || ((lo >> 16) & 0x1Fu) != rd)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t low = lo & 0xFFFFu;
+                    const uint32_t address = ((hi << 16u) + low) & 0xFFFFFFFFu;
+                    if (address < textStart || address >= textEnd || (address & 0x3u) != 0u ||
+                        knownStarts.contains(address))
+                    {
+                        break;
+                    }
+
+                    uint32_t firstInstruction = 0u;
+                    if (readSectionWord(sections, address, firstInstruction) &&
+                        looksLikeFunctionPrologue(firstInstruction))
+                    {
+                        if (std::find(candidates.begin(), candidates.end(), address) == candidates.end())
+                        {
+                            candidates.push_back(address);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         std::sort(candidates.begin(), candidates.end());
         return candidates;
     }

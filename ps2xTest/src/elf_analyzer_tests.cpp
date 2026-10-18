@@ -309,5 +309,58 @@ void register_elf_analyzer_tests()
             t.IsFalse(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0x00000000u),
                       "nop is not a function prologue");
             t.IsFalse(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0x24020001u),
-                      "addiu v0, zero, 1 is not a function prologue"); }); });
+                      "addiu v0, zero, 1 is not a function prologue"); });
+
+                       tc.Run("instruction-formed entry candidates", [](TestCase &t)
+                              {
+            // Callback pointers are also formed in code as lui+addiu pairs
+            // and handed straight to registration syscalls (SetAlarm's
+            // handler argument never touches data memory). Vanguard's
+            // alarm-sleep wake callback 0x355840 is referenced only this
+            // way; without an entry the alarm fires into a missing
+            // function and every sleeping thread stays asleep forever.
+            // word 1 (within the lui window) is `addiu s1, s1, 0x20`:
+            // lui 0x0010 + 0x0020 forms a pointer to 0x00100020, whose word
+            // is an addiu-free prologue -> the pair must yield a candidate.
+            static uint32_t textBytes2[16] = {
+                0x3C110010u, // 0x00100000: lui s1, 0x10     (formed pointer hi)
+                0x26310020u, // 0x00100004: addiu s1, s1, 0x20 (lo; target 0x00100020)
+                0x00000000u, // 0x00100008
+                0x00000000u, // 0x0010000c
+                0x00000000u, // 0x00100010
+                0x00000000u, // 0x00100014
+                0x00000000u, // 0x00100018
+                0x00000000u, // 0x0010001c
+                0x27BDFFF0u, // 0x00100020: addiu sp, sp, -16 (unknown prologue)
+                0x00000000u, // 0x00100024
+                0x00000000u, // 0x00100028
+                0x00000000u, // 0x0010002c
+                0x00000000u, // 0x00100030
+                0x00000000u, // 0x00100034
+                0x00000000u, // 0x00100038
+                0x00000000u, // 0x0010003c
+            };
+
+            std::vector<Section> sections2;
+            Section textSec2{};
+            textSec2.name = ".text";
+            textSec2.address = 0x00100000u;
+            textSec2.size = sizeof(textBytes2);
+            textSec2.data = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(textBytes2));
+            textSec2.isCode = true;
+            sections2.push_back(textSec2);
+
+            const std::unordered_set<uint32_t> knownStarts2{0x00100000u};
+            auto formed = ElfAnalyzer::findDataReferencedEntryCandidatesForHeuristics(
+                sections2, 0x00100000u, 0x00100040u, knownStarts2);
+            bool found = false;
+            for (uint32_t address : formed)
+            {
+                if (address == 0x00100020u)
+                {
+                    found = true;
+                }
+            }
+            t.IsTrue(found,
+                     "a lui+addiu-formed text pointer to an unknown prologue must be a candidate"); }); });
 }
