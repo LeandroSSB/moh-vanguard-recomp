@@ -901,17 +901,26 @@ void register_ps2_runtime_kernel_tests()
 
             t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
             const uint32_t heapLimit = static_cast<uint32_t>(getRegS32(env.ctx, 2));
-            t.Equals(heapLimit, 0x00181010u, "EndOfHeap should report the upper limit of the configured heap");
+            t.Equals(heapLimit, 0x00181010u, "EndOfHeap should report the upper limit of the game heap window");
 
-            const uint32_t alignedAlloc = env.runtime.guestMalloc(0x20u, 64u);
-            t.IsTrue(alignedAlloc != 0u, "guestMalloc should allocate inside configured heap");
-            t.Equals(alignedAlloc & 0x3Fu, 0u, "guestMalloc should honor 64-byte alignment");
+            // M3-T7: the runtime staging heap must live OUTSIDE the window the
+            // game just claimed — the game manages that memory with its own
+            // allocator, and any runtime block inside it is a latent corruption
+            // (Vanguard: its "RAM" heap descriptor at 0x68F710 was trampled by
+            // a staging packet, hanging the post-preload render path).
+            const uint32_t stagingAlloc = env.runtime.guestMalloc(0x20u, 64u);
+            t.IsTrue(stagingAlloc != 0u, "guestMalloc should still allocate from the staging heap");
+            t.Equals(stagingAlloc & 0x3Fu, 0u, "guestMalloc should honor 64-byte alignment");
+            t.IsTrue(stagingAlloc + 0x20u <= heapBase || stagingAlloc >= heapLimit,
+                     "staging allocation must not intersect the game heap window");
 
-            env.runtime.guestFree(alignedAlloc);
+            env.runtime.guestFree(stagingAlloc);
 
             const uint32_t a = env.runtime.guestMalloc(0x100u, 16u);
             const uint32_t b = env.runtime.guestMalloc(0x100u, 16u);
             t.IsTrue(a != 0u && b != 0u, "guestMalloc should provide two adjacent blocks in this heap window");
+            t.IsTrue(a + 0x100u <= heapBase || a >= heapLimit,
+                     "staging allocations must not intersect the game heap window");
             env.runtime.guestFree(b);
 
             const uint32_t grown = env.runtime.guestRealloc(a, 0x180u, 16u);
@@ -919,7 +928,44 @@ void register_ps2_runtime_kernel_tests()
 
             env.runtime.guestFree(grown);
             const uint32_t reused = env.runtime.guestMalloc(0x80u, 16u);
-            t.Equals(reused, heapBase, "guestFree should make the head block reusable");
+            t.IsTrue(reused != 0u, "guestFree should make a staging block reusable");
+            t.IsTrue(reused + 0x80u <= heapBase || reused >= heapLimit,
+                     "reused staging block must not intersect the game heap window");
+        });
+
+        tc.Run("SetupHeap must keep the runtime staging heap out of the game heap window", [](TestCase &t)
+        {
+            TestEnv env;
+
+            // Vanguard bring-up regression: the game calls SetupHeap(0x68F700, -1)
+            // and then builds its own allocator ("RAM" heap, descriptor at
+            // 0x68F710). Before the fix the runtime re-based its OWN staging
+            // heap onto the very same region and its staging writes trampled
+            // the game's free-list sentinel links (0x68F730/0x68F734), hanging
+            // the first post-preload render allocation forever.
+            setRegU32(env.ctx, 4, 0x0068F700u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+            const uint32_t gameBase = static_cast<uint32_t>(getRegS32(env.ctx, 2));
+            t.Equals(gameBase, 0x0068F700u, "SetupHeap must return the game's requested base");
+
+            const uint32_t stagingBase = env.runtime.guestHeapBase();
+            t.IsTrue(stagingBase != 0u, "runtime staging heap must stay configured");
+            t.IsTrue(stagingBase < gameBase,
+                     "runtime staging heap must live below the game heap window");
+
+            const uint32_t block = env.runtime.guestMalloc(0x40u, 16u);
+            t.IsTrue(block != 0u, "guestMalloc should allocate from the staging heap");
+            t.IsTrue(block + 0x40u <= gameBase,
+                     "staging block must not intersect the game heap window");
+            env.runtime.guestFree(block);
+
+            // EndOfHeap reports the GAME's window, not the staging window.
+            // size=-1 means "rest of RAM" capped at the runtime's reserved top
+            // (kDefaultGuestHeapEnd) — the same cap SetupHeap always applied.
+            t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x01F00000u,
+                     "SetupHeap(-1) hands the game everything up to the reserved top");
         });
 
         tc.Run("memalign stubs allocate aligned guest memory", [](TestCase &t)

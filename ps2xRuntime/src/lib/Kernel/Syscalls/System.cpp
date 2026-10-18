@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "System.h"
 
+#include <mutex>
+
 namespace ps2_syscalls
 {
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -546,6 +548,20 @@ namespace ps2_syscalls
         setReturnU32(ctx, sp);
     }
 
+    namespace
+    {
+        // M3-T7: the window the game claimed via SetupHeap. The game manages
+        // this memory with its OWN allocator (Vanguard's "RAM" heap), so the
+        // runtime's internal staging allocator must never place blocks inside
+        // it — the two allocators would trample each other (Vanguard's heap
+        // free-list sentinel at 0x68F730/0x68F734 was overwritten by a
+        // staging packet and the first post-preload render allocation hung
+        // forever inside its first-fit walk).
+        std::mutex g_gameHeapWindowMutex;
+        uint32_t g_gameHeapBase = 0u;
+        uint32_t g_gameHeapLimit = 0u;
+    }
+
     // 0x3D SetupHeap: returns heap base/start pointer
     void SetupHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -571,35 +587,57 @@ namespace ps2_syscalls
 
         if (runtime)
         {
-            runtime->configureGuestHeap(heapBase, heapLimit);
+            {
+                std::lock_guard<std::mutex> lock(g_gameHeapWindowMutex);
+                g_gameHeapBase = heapBase;
+                g_gameHeapLimit = heapLimit;
+            }
+
+            // Re-base the runtime STAGING heap to [suggestedBase, heapBase):
+            // configureGuestHeap(0, ...) falls back to the loader's suggested
+            // base (just past the loaded program), so runtime-internal
+            // allocations (SIF/RPC packets, GS/Font staging) stay below the
+            // window the game's own allocator now manages.
+            runtime->configureGuestHeap(0u, heapBase);
 
             PS2_IF_AGRESSIVE_LOGS({
                 std::cerr << "[SetupHeap]"
                           << " base=0x" << std::hex << heapBaseRaw
                           << " alignedBase=0x" << heapBase
                           << " size=0x" << heapSize
+                          << " gameLimit=0x" << heapLimit
                           << " runtimeBase=0x" << runtime->guestHeapBase()
                           << " runtimeEnd=0x" << runtime->guestHeapEnd()
                           << std::dec << std::endl;
             });
 
-            setReturnU32(ctx, runtime->guestHeapBase());
+            setReturnU32(ctx, heapBase);
             return;
         }
 
         setReturnU32(ctx, heapBase);
     }
 
-    // 0x3E EndOfHeap: commonly returns current heap end; keep it stable for now.
+    // 0x3E EndOfHeap: reports the end of the window SetupHeap granted to the
+    // game (falls back to the staging heap limit when SetupHeap never ran).
     void EndOfHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
 
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
 
-        const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
-                                 : kDefaultGuestHeapEnd;
+        uint32_t ret = kDefaultGuestHeapEnd;
+        {
+            std::lock_guard<std::mutex> lock(g_gameHeapWindowMutex);
+            if (g_gameHeapLimit != 0u)
+            {
+                ret = g_gameHeapLimit;
+            }
+            else
+            {
+                ret = runtime ? runtime->guestHeapLimit() : kDefaultGuestHeapEnd;
+            }
+        }
 
         setReturnU32(ctx, ret);
     }

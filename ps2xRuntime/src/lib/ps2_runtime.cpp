@@ -2506,6 +2506,62 @@ void PS2Runtime::run()
         // GameThread (queueInvocation is executor-only by contract).
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
+            // M3-T7 probe (runtime-only): (a) watch the allocator channel-0
+            // list links [0x68F730]/[0x68F734] every loop iteration and log
+            // the exact loop tick they change (the post-preload stall walks
+            // this list); (b) every 120 ticks, when the sampled thread sits
+            // inside sub_00344A58 (0x344A58-0x345188), dump the saved call
+            // arguments and the return-address chain out of its stack frame:
+            //   [sp+0x34]=a0 [sp+0x38]=a2 [sp+0x60]=ra [sp+0x70]=a1(fp)
+            //   [sp+0x90]=s6(selector) [sp+0xA0]=a3(s5) [sp+0x100]=wrapper
+            //   frame (wrapper saved ra) — the outer caller's return site.
+            {
+                static uint32_t s_t7PrevSent = 0;
+                static uint32_t s_t7PrevHead = 0;
+                static bool s_t7Init = false;
+                const uint32_t t7Sent = m_memory.read32(0x68F730);
+                const uint32_t t7Head = m_memory.read32(0x68F734);
+                if (!s_t7Init || t7Sent != s_t7PrevSent || t7Head != s_t7PrevHead)
+                {
+                    RUNTIME_LOG("[m3t7] link-watch loopTick=" << std::dec << tick
+                                                              << " [0x68F730]=0x" << std::hex << t7Sent
+                                                              << " (prev 0x" << s_t7PrevSent
+                                                              << ")  [0x68F734]=0x" << t7Head
+                                                              << " (prev 0x" << s_t7PrevHead << ')'
+                                                              << " pc=0x" << m_debugPc.load(std::memory_order_relaxed)
+                                                              << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
+                                                              << " sp=0x" << m_debugSp.load(std::memory_order_relaxed)
+                                                              << std::endl);
+                    s_t7PrevSent = t7Sent;
+                    s_t7PrevHead = t7Head;
+                    s_t7Init = true;
+                }
+                if ((tick % 120) == 0)
+                {
+                    const uint32_t t7Pc = m_debugPc.load(std::memory_order_relaxed);
+                    const uint32_t t7Sp = m_debugSp.load(std::memory_order_relaxed);
+                    if (t7Pc >= 0x344A58u && t7Pc < 0x345188u && t7Sp >= 0x00100000u && t7Sp < 0x02000000u)
+                    {
+                        RUNTIME_LOG("[m3t7] in344A58 loopTick=" << std::dec << tick
+                                                                << " pc=0x" << std::hex << t7Pc
+                                                                << " sp=0x" << t7Sp
+                                                                << " a0=0x" << m_memory.read32(t7Sp + 0x34)
+                                                                << " a1=0x" << m_memory.read32(t7Sp + 0x70)
+                                                                << " a2=0x" << m_memory.read32(t7Sp + 0x38)
+                                                                << " a3=0x" << m_memory.read32(t7Sp + 0xA0)
+                                                                << " sel=0x" << m_memory.read32(t7Sp + 0x90)
+                                                                << " ra=0x" << m_memory.read32(t7Sp + 0x60)
+                                                                << " wrapRa=0x" << m_memory.read32(t7Sp + 0x100)
+                                                                << " up1=0x" << m_memory.read32(t7Sp + 0x110)
+                                                                << " up2=0x" << m_memory.read32(t7Sp + 0x120)
+                                                                << " up3=0x" << m_memory.read32(t7Sp + 0x330)
+                                                                << " selG=0x" << m_memory.read32(0x510550)
+                                                                << " obj21=0x" << m_memory.read32(0x648134)
+                                                                << " obj21_20=0x" << m_memory.read32(0x68F730)
+                                                                << std::endl);
+                    }
+                }
+            }
             if ((tick % 120) == 0)
             {
                 uint64_t curDma = m_memory.dmaStartCount();

@@ -298,17 +298,20 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     // Vanguard bring-up diagnostic: log guest writes into the engine's
     // cooperative sync state (gate/counter/ring, deferred I/O record,
     // completion pointer, request records) with the writing PC, rate-limited.
-    if (size <= 8u && rdram != nullptr)
+    // M3-T7: also log 16-byte (sq) writes — a 128-bit node write was the one
+    // blind spot when hunting the heap-sentinel clobber at 0x68F730/34.
+    if (size <= 16u && rdram != nullptr)
     {
         static std::atomic<uint32_t> watchLogged{0};
-        if (watchLogged.load(std::memory_order_relaxed) < 2048 &&
+        if (watchLogged.load(std::memory_order_relaxed) < 8192 &&
             ps2EngineSyncWatchHit(guestAddr, rdram))
         {
             watchLogged.fetch_add(1, std::memory_order_relaxed);
             const uint32_t pc = ctx ? ctx->pc : 0u;
             RUNTIME_LOG("[gsync-watch] " << op << " pc=0x" << std::hex << pc
                                          << " addr=0x" << guestAddr
-                                         << " val=0x" << valueLo << std::dec
+                                         << " val=0x" << valueLo
+                                         << ":" << valueHi << std::dec
                                          << std::endl);
         }
     }
