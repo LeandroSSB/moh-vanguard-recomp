@@ -269,6 +269,17 @@ inline bool ps2EngineSyncWatchHit(uint32_t guestAddr, const uint8_t *rdram)
             return true;
         }
     }
+    // M3-T5: stream-ring channel object (0x68F710, obj+0..0x40 — the head at
+    // +0x24 aliases the inline sentinel's next at 0x68F734) and the pump
+    // walk-start globals 0x4FEB80/0x4FEB84: name whoever zeroes the ring.
+    if (guestAddr - 0x68F710u < 0x40u)
+    {
+        return true;
+    }
+    if (guestAddr - 0x4FEB80u < 8u)
+    {
+        return true;
+    }
     return false;
 }
 #endif
