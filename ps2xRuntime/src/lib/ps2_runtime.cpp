@@ -2478,6 +2478,82 @@ void PS2Runtime::run()
                     {
                         RUNTIME_LOG(std::dec);
                     }
+
+                    // M3-T4 phase probe. The steady-state main loop lives in
+                    // the ring poll sub_00344A58 (tick pc 0x344cb0): it walks
+                    // a stream-channel node chain (table 0x6480E0, selector
+                    // [0x510550], head at obj+0x24, node = {u16 tag, +4 write
+                    // cursor, +0x14 next}) and exits on tag 0x4253 'SB' when
+                    // the ring is empty. m_cpuContext holds the main thread's
+                    // register file here (copyMainContextToRuntime runs on
+                    // scheduler checkpoints); the read is racy by design —
+                    // diagnostic build only, worst case a torn sample.
+                    {
+                        auto gpr = [&](int idx) -> uint32_t
+                        { return static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[idx], 0)); };
+                        const uint32_t frameCtr = m_memory.read32(0x4EDB10);
+                        const uint32_t tbase = m_memory.read32(0x510A18);
+                        const uint32_t pending = m_memory.read32(0x647F6C);
+                        const uint32_t v0 = gpr(2);
+                        const uint32_t a1 = gpr(5);
+                        const uint32_t t1 = gpr(9);
+                        const uint32_t t2 = gpr(10);
+                        const uint32_t s0 = gpr(16);
+                        const uint32_t s6 = gpr(22);
+                        RUNTIME_LOG("[phase-probe] frame=0x" << std::hex << frameCtr
+                                                             << " tbase=0x" << tbase
+                                                             << " pending=0x" << pending
+                                                             << " v0=0x" << v0
+                                                             << " a1=0x" << a1
+                                                             << " t1=0x" << t1
+                                                             << " t2=0x" << t2
+                                                             << " s0=0x" << s0
+                                                             << " s6=0x" << s6);
+                        auto inRdram = [](uint32_t a)
+                        { return a >= 0x00100000u && a < 0x02000000u; };
+                        // sub_00344A58 entered with sp = dbgSp+0x100 (addiu
+                        // sp,-0x100) and saved $ra at 0x60(sp); its wrapper
+                        // (sub_00345188/B0) saved $ra at 0(sp) of its own
+                        // frame — i.e. dbgSp+0x100. That word is the main
+                        // loop's return site: names the loop that polls.
+                        if (inRdram(dbgSp))
+                        {
+                            const uint32_t pollRa = m_memory.read32(dbgSp + 0x60);
+                            const uint32_t wrapperRa = m_memory.read32(dbgSp + 0x100);
+                            RUNTIME_LOG("[phase-probe] bt poll_ra=0x" << std::hex << pollRa
+                                                                      << " loop_ra=0x" << wrapperRa);
+                        }
+                        if (inRdram(t2))
+                        {
+                            RUNTIME_LOG("[phase-probe] node=0x" << std::hex << t2
+                                                                << " tag=0x" << (m_memory.read32(t2) & 0xFFFFu)
+                                                                << " cur=0x" << m_memory.read32(t2 + 4)
+                                                                << " next=0x" << m_memory.read32(t2 + 0x14));
+                        }
+                        const uint32_t ch = (s6 != 0) ? (s6 & 0x3Fu) : (m_memory.read32(0x510550) & 0x3Fu);
+                        const uint32_t obj = m_memory.read32(0x6480E0u + ch * 4u);
+                        RUNTIME_LOG("[phase-probe] ch=" << std::dec << ch << " obj=0x" << std::hex << obj);
+                        if (inRdram(obj))
+                        {
+                            uint32_t node = m_memory.read32(obj + 0x24);
+                            RUNTIME_LOG("[phase-probe] obj30=0x" << std::hex << m_memory.read32(obj + 0x30)
+                                                                 << " head=0x" << node);
+                            for (int i = 0; i < 3; ++i)
+                            {
+                                if (!inRdram(node))
+                                    break;
+                                const uint32_t next = m_memory.read32(node + 0x14);
+                                RUNTIME_LOG("[phase-probe] ring[" << std::dec << i << "]=0x" << std::hex
+                                                                  << node << " tag=0x" << (m_memory.read32(node) & 0xFFFFu)
+                                                                  << " cur=0x" << m_memory.read32(node + 4)
+                                                                  << " next=0x" << next);
+                                if (next == node)
+                                    break;
+                                node = next;
+                            }
+                        }
+                        RUNTIME_LOG(std::dec);
+                    }
                 }
 
             }
