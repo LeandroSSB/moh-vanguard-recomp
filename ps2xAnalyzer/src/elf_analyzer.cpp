@@ -733,9 +733,10 @@ namespace ps2recomp
         const std::vector<Section> &sections,
         uint32_t textStart,
         uint32_t textEnd,
-        const std::unordered_set<uint32_t> &knownStarts)
+        const std::unordered_set<uint32_t> &knownStarts,
+        const std::unordered_set<uint32_t> &servedTargets)
     {
-        return AnalysisPasses::collectDataReferencedEntryCandidates(sections, textStart, textEnd, knownStarts);
+        return AnalysisPasses::collectDataReferencedEntryCandidates(sections, textStart, textEnd, knownStarts, servedTargets);
     }
 
     void ElfAnalyzer::analyzeDataReferencedEntryPoints()
@@ -768,13 +769,29 @@ namespace ps2recomp
 
         std::unordered_set<uint32_t> knownStarts;
         knownStarts.reserve(m_context.functions.size());
+        std::unordered_set<uint32_t> servedTargets;
+        servedTargets.reserve(m_context.functions.size() * 4u);
         for (const auto &func : m_context.functions)
         {
             knownStarts.insert(func.start);
+
+            // The recompiler emits a dispatch-table row for every decoded
+            // direct branch label of a compiled function, so those targets
+            // are callable without a configured entry. Stubs have no
+            // compiled body, so their spans contribute no served labels.
+            if (m_libFunctions.contains(func.name))
+            {
+                continue;
+            }
+
+            for (const uint32_t target : AnalysisPasses::collectDirectBranchTargets(getDecodedInstructions(func)))
+            {
+                servedTargets.insert(target);
+            }
         }
 
         const std::vector<uint32_t> candidates =
-            findDataReferencedEntryCandidatesForHeuristics(m_context.sections, textStart, textEnd, knownStarts);
+            findDataReferencedEntryCandidatesForHeuristics(m_context.sections, textStart, textEnd, knownStarts, servedTargets);
         if (candidates.empty())
         {
             return;

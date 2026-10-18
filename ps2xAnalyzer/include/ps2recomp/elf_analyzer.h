@@ -67,7 +67,8 @@ namespace ps2recomp
             const std::vector<Section> &sections,
             uint32_t textStart,
             uint32_t textEnd,
-            const std::unordered_set<uint32_t> &knownStarts);
+            const std::unordered_set<uint32_t> &knownStarts,
+            const std::unordered_set<uint32_t> &servedTargets = {});
 
     private:
         std::string m_elfPath;

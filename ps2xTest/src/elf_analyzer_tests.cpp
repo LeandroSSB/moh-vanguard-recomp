@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "ps2recomp/elf_analyzer.h"
+#include "ps2recomp/analysis_passes.h"
 #include "ps2recomp/function_classifier.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/types.h"
@@ -260,14 +261,14 @@ void register_elf_analyzer_tests()
                 0xFFBF0020u, // 0x00100024: sd ra, 0x20(sp)
                 0x00000000u, // 0x00100028
                 0x00000000u, // 0x0010002c
-                0x00000000u, // 0x00100030: interior non-prologue (reject target)
+                0x00000000u, // 0x00100030: interior label the runtime already serves (reject target)
                 0x00000000u, // 0x00100034
                 0x00000000u, // 0x00100038
                 0x00000000u, // 0x0010003c
             };
             static const uint32_t dataBytes[4] = {
                 0x00100020u, // pointer at 0x00200000 -> unknown prologue: candidate
-                0x00100030u, // pointer at 0x00200004 -> interior non-prologue: rejected
+                0x00100030u, // pointer at 0x00200004 -> already-served label: rejected
                 0x00200008u, // pointer at 0x00200008 -> outside text: rejected
                 0x00100000u, // pointer at 0x0020000c -> known start: rejected
             };
@@ -292,7 +293,7 @@ void register_elf_analyzer_tests()
             const std::unordered_set<uint32_t> knownStarts{0x00100000u};
 
             auto candidates = ElfAnalyzer::findDataReferencedEntryCandidatesForHeuristics(
-                sections, 0x00100000u, 0x00100040u, knownStarts);
+                sections, 0x00100000u, 0x00100040u, knownStarts, std::unordered_set<uint32_t>{0x00100030u});
             t.Equals(candidates.size(), static_cast<size_t>(1),
                      "only the unknown prologue target should be a candidate");
             if (candidates.size() == 1u)
@@ -362,5 +363,112 @@ void register_elf_analyzer_tests()
                 }
             }
             t.IsTrue(found,
-                     "a lui+addiu-formed text pointer to an unknown prologue must be a candidate"); }); });
+                     "a lui+addiu-formed text pointer to an unknown prologue must be a candidate"); });
+
+                       tc.Run("prologue-less table targets", [](TestCase &t)
+                              {
+            // Module dispatch tables hand out entries that are bare
+            // continuation fragments: the first instruction is a register
+            // load (e.g. `lw a0, 0(a1)`), not a prologue. Vanguard's module
+            // dispatcher died exactly this way — `jalr v1` into 0x10d6b8,
+            // pointed to by the .rodata words 0x544420/0x544590, with no
+            // compiled function covering the target, so the scheduler put
+            // the thread to sleep for good. A data-table word that points
+            // into a code section at an address no discovered function
+            // covers (neither a known start nor inside a known body) is a
+            // callable guest entry regardless of its prologue shape.
+            static const uint32_t textBytes3[15] = {
+                0x27BDFFF0u, // 0x00100000: addiu sp, sp, -16 (known start)
+                0x03E00008u, // 0x00100004: jr ra
+                0x00100028u, // 0x00100008: code literal holding a text pointer (not a table)
+                0x00000000u, // 0x0010000c
+                0x00000000u, // 0x00100010
+                0x00000000u, // 0x00100014
+                0x00000000u, // 0x00100018
+                0x00000000u, // 0x0010001c
+                0x8CA40000u, // 0x00100020: lw a0, 0(a1) — prologue-less uncovered target
+                0x00000000u, // 0x00100024
+                0x8CA40004u, // 0x00100028: prologue-less, referenced only from code -> reject
+                0x00000000u, // 0x0010002c
+                0x27BDFFE0u, // 0x00100030: addiu sp, sp, -32 (known function start)
+                0x8CA40008u, // 0x00100034: covered interior -> reject
+                0x00000000u, // 0x00100038
+            };
+            static const uint32_t tableBytes[4] = {
+                0x00100020u, // 0x00200000: uncovered prologue-less code target -> candidate
+                0x00100034u, // 0x00200004: covered by a known function -> reject
+                0x00200010u, // 0x00200008: points into data, not code -> reject
+                0x00100000u, // 0x0020000c: known start -> reject
+            };
+
+            std::vector<Section> sections3;
+            Section textSec3{};
+            textSec3.name = ".text";
+            textSec3.address = 0x00100000u;
+            textSec3.size = sizeof(textBytes3);
+            textSec3.data = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(textBytes3));
+            textSec3.isCode = true;
+            sections3.push_back(textSec3);
+
+            Section dataTableSec{};
+            dataTableSec.name = ".rodata";
+            dataTableSec.address = 0x00200000u;
+            dataTableSec.size = sizeof(tableBytes);
+            dataTableSec.data = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(tableBytes));
+            dataTableSec.isData = true;
+            sections3.push_back(dataTableSec);
+
+            const std::unordered_set<uint32_t> knownStarts3{0x00100000u, 0x00100030u};
+
+            // 0x00100034 is a decoded branch label of the known function, so
+            // the runtime dispatch table already serves it; 0x00100020 is
+            // reachable only through the table, so nothing serves it.
+            const std::unordered_set<uint32_t> served{0x00100034u};
+
+            auto tableTargets = ElfAnalyzer::findDataReferencedEntryCandidatesForHeuristics(
+                sections3, 0x00100000u, 0x00100040u, knownStarts3, served);
+
+            t.Equals(tableTargets.size(), static_cast<size_t>(1),
+                     "only the unserved prologue-less table target should be a candidate");
+            if (tableTargets.size() == 1u)
+            {
+                t.Equals(tableTargets[0], 0x00100020u,
+                         "candidate address should match the prologue-less table pointer target");
+            } });
+
+                       tc.Run("direct branch targets feed the served set", [](TestCase &t)
+                              {
+            // The recompiler emits a dispatch-table row for every decoded
+            // direct branch label, so those addresses are callable without a
+            // configured entry — the third tier must treat them as served.
+            Instruction beq = makeInstruction(0x00001000u, OPCODE_BEQ);
+            beq.immediate = 0x0008u; // -> 0x1024
+            Instruction bne = makeInstruction(0x00001004u, OPCODE_BNE);
+            bne.immediate = 0xFFFEu; // -> 0x1000 (backward)
+            Instruction jal = makeInstruction(0x00001008u, OPCODE_JAL);
+            jal.target = 0x001000u; // -> 0x004000
+            Instruction regimm = makeInstruction(0x0000100cu, OPCODE_REGIMM);
+            regimm.rt = REGIMM_BGEZ;
+            regimm.immediate = 0x0004u; // -> 0x1020
+            Instruction beql = makeInstruction(0x00001010u, OPCODE_BEQL);
+            beql.immediate = 0x0001u; // -> 0x1018
+            Instruction addiu = makeInstruction(0x00001014u, OPCODE_ADDIU);
+
+            const auto targets = AnalysisPasses::collectDirectBranchTargets(
+                std::vector<Instruction>{beq, bne, jal, regimm, beql, addiu});
+
+            t.Equals(targets.size(), static_cast<size_t>(5),
+                     "five direct control-flow instructions should yield five targets");
+            for (uint32_t expected : {0x00001000u, 0x00001018u, 0x00001020u, 0x00001024u, 0x00004000u})
+            {
+                bool found = false;
+                for (uint32_t target : targets)
+                {
+                    if (target == expected)
+                    {
+                        found = true;
+                    }
+                }
+                t.IsTrue(found, "branch target set should contain the decoded label");
+            } }); });
 }
