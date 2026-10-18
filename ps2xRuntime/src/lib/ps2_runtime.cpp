@@ -1511,6 +1511,20 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+        // EE INTC causes 4/5 are the VIF0/VIF1 interrupt lines (PS2SDK intc.h
+        // cause numbering: 0=GS, 2=VBLANK-START, 3=VBLANK-END, 4=VIF0, 5=VIF1,
+        // 10/11=TIMER1/2). A completed VIF channel transfer is the only VIF
+        // event this runtime models, so games that registered a VIF INTC
+        // handler (MOH Vanguard: cause 5 for its VIF1 stream pipeline) receive
+        // it on channel completion, mirroring the timer dispatch pattern.
+        if (cause == 0u)
+        {
+            ps2_syscalls::dispatchIntcHandlersForCause(rdram, this, 4u);
+        }
+        else if (cause == 1u)
+        {
+            ps2_syscalls::dispatchIntcHandlersForCause(rdram, this, 5u);
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <exception>
 #include <string_view>
 #include <thread>
@@ -72,6 +73,19 @@ namespace
     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+    constexpr uint32_t kVifDmaEntryPc = 0x00160600u;
+    constexpr uint32_t kVifDmaResumePc = 0x00160610u;
+    constexpr uint32_t kVifDmaDmacHandlerPc = 0x00160620u;
+    constexpr uint32_t kVifDmaIntcHandlerPc = 0x00160630u;
+    constexpr uint32_t kVif1ChannelChcr = 0x10009000u;
+    constexpr uint32_t kVif1ChannelMadr = 0x10009010u;
+    constexpr uint32_t kVif1ChannelQwc = 0x10009020u;
+
+    std::atomic<uint32_t> g_vifDmaDmacCause{0u};
+    std::atomic<uint32_t> g_vifDmaDmacArg{0u};
+    std::atomic<uint32_t> g_vifDmaIntcCause{0u};
+    std::atomic<uint32_t> g_vifDmaIntcArg{0u};
+    std::atomic<bool> g_vifDmaResumed{false};
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -264,6 +278,43 @@ namespace
     {
         g_dispatchTrace.push_back(5);
         g_resumedResult = getRegS32(*ctx, 2);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerVifDmaDmacHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_vifDmaDmacCause.store(getRegU32(ctx, 4), std::memory_order_relaxed);
+        g_vifDmaDmacArg.store(getRegU32(ctx, 5), std::memory_order_relaxed);
+        ctx->pc = 0u;
+    }
+
+    void schedulerVifDmaIntcHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_vifDmaIntcCause.store(getRegU32(ctx, 4), std::memory_order_relaxed);
+        g_vifDmaIntcArg.store(getRegU32(ctx, 5), std::memory_order_relaxed);
+        ctx->pc = 0u;
+    }
+
+    void schedulerVifDmaEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(true, 1u, kVifDmaDmacHandlerPc, true, 0xAAAAu, 0u, 0u);
+        scheduler.addIrqHandler(false, 5u, kVifDmaIntcHandlerPc, true, 0xBBBBu, 0u, 0u);
+        scheduler.setIrqCauseEnabled(true, 1u, true);
+        scheduler.setIrqCauseEnabled(false, 5u, true);
+
+        runtime->memory().write32(kVif1ChannelMadr, 0x00003000u);
+        runtime->memory().write32(kVif1ChannelQwc, 1u);
+        runtime->memory().write32(kVif1ChannelChcr, 0x100u); // STR, direct mode
+        runtime->drainCompletedDmacHandlers(rdram);
+
+        ctx->pc = kVifDmaResumePc;
+    }
+
+    void schedulerVifDmaResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_vifDmaResumed.store(true, std::memory_order_relaxed);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -600,6 +651,38 @@ void register_ps2_runtime_interrupt_tests()
             t.IsFalse(exhausted, "queued callbacks must not consume one invocation stack per pending item");
             t.Equals(g_invocationQueueRuns, 96u, "every queued callback should execute exactly once");
             t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
+        });
+
+        tc.Run("VIF1 DMA completion dispatches channel handler and raises INTC cause 5", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kVifDmaEntryPc, schedulerVifDmaEntry);
+            env.runtime.registerFunction(kVifDmaResumePc, schedulerVifDmaResume);
+            env.runtime.registerFunction(kVifDmaDmacHandlerPc, schedulerVifDmaDmacHandler);
+            env.runtime.registerFunction(kVifDmaIntcHandlerPc, schedulerVifDmaIntcHandler);
+
+            g_vifDmaDmacCause.store(0u, std::memory_order_relaxed);
+            g_vifDmaDmacArg.store(0u, std::memory_order_relaxed);
+            g_vifDmaIntcCause.store(0u, std::memory_order_relaxed);
+            g_vifDmaIntcArg.store(0u, std::memory_order_relaxed);
+            g_vifDmaResumed.store(false, std::memory_order_relaxed);
+
+            R5900Context mainContext{};
+            mainContext.pc = kVifDmaEntryPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_vifDmaResumed.load(std::memory_order_relaxed),
+                     "the main context should resume after the DMA completion");
+            t.Equals(g_vifDmaDmacCause.load(std::memory_order_relaxed), 1u,
+                     "the VIF1 channel (cause 1) DMAC handler should run on completion");
+            t.Equals(g_vifDmaDmacArg.load(std::memory_order_relaxed), 0xAAAAu,
+                     "the DMAC handler should receive its registered argument");
+            t.Equals(g_vifDmaIntcCause.load(std::memory_order_relaxed), 5u,
+                     "VIF1 completion should raise the VIF1 interrupt (INTC cause 5)");
+            t.Equals(g_vifDmaIntcArg.load(std::memory_order_relaxed), 0xBBBBu,
+                     "the INTC handler should receive its registered argument");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)

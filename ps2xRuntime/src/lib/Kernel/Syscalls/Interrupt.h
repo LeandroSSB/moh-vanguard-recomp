@@ -5,6 +5,7 @@
 namespace ps2_syscalls
 {
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
+    void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
     uint64_t GetCurrentVSyncTick(PS2Runtime *runtime);
     void WaitVSyncTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int fixedResult);
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
