@@ -2682,6 +2682,34 @@ void PS2Runtime::run()
                                                              << " vsyncAfterTick=0x" << t.waitAfterTick
                                                              << std::dec);
                         }
+                        // M3-T5b: when the main thread's saved pc sits in the
+                        // ring poll (sub_00344A58), dump the node-walk loop's
+                        // live variables (m_cpuContext is the main thread's
+                        // register file at the last checkpoint) so the spin
+                        // names its own condition.
+                        {
+                            auto inRam = [](uint32_t a)
+                            { return a >= 0x00100000u && a < 0x02000000u; };
+                            const uint32_t mainPc = m_cpuContext.pc;
+                            if (mainPc >= 0x344A58u && mainPc < 0x345188u)
+                            {
+                                auto g = [&](int idx) -> uint32_t
+                                { return static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[idx], 0)); };
+                                const uint32_t t2 = g(10);
+                                const uint32_t s3 = g(19);
+                                RUNTIME_LOG("[poll-loop] t2=0x" << std::hex << t2
+                                                                << " nodeTag=0x" << (inRam(t2) ? (m_memory.read32(t2) & 0xFFFFu) : 0u)
+                                                                << " nodeCur=0x" << (inRam(t2 + 4) ? m_memory.read32(t2 + 4) : 0u)
+                                                                << " nodeNext=0x" << (inRam(t2 + 0x14) ? m_memory.read32(t2 + 0x14) : 0u)
+                                                                << " a0=0x" << g(4)
+                                                                << " a1=0x" << g(5)
+                                                                << " t1=0x" << g(9)
+                                                                << " s0=0x" << g(16)
+                                                                << " s3=0x" << s3
+                                                                << " head=0x" << (inRam(s3 + 0x24) ? m_memory.read32(s3 + 0x24) : 0u)
+                                                                << std::dec);
+                            }
+                        }
                         for (const auto &h : threadSnap.intcHandlers)
                         {
                             RUNTIME_LOG("[intc-handler] id=" << std::dec << h.id
