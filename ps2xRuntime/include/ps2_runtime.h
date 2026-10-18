@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -291,12 +292,31 @@ inline void ps2T10RangeWatch(const char *op, uint32_t address, uint64_t size, co
 }
 
 #if PS2X_ENGINE_SYNC_WATCH
+// M3-T11: trigger-gated capture of the CD driver's staging copy. The boot
+// dir-parse floods a static watch window (8192 cap gone before the reload),
+// so the window is only live once dispatchGuestBranch saw the reload's
+// request enqueue (src 0x11E954) and for the next N window hits after that.
+inline std::atomic<uint32_t> g_ps2T11StoreWindow{0};
+
 inline bool ps2EngineSyncWatchHit(uint32_t guestAddr, const uint8_t *rdram)
 {
     // Engine sync struct: stage gate 0x642DC0, DF70 repeat counter 0x642DD0,
     // stream ring state 0x642DE8..
     if (guestAddr - 0x642DC0u < 0x30u)
     {
+        return true;
+    }
+    // M3-T11: staging buffer 0x642E40 (sceCdRead buf) plus the driver record
+    // at 0x642DE8 in front of it — captured only while the T11 window is open.
+    // Also the reload blob buffer 0x1F18E00 (0x850 B window): whoever writes
+    // it with the +8-shifted BRGR bytes is the bug this task hunts.
+    if (g_ps2T11StoreWindow.load(std::memory_order_relaxed) > 0u &&
+        (guestAddr - 0x642DE8u < 0x1B8u || guestAddr - 0x1F18E00u < 0x850u))
+    {
+        if (g_ps2T11StoreWindow.fetch_sub(1, std::memory_order_relaxed) <= 1u)
+        {
+            g_ps2T11StoreWindow.store(0, std::memory_order_relaxed);
+        }
         return true;
     }
     // Deferred file-I/O arm record: flag 0x6480B8, fd 0x6480BC, buf 0x6480C0, size 0x6480C8.
@@ -392,18 +412,61 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
 #endif
 }
 
+// Host bulk-write diagnostics (memcpy/memset/DMA services writing guest RAM).
+// Long-standing callers, historically a no-op ("we dont need this anymore").
+// Vanguard M3-T11 needed it back: hunting which service fills a guest buffer
+// costs one full probe build per blind guess, so make the trace opt-in via
+// environment instead of deleted:
+//   PS2X_TRACE_GUEST_RANGE_WRITES=1      log every bulk write (op, addr, size, pc)
+//   PS2X_TRACE_GUEST_RANGE_ADDR=0xADDR   only writes overlapping [addr, addr+SIZE)
+//   PS2X_TRACE_GUEST_RANGE_SIZE=0xN      (with ADDR; default 0x1000)
+// Rate-limited to the first 4096 hits per run. Default (env unset): silent,
+// zero behavior change.
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     uint32_t guestAddr,
                                     uint32_t size,
                                     const char *op,
                                     const R5900Context *ctx)
 {
-    (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    static const bool s_enabled = []()
+    {
+        const char *env = std::getenv("PS2X_TRACE_GUEST_RANGE_WRITES");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!s_enabled)
+    {
+        return;
+    }
+    static const uint32_t s_watchAddr = []()
+    {
+        const char *env = std::getenv("PS2X_TRACE_GUEST_RANGE_ADDR");
+        return env != nullptr ? static_cast<uint32_t>(std::strtoull(env, nullptr, 0)) : 0u;
+    }();
+    static const uint32_t s_watchSize = []()
+    {
+        const char *env = std::getenv("PS2X_TRACE_GUEST_RANGE_SIZE");
+        return env != nullptr ? static_cast<uint32_t>(std::strtoull(env, nullptr, 0)) : 0x1000u;
+    }();
+
+    static std::atomic<uint32_t> s_logged{0};
+    if (s_logged.load(std::memory_order_relaxed) >= 4096u)
+    {
+        return;
+    }
+    const uint64_t writeEnd = static_cast<uint64_t>(guestAddr) + size;
+    const bool overlaps = s_watchAddr == 0u ||
+                          (guestAddr < s_watchAddr + s_watchSize && writeEnd > s_watchAddr);
+    if (!overlaps)
+    {
+        return;
+    }
+    s_logged.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t pc = ctx ? ctx->pc : 0u;
+    RUNTIME_LOG("[guest-range-write] " << (op != nullptr ? op : "write")
+                                       << " addr=0x" << std::hex << guestAddr
+                                       << " size=0x" << size
+                                       << " pc=0x" << pc << std::dec
+                                       << std::endl);
 }
 
 class PS2Runtime

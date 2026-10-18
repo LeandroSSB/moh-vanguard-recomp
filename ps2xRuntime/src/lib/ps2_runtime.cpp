@@ -16,6 +16,7 @@
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
+#include <iomanip>
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
@@ -1410,6 +1411,30 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t t10A0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0));
         const uint32_t t10A1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0));
         const uint32_t t10A2 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0));
+        // M3-T11 probe 3: the reload's staging copies (sector buffer
+        // 0x642E40 -> request dests on the stack / blob arena) never reached
+        // the default t10 log (first-64 cap). Log them specifically and
+        // uncapped-ish so the intra-sector source offset is measured.
+        {
+            static uint32_t s_t11CopyLogs = 0;
+            const uint32_t a0m = t10A0 & 0x1FFFFFFFu;
+            const uint32_t a1m = t10A1 & 0x1FFFFFFFu;
+            const bool nearStaging = (a1m - 0x642DC0u < 0x640u) || (a0m - 0x642DC0u < 0x640u);
+            const bool nearBlob = (a0m - 0x1F18000u < 0x2000u) || (a1m - 0x1F18000u < 0x2000u);
+            const bool nearHdrDest = (a0m - 0x1FFF000u < 0x1000u) || (a1m - 0x1FFF000u < 0x1000u);
+            if ((nearStaging || nearBlob || nearHdrDest) && s_t11CopyLogs < 400u)
+            {
+                ++s_t11CopyLogs;
+                std::ostringstream line;
+                line << "[t11-copy] src=0x" << std::hex << sourcePc
+                     << " dst=0x" << t10A0
+                     << " from=0x" << t10A1
+                     << " n=0x" << t10A2
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << std::dec << std::endl;
+                RUNTIME_LOG(line.str());
+            }
+        }
         if (s_t10MemcpyLogs < 64u || t10A2 > 0x100000u)
         {
             ++s_t10MemcpyLogs;
@@ -1425,9 +1450,253 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             line << std::endl;
             RUNTIME_LOG(line.str());
         }
+        // M3-T11 probe: decode the BRGR-blob reload size at the exploding call
+        // site (sub_0011F0E0 @0x11f200). The game walks `count = *(hdr+4)`
+        // records of `8 + 16*field` bytes each out of the blob (s5) and ends
+        // with s0 = `*(hdr+8) + 4*Σfield - 8*count - 20*Σfield` =
+        // `*(hdr+8) - consumed`. Replicate the walk on the host from the live
+        // registers so the diverging input (header size vs record fields) is
+        // named. Opt-in: PS2X_ENABLE_T11_BLOB=1 (default off).
+        static const char *s_t11Env = std::getenv("PS2X_ENABLE_T11_BLOB");
+        if (s_t11Env != nullptr && s_t11Env[0] == '1' && sourcePc == 0x11F200u)
+        {
+            static uint32_t s_t11Logs = 0;
+            if (s_t11Logs < 4u)
+            {
+                ++s_t11Logs;
+                const uint32_t hdrAddr = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[17], 0)) & 0x1FFFFFFFu;
+                const uint32_t blobAddr = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[21], 0)) & 0x1FFFFFFFu;
+                const uint32_t s0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[16], 0));
+                std::ostringstream line;
+                line << "[t11-blob] hdr=0x" << std::hex << hdrAddr
+                     << " blob=0x" << blobAddr
+                     << " s0=0x" << s0 << std::dec;
+                if (rdram != nullptr && hdrAddr + 0x18u <= PS2_RAM_SIZE && blobAddr + 0x40u <= PS2_RAM_SIZE)
+                {
+                    uint32_t hdr[6];
+                    std::memcpy(hdr, rdram + hdrAddr, sizeof(hdr));
+                    const uint32_t count = hdr[1];
+                    const int32_t size = static_cast<int32_t>(hdr[2]);
+                    line << " hdr=[";
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        line << (i ? " " : "") << std::hex << hdr[i] << std::dec;
+                    }
+                    line << "] count=" << count << " size=" << size;
+                    uint64_t off = 0;
+                    uint64_t sumF4 = 0;
+                    uint32_t walked = 0;
+                    line << " rec[";
+                    for (uint32_t i = 0; i < count && i < 64u; ++i)
+                    {
+                        if (blobAddr + off + 8u > PS2_RAM_SIZE)
+                        {
+                            break;
+                        }
+                        uint32_t rw[2];
+                        std::memcpy(rw, rdram + blobAddr + off, sizeof(rw));
+                        if (i < 24u)
+                        {
+                            line << (i ? "," : "") << i << ":w0=" << std::hex << rw[0] << std::dec
+                                 << ",f=" << rw[1];
+                        }
+                        sumF4 += static_cast<uint64_t>(rw[1]) * 4u;
+                        off += 8u + static_cast<uint64_t>(rw[1]) * 16u;
+                        walked = i + 1u;
+                        if (off > 0x40000u)
+                        {
+                            break;
+                        }
+                    }
+                    const int64_t consumed = static_cast<int64_t>(8ull * walked + 16ull * sumF4);
+                    line << "] walked=" << walked
+                         << " consumed=" << std::dec << consumed
+                         << " delta(size-consumed)=" << (static_cast<int64_t>(size) - consumed);
+                }
+                line << std::endl;
+                RUNTIME_LOG(line.str());
+                if (rdram != nullptr && blobAddr + 0x30u <= PS2_RAM_SIZE)
+                {
+                    std::ostringstream hex;
+                    hex << "[t11-blob] blob[0..0x30]=";
+                    for (uint32_t i = 0; i < 0x30u; ++i)
+                    {
+                        hex << std::hex << std::setw(2) << std::setfill('0')
+                            << static_cast<unsigned>(rdram[blobAddr + i]) << std::dec;
+                    }
+                    hex << std::endl;
+                    RUNTIME_LOG(hex.str());
+                }
+            }
+        }
     }
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+
+    // M3-T11 probe 8 (refines probe 6): the game's libc memcpy (sub_003553F0)
+    // serves file reads out of the CD driver's sector staging — call site
+    // 0x33EB5C computes dst=[0x642DFC], src=[0x642E04]+[0x642DF0], n=[0x642DE8].
+    // Probe 6 burned its cap on boot dir-parse copies; this one only logs
+    // while the T11 store window (armed by the reload enqueue) is open.
+    {
+        static const char *s_t11Env4 = std::getenv("PS2X_ENABLE_T11_BLOB");
+#if PS2X_ENGINE_SYNC_WATCH
+        const bool s_t11WindowOpen = g_ps2T11StoreWindow.load(std::memory_order_relaxed) > 0u;
+#else
+        const bool s_t11WindowOpen = false;
+#endif
+        if (s_t11Env4 != nullptr && s_t11Env4[0] == '1' && targetPc == 0x3553F0u &&
+            s_t11WindowOpen)
+        {
+            const uint32_t mA0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)) & 0x1FFFFFFFu;
+            const uint32_t mA1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0)) & 0x1FFFFFFFu;
+            const bool nearDrv = (mA0 - 0x642DE0u < 0x620u) || (mA1 - 0x642DE0u < 0x620u);
+            const bool nearBlob = (mA0 - 0x1F18000u < 0x2000u) || (mA1 - 0x1F18000u < 0x2000u);
+            const bool nearHdr = (mA0 - 0x1FFF000u < 0x1000u) || (mA1 - 0x1FFF000u < 0x1000u);
+            if ((nearDrv || nearBlob || nearHdr))
+            {
+                static uint32_t s_t11DrvLogs = 0;
+                if (s_t11DrvLogs < 200u)
+                {
+                    ++s_t11DrvLogs;
+                    std::ostringstream line;
+                    line << "[t11-drv] src=0x" << std::hex << sourcePc
+                         << " dst=0x" << mA0
+                         << " from=0x" << mA1
+                         << " n=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0));
+                    if (rdram != nullptr)
+                    {
+                        uint32_t rec[22];
+                        std::memcpy(rec, rdram + 0x642DE8u, sizeof(rec));
+                        line << " drv=[";
+                        for (int i = 0; i < 22; ++i)
+                        {
+                            line << (i ? " " : "") << rec[i];
+                        }
+                        line << "]";
+                    }
+                    line << std::endl;
+                    RUNTIME_LOG(line.str());
+                }
+            }
+        }
+    }
+
+    // M3-T11 probe 5: the stream-manager read-completion callback
+    // (sub_0011E9B0) advances its object's offset/dest/done by a1 — the byte
+    // count the serving layer (0x3130A0) reports. If the layer over-serves
+    // (+8), the sequential data read starts 8 bytes late, which is exactly
+    // the BRGR blob shift measured at the exploding memcpy. Log every entry
+    // with a1 and the object bookkeeping. Opt-in: PS2X_ENABLE_T11_BLOB=1.
+    {
+        static const char *s_t11Env3 = std::getenv("PS2X_ENABLE_T11_BLOB");
+        if (s_t11Env3 != nullptr && s_t11Env3[0] == '1' && targetPc == 0x11E9B0u)
+        {
+            static uint32_t s_t11CbLogs = 0;
+            if (s_t11CbLogs < 96u)
+            {
+                ++s_t11CbLogs;
+                const uint32_t served = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0));
+                const uint32_t obj = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0)) & 0x1FFFFFFFu;
+                std::ostringstream line;
+                line << "[t11-cb] served=0x" << std::hex << served
+                     << " obj=0x" << obj << std::dec;
+                if (rdram != nullptr && obj + 0x28u <= PS2_RAM_SIZE)
+                {
+                    uint32_t f[10];
+                    std::memcpy(f, rdram + obj, sizeof(f));
+                    line << " rec=[";
+                    for (int i = 0; i < 10; ++i)
+                    {
+                        line << (i ? " " : "") << std::hex << f[i] << std::dec;
+                    }
+                    line << "]";
+                    // M3-T11 probe 9: blob content right after the copy
+                    // (dest = rec[0x10], len = rec[0x14]) and the staging
+                    // neighborhood [0x642E38, 0x642E70) — tells whether the
+                    // +8 shift exists at copy completion or appears later.
+                    const uint32_t dest = f[4];
+                    const uint32_t len = f[5] < 0x20u ? f[5] : 0x20u;
+                    if (dest >= 0x20u && dest - 0x20u + len <= PS2_RAM_SIZE)
+                    {
+                        line << std::hex << " pre8=[" << std::setfill('0');
+                        for (uint32_t i = 0; i < 8u; ++i)
+                        {
+                            line << std::setw(2) << static_cast<unsigned>(rdram[dest - 8u + i]);
+                        }
+                        line << "] data=[";
+                        for (uint32_t i = 0; i < len; ++i)
+                        {
+                            line << std::setw(2) << static_cast<unsigned>(rdram[dest + i]);
+                        }
+                        line << std::setfill(' ') << std::dec << "]";
+                    }
+                    if (0x642E70u <= PS2_RAM_SIZE)
+                    {
+                        line << std::hex << " stg38=[";
+                        for (uint32_t i = 0; i < 0x38u; ++i)
+                        {
+                            line << std::setw(2) << std::setfill('0')
+                                 << static_cast<unsigned>(rdram[0x642E38u + i]);
+                        }
+                        line << std::setfill(' ') << std::dec << "]";
+                    }
+                }
+                line << std::endl;
+                RUNTIME_LOG(line.str());
+            }
+        }
+    }
+
+    // M3-T11 probe 2: name the stub that serves the stream-manager reload
+    // reads. The BRGR header/data reads hit no logged path ([fio], [cd-read],
+    // [sceCdStRead] all silent), so log every call landing in the kernel/file
+    // or cdvd import windows, bracketed around the game's request enqueue
+    // (jal 0x33F678 from sub_0011E8C8 @0x11E954). Opt-in: PS2X_ENABLE_T11_BLOB=1.
+    {
+        static const char *s_t11Env2 = std::getenv("PS2X_ENABLE_T11_BLOB");
+        if (s_t11Env2 != nullptr && s_t11Env2[0] == '1')
+        {
+            static bool s_t11Win = false;
+            static uint32_t s_t11WinBudget = 0;
+            static uint32_t s_t11StubLogs = 0;
+            if (sourcePc == 0x11E954u)
+            {
+                s_t11Win = true;
+                s_t11WinBudget = 600;
+#if PS2X_ENGINE_SYNC_WATCH
+                g_ps2T11StoreWindow.store(400, std::memory_order_relaxed);
+#endif
+                std::ostringstream line;
+                line << "[t11-stub] === reload enqueue (src=0x11E954) ===" << std::endl;
+                RUNTIME_LOG(line.str());
+            }
+            auto inKernelWindow = [](uint32_t pc)
+            {
+                return (pc - 0x49B000u < 0x1700u) ||
+                       (pc - 0x49E000u < 0x1A00u) ||
+                       (pc - 0x4ABFF8u < 0x1900u);
+            };
+            if (s_t11Win && s_t11WinBudget > 0 && inKernelWindow(targetPc) && s_t11StubLogs < 1200u)
+            {
+                --s_t11WinBudget;
+                ++s_t11StubLogs;
+                std::ostringstream line;
+                line << "[t11-stub] tgt=0x" << std::hex << targetPc
+                     << " src=0x" << sourcePc
+                     << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0))
+                     << " a1=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0))
+                     << " a2=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0))
+                     << " a3=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[7], 0))
+                     << std::dec << std::endl;
+                RUNTIME_LOG(line.str());
+                if (s_t11WinBudget == 0)
+                {
+                    RUNTIME_LOG("[t11-stub] === window closed ===\n");
+                }
+            }
+        }
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
