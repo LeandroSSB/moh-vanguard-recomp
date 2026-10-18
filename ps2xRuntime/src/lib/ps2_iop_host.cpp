@@ -8,6 +8,7 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -129,6 +130,31 @@ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begi
     return true;
 }
 
+namespace
+{
+    // M3-T10 probe: the SDK dispatcher handler slots (.data 0x5109F0..0x510A10)
+    // fill with foreign code words / ASCII late in the run; [t10-write] (gen
+    // stores) and the LibC stub watch both saw ZERO hits, so the writer is a
+    // host-side bulk path. The slot junk byte-matches SNDDRV.IRX / IOPRP280
+    // content — watch the IOP->EE bulk writers here.
+    void t10IopRangeWatch(uint32_t address, size_t size, const char *op)
+    {
+        constexpr uint32_t kSlotBase = 0x5109F0u;
+        constexpr uint32_t kSlotEnd = kSlotBase + 0x20u;
+        const uint64_t writeEnd = static_cast<uint64_t>(address) + size;
+        if (address < kSlotEnd && writeEnd > kSlotBase)
+        {
+            static std::atomic<uint32_t> s_logged{0};
+            if (s_logged.fetch_add(1, std::memory_order_relaxed) < 256u)
+            {
+                std::cerr << "[t10-iop] " << (op ? op : "iopwrite")
+                          << " addr=0x" << std::hex << address
+                          << "+0x" << size << std::dec << std::endl;
+            }
+        }
+    }
+}
+
 bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t size) const
 {
     if (!destination && size != 0)
@@ -162,6 +188,7 @@ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t 
     {
         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
         ps2TraceGuestRangeWrite(rdram, address, static_cast<uint32_t>(size), "IopHost::writeGuest", nullptr);
+        t10IopRangeWatch(address, size, "writeGuest");
         std::memcpy(destination, source, size);
     }
     return true;
@@ -178,6 +205,7 @@ bool PS2IopHostAdapter::zeroGuest(uint32_t address, size_t size)
     {
         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
         ps2TraceGuestRangeWrite(rdram, address, static_cast<uint32_t>(size), "IopHost::zeroGuest", nullptr);
+        t10IopRangeWatch(address, size, "zeroGuest");
         std::memset(destination, 0, size);
     }
     return true;

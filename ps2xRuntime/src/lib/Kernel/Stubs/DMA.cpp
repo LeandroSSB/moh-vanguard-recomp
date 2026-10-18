@@ -63,6 +63,7 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
             std::memcpy(dst, &g_dmaCurrentEnv, sizeof(g_dmaCurrentEnv));
+            ps2T10RangeWatch("dma-env-dst", envAddr, sizeof(g_dmaCurrentEnv), ctx);
         }
         setReturnU32(ctx, envAddr);
     }

@@ -4,7 +4,9 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -69,6 +71,117 @@ namespace
             candidate = (candidate == std::numeric_limits<int>::max()) ? 1 : candidate + 1;
         } while (candidate != first);
         return 0;
+    }
+
+    // M3-T10 probe (runtime-only diagnostic): watch ONLY the 8 SDK dispatcher
+    // handler slot words at 0x5109F0 (walked by sub_00355300). The v1 probe
+    // also watched the adjacent tick counters 0x510A10/A14/A18, which tick
+    // every frame and ate the log cap before the slots ever changed. Sampled
+    // once per guest function dispatch; on any change, log the new words with
+    // the writing thread's identity and the ring of recently dispatched PCs.
+    // Exact per-store PCs come from [t10-write] (PS2X_T10_SLOT_WATCH).
+    constexpr uint32_t kT10SlotWatchBase = 0x5109F0u;
+    constexpr uint32_t kT10SlotWatchWords = 8u; // 0x5109F0..0x510A0F
+    struct T10SlotWatchState
+    {
+        std::array<uint32_t, kT10SlotWatchWords> prev{};
+        bool primed = false;
+        uint32_t logged = 0u;
+        std::array<uint32_t, 16> recentPcs{};
+        uint32_t recentNext = 0u; // index of the OLDEST entry
+        uint64_t dispatches = 0u;
+    };
+    T10SlotWatchState g_t10SlotWatch;
+
+    void t10RecordDispatchPc(uint32_t pc)
+    {
+        g_t10SlotWatch.recentPcs[g_t10SlotWatch.recentNext] = pc;
+        g_t10SlotWatch.recentNext = (g_t10SlotWatch.recentNext + 1u) % static_cast<uint32_t>(g_t10SlotWatch.recentPcs.size());
+        ++g_t10SlotWatch.dispatches;
+    }
+
+
+    // M3-T10 probe: the host-side guest-RAM writers in this scheduler are the
+    // only writers the gen store watch ([t10-write]) cannot see — and the slot
+    // changes land exactly between guest branches, i.e. inside event
+    // processing. Tag and log every one of them that touches the dispatcher
+    // slot window 0x5109F0..0x510A10.
+    void t10TagWrite(const char *tag, uint32_t address, uint32_t valueLo, uint32_t valueHi)
+    {
+        constexpr uint32_t kSlotBase = 0x5109F0u;
+        constexpr uint32_t kSlotEnd = kSlotBase + 0x20u;
+        const uint64_t writeEnd = static_cast<uint64_t>(address) + 8u;
+        if (address < kSlotEnd && writeEnd > kSlotBase)
+        {
+            static std::atomic<uint32_t> s_logged{0};
+            if (s_logged.fetch_add(1, std::memory_order_relaxed) < 256u)
+            {
+                std::ostringstream line;
+                line << "[t10-hostwrite] " << tag
+                     << " addr=0x" << std::hex << address
+                     << " val=0x" << valueLo << ":" << valueHi
+                     << std::dec << std::endl;
+                RUNTIME_LOG(line.str());
+            }
+        }
+    }
+
+    void t10CheckSlotWrites(uint32_t pc, uint32_t ra, uint32_t sp, int tid, const uint8_t *rdram, uint64_t eeCycle)
+    {
+        if (rdram == nullptr || g_t10SlotWatch.logged >= 512u)
+        {
+            return;
+        }
+        std::array<uint32_t, kT10SlotWatchWords> cur{};
+        std::memcpy(cur.data(), rdram + kT10SlotWatchBase, sizeof(cur));
+        if (!g_t10SlotWatch.primed)
+        {
+            g_t10SlotWatch.prev = cur;
+            g_t10SlotWatch.primed = true;
+            return;
+        }
+        if (std::memcmp(g_t10SlotWatch.prev.data(), cur.data(), sizeof(cur)) == 0)
+        {
+            return;
+        }
+        ++g_t10SlotWatch.logged;
+        std::ostringstream line;
+        line << "[t10-slotwatch] dispatch=" << g_t10SlotWatch.dispatches
+             << " eeCycle=0x" << std::hex << eeCycle
+             << " tid=" << std::dec << tid
+             << " pc=0x" << std::hex << pc
+             << " ra=0x" << ra
+             << " sp=0x" << sp
+             << std::dec << " changed:";
+        for (uint32_t i = 0; i < kT10SlotWatchWords; ++i)
+        {
+            if (cur[i] != g_t10SlotWatch.prev[i])
+            {
+                line << " [0x" << std::hex << (kT10SlotWatchBase + i * 4u) << "]"
+                     << "0x" << cur[i] << "(was 0x" << g_t10SlotWatch.prev[i] << ")";
+            }
+        }
+        line << std::dec << " recentPcs(oldest->newest):";
+        for (const uint32_t recent : g_t10SlotWatch.recentPcs)
+        {
+            line << " 0x" << std::hex << recent;
+        }
+        line << std::dec << " execRing(oldest->newest):";
+        {
+            const auto &ring = ps2_log::t10_exec_ring();
+            const unsigned pos = ps2_log::t10_exec_ring_pos();
+            for (size_t i = 0; i < ps2_log::kT10ExecRingSize; ++i)
+            {
+                const char *name = ring[(pos + i) % ps2_log::kT10ExecRingSize];
+                if (name != nullptr)
+                {
+                    line << ' ' << name;
+                }
+            }
+        }
+        line << std::endl;
+        RUNTIME_LOG(line.str());
+        g_t10SlotWatch.prev = cur;
     }
 }
 
@@ -291,6 +404,8 @@ void EeScheduler::run()
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
+        t10RecordDispatchPc(context.pc);
+
         if (checkpointDue(kGuestDispatchCycles))
         {
             continue;
@@ -303,6 +418,12 @@ void EeScheduler::run()
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            t10CheckSlotWrites(context.pc,
+                               getRegU32(&context, 31),
+                               getRegU32(&context, 29),
+                               running->id,
+                               m_rdram,
+                               m_eeCycle);
         }
         catch (const EeDispatcherTransfer &)
         {
@@ -1069,6 +1190,7 @@ void EeScheduler::waitEventFlag(int id, uint32_t bits, uint32_t mode, uint32_t r
     if (eventCondition(flag->bits, bits, mode))
     {
         const uint32_t observed = flag->bits;
+        t10TagWrite("evf-result", resultAddress, observed, 0u);
         writeGuestU32(resultAddress, observed);
         if ((mode & WEF_CLEAR_ALL) != 0u)
         {
@@ -1344,6 +1466,7 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
     assertExecutor();
     m_vsyncFlagAddress = flagAddress;
     m_vsyncTickAddress = tickAddress;
+    t10TagWrite("vsync-reg-flag", flagAddress, 0u, 0u);
     writeGuestU32(flagAddress, 0u);
     if (tickAddress != 0u)
     {
@@ -1351,6 +1474,7 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
         if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(uint64_t))
         {
             const uint64_t zero = 0u;
+            t10TagWrite("vsync-reg-tick", physical, 0u, 0u);
             std::memcpy(m_rdram + physical, &zero, sizeof(zero));
         }
     }
@@ -1960,12 +2084,14 @@ void EeScheduler::processEvent(const EeEvent &event)
         {
             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
         }
+        t10TagWrite("vsync-flag", m_vsyncFlagAddress, 1u, 0u);
         writeGuestU32(m_vsyncFlagAddress, 1u);
         if (m_vsyncTickAddress != 0u)
         {
             const uint32_t physical = m_vsyncTickAddress & 0x1FFFFFFFu;
             if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(uint64_t))
             {
+                t10TagWrite("vsync-tick", physical, static_cast<uint32_t>(m_vsyncTick), static_cast<uint32_t>(m_vsyncTick >> 32u));
                 std::memcpy(m_rdram + physical, &m_vsyncTick, sizeof(m_vsyncTick));
             }
         }
@@ -2041,6 +2167,7 @@ void EeScheduler::finishEventWaiters(EeEventFlag &flag, bool interruptSafe)
             continue;
         }
         const uint32_t observed = flag.bits;
+        t10TagWrite("evf-wake", wait.resultAddress, observed, 0u);
         writeGuestU32(wait.resultAddress, observed);
         if ((wait.mode & WEF_CLEAR_ALL) != 0u)
         {

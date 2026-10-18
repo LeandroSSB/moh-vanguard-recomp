@@ -1571,6 +1571,7 @@ namespace ps2_stubs
             }
 
             std::memset(data, 0, kMpegCallbackDataSize);
+            ps2T10RangeWatch("mpeg-cbdata", addr, kMpegCallbackDataSize, nullptr);
             *reinterpret_cast<uint32_t *>(data + 0x00u) = event.streamType;
             *reinterpret_cast<uint32_t *>(data + 0x08u) = event.dataAddr;
             *reinterpret_cast<uint32_t *>(data + 0x0Cu) = event.len;

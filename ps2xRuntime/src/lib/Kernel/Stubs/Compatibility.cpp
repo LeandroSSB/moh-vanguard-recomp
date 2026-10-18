@@ -112,6 +112,7 @@ namespace ps2_stubs
             {
                 const uint32_t out = static_cast<uint32_t>(ch);
                 std::memcpy(dst, &out, sizeof(out));
+            ps2T10RangeWatch("compat-out", wcAddr, sizeof(out), ctx);
             }
         }
         setReturnS32(ctx, (ch == 0u) ? 0 : 1);

@@ -45,6 +45,37 @@ namespace ps2_stubs
             return (offset < PS2_RAM_SIZE) ? (PS2_RAM_SIZE - offset) : 0u;
         }
 
+        // M3-T10 probe: the SDK dispatcher handler slots (.data 0x5109F0..0x510A10)
+        // keep filling with foreign code words / ASCII late in the run, and the
+        // [t10-write] gen-level watch sees ZERO stores there — the writes come
+        // from host-side stub paths (these LibC writers bypass both traced store
+        // paths; ps2TraceGuestRangeWrite is a no-op). Log every bulk write that
+        // touches the slot window with the caller identity and ABI registers.
+        void t10WatchRangeWrite(uint32_t guestAddr, uint32_t size, const char *op,
+                                uint32_t a0, uint32_t a1, uint32_t a2,
+                                R5900Context *ctx)
+        {
+            constexpr uint32_t kSlotBase = 0x5109F0u;
+            constexpr uint32_t kSlotEnd = kSlotBase + 0x20u;
+            const uint64_t writeEnd = static_cast<uint64_t>(guestAddr) + size;
+            if (guestAddr < kSlotEnd && writeEnd > kSlotBase)
+            {
+                static std::atomic<uint32_t> s_logged{0};
+                if (s_logged.fetch_add(1, std::memory_order_relaxed) < 512u)
+                {
+                    RUNTIME_LOG("[t10-range] " << (op ? op : "memop")
+                                               << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                                               << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                                               << " a0=0x" << a0
+                                               << " a1=0x" << a1
+                                               << " a2=0x" << a2
+                                               << " range=0x" << guestAddr
+                                               << "+0x" << size
+                                               << std::dec << std::endl);
+                }
+            }
+        }
+
     }
 
     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -123,6 +154,7 @@ namespace ps2_stubs
         if (copied != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, copied, "memcpy", ctx);
+            t10WatchRangeWrite(destAddr, copied, "memcpy", destAddr, srcAddr, size, ctx);
         }
 
         // returns dest pointer ($v0 = $a0)
@@ -161,6 +193,7 @@ namespace ps2_stubs
         if (written != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, written, "memset", ctx);
+            t10WatchRangeWrite(destAddr, written, "memset", destAddr, value, size, ctx);
         }
 
         // returns dest pointer ($v0 = $a0)
@@ -198,6 +231,7 @@ namespace ps2_stubs
         if (written != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, written, "memclr", ctx);
+            t10WatchRangeWrite(destAddr, written, "memclr", destAddr, 0u, size, ctx);
         }
 
         ctx->r[2] = ctx->r[4];
@@ -237,6 +271,7 @@ namespace ps2_stubs
         if (copied != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, copied, "memmove", ctx);
+            t10WatchRangeWrite(destAddr, copied, "memmove", destAddr, srcAddr, size, ctx);
         }
 
         // returns dest pointer ($v0 = $a0)
@@ -281,6 +316,7 @@ namespace ps2_stubs
         {
             ::strcpy(hostDest, hostSrc);
             ps2TraceGuestRangeWrite(rdram, destAddr, static_cast<uint32_t>(::strlen(hostSrc) + 1u), "strcpy", ctx);
+            t10WatchRangeWrite(destAddr, static_cast<uint32_t>(::strlen(hostSrc) + 1u), "strcpy", destAddr, srcAddr, 0u, ctx);
         }
         else
         {
@@ -307,6 +343,7 @@ namespace ps2_stubs
         {
             ::strncpy(hostDest, hostSrc, size);
             ps2TraceGuestRangeWrite(rdram, destAddr, size, "strncpy", ctx);
+            t10WatchRangeWrite(destAddr, size, "strncpy", destAddr, srcAddr, size, ctx);
         }
         else
         {
@@ -400,6 +437,7 @@ namespace ps2_stubs
 
         if (hostDest && hostSrc)
         {
+            t10WatchRangeWrite(destAddr, static_cast<uint32_t>(::strlen(hostSrc) + ::strlen(hostDest) + 1u), "strcat", destAddr, srcAddr, 0u, ctx);
             ::strcat(hostDest, hostSrc);
         }
         else
@@ -425,7 +463,8 @@ namespace ps2_stubs
 
         if (hostDest && hostSrc)
         {
-            ::strncat(hostDest, hostSrc, size);
+           t10WatchRangeWrite(destAddr, size, "strncat", destAddr, srcAddr, size, ctx);
+             ::strncat(hostDest, hostSrc, size);
         }
         else
         {
@@ -602,6 +641,7 @@ namespace ps2_stubs
             if (writeGuestBytes(rdram, runtime, str_addr, reinterpret_cast<const uint8_t *>(rendered.c_str()), writeLen))
             {
                 ps2TraceGuestRangeWrite(rdram, str_addr, static_cast<uint32_t>(writeLen), "sprintf", ctx);
+                t10WatchRangeWrite(str_addr, static_cast<uint32_t>(writeLen), "sprintf", str_addr, format_addr, 0u, ctx);
                 ret = static_cast<int>(rendered.size());
             }
             else
@@ -646,6 +686,7 @@ namespace ps2_stubs
                 if (writeGuestBytes(rdram, runtime, str_addr, output.data(), output.size()))
                 {
                     ps2TraceGuestRangeWrite(rdram, str_addr, static_cast<uint32_t>(output.size()), "snprintf", ctx);
+                    t10WatchRangeWrite(str_addr, static_cast<uint32_t>(output.size()), "snprintf", str_addr, size, format_addr, ctx);
                 }
                 else
                 {

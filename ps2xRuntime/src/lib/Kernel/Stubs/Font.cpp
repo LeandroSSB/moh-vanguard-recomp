@@ -63,6 +63,7 @@ namespace ps2_stubs
                         q[10] = (2ULL << 58) | (kClutQwc & 0x7FFF) | (1ULL << 15);
                         q[11] = 0ULL;
                         std::memcpy(pkt + 12u * 8u, clutData, 64u);
+            ps2T10RangeWatch("font-clut", pktAddr, 64u, ctx);
                         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
                         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
                         runtime->memory().writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
@@ -132,6 +133,7 @@ namespace ps2_stubs
             const uint8_t *src = getConstMemPtr(rdram, glyphSrc);
             if (dst && src)
                 std::memcpy(dst, src, 0x2010u);
+            ps2T10RangeWatch("font-2010", glyphAlloc, 0x2010u, nullptr);
         }
 
         uint32_t isDoubleByte = 0;
@@ -149,6 +151,7 @@ namespace ps2_stubs
                 const uint8_t *src = getConstMemPtr(rdram, kernSrc);
                 if (dst && src)
                     std::memcpy(dst, src, 0xc400u);
+            ps2T10RangeWatch("font-c400", kernAlloc, 0xc400u, nullptr);
             }
         }
 
@@ -208,6 +211,7 @@ namespace ps2_stubs
                     q[10] = (2ULL << 58) | (imageQwc & 0x7FFF) | (1ULL << 15);
                     q[11] = 0ULL;
                     std::memcpy(pkt + 12 * 8, imgSrc, imageBytes);
+            ps2T10RangeWatch("font-img", pktAddr, imageBytes, ctx);
 
                     constexpr uint32_t GIF_CHANNEL = 0x1000A000;
                     constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
@@ -515,6 +519,7 @@ namespace ps2_stubs
         uint8_t *frameVa = getMemPtr(rdram, frame + 0x8f8u);
         if (callerVa && frameVa)
             std::memcpy(frameVa, callerVa, 64u);
+            ps2T10RangeWatch("font-frameva", frame + 0x8f8u, 64u, ctx);
 
         SET_GPR_U32(ctx, 4, frame + 0x20u);
         SET_GPR_U32(ctx, 5, fmtAddr);

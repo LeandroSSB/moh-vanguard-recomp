@@ -6,6 +6,7 @@
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -203,11 +204,33 @@ namespace ps2_stubs
             return true;
         }
 
+        // M3-T10 probe: the SDK dispatcher handler slots (.data 0x5109F0..0x510A10)
+        // fill with foreign content late in the run; every traced store path saw
+        // zero hits, so the writer is a host-side bulk copy. This IOP->EE DMA
+        // writer carries raw IOP memory (loaded IRX code, driver data, kernel
+        // strings) into whatever EE destination the packet names — instrument it.
+        void t10SifRangeWatch(uint32_t address, uint32_t sizeBytes)
+        {
+            constexpr uint32_t kSlotBase = 0x5109F0u;
+            constexpr uint32_t kSlotEnd = kSlotBase + 0x20u;
+            const uint64_t writeEnd = static_cast<uint64_t>(address) + sizeBytes;
+            if (address < kSlotEnd && writeEnd > kSlotBase)
+            {
+                static std::atomic<uint32_t> s_logged{0};
+                if (s_logged.fetch_add(1, std::memory_order_relaxed) < 256u)
+                {
+                    std::cerr << "[t10-sif] iop-to-ee addr=0x" << std::hex << address
+                              << "+0x" << sizeBytes << std::dec << std::endl;
+                }
+            }
+        }
+
         bool writeEeRange(uint8_t *rdram, uint32_t address, const void *source, uint32_t sizeBytes)
         {
             if ((!source && sizeBytes != 0u) || !canAccessEeRange(rdram, address, sizeBytes))
                 return false;
             ps2TraceGuestRangeWrite(rdram, address, sizeBytes, "SIF IOP-to-EE DMA", nullptr);
+            t10SifRangeWatch(address, sizeBytes);
             const auto *bytes = static_cast<const uint8_t *>(source);
             for (uint32_t i = 0u; i < sizeBytes; ++i)
             {

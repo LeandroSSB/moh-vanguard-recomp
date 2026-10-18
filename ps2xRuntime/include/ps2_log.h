@@ -2,6 +2,7 @@
 #define PS2_LOG_H
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -160,8 +161,27 @@ inline int &depth()
     static thread_local int d = 0;
     return d;
 }
+inline constexpr size_t kT10ExecRingSize = 48;
+
+// M3-T10 probe: ring of the last entered recompiled-function names (static
+// strings, no copies). The scheduler slot-watch prints it when the SDK
+// dispatcher handler slots at 0x5109F0 change, naming the guest function
+// chain that was running when the host-side writer fired.
+inline std::array<const char *, kT10ExecRingSize> &t10_exec_ring()
+{
+    static thread_local std::array<const char *, kT10ExecRingSize> ring{};
+    return ring;
+}
+inline unsigned &t10_exec_ring_pos()
+{
+    static thread_local unsigned pos = 0;
+    return pos;
+}
+
 inline void log_entry(const char *name)
 {
+    t10_exec_ring()[t10_exec_ring_pos()] = name;
+    t10_exec_ring_pos() = (t10_exec_ring_pos() + 1u) % static_cast<unsigned>(kT10ExecRingSize);
     for (int i = 0; i < depth(); ++i)
         log_stream() << '\t';
     log_stream() << ">> " << name << " enter\n";

@@ -421,6 +421,13 @@ if(PS2X_ENABLE_ENGINE_SYNC_WATCH)
     )
 endif()
 
+option(PS2X_ENABLE_T10_SLOT_WATCH "Log guest writes to the Vanguard SDK dispatcher handler slots 0x5109F0 (M3-T10 diagnostic)" OFF)
+if(PS2X_ENABLE_T10_SLOT_WATCH)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_T10_SLOT_WATCH=1
+    )
+endif()
+
 option(PS2X_ENABLE_DRAW_COUNTER "Log total GS backend draws with milestone counts (bring-up)" OFF)
 if(PS2X_ENABLE_DRAW_COUNTER)
     target_compile_definitions(ps2_runtime PUBLIC

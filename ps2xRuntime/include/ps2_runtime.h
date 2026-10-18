@@ -241,6 +241,55 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
 #define PS2X_ENGINE_SYNC_WATCH 0
 #endif
 
+#ifndef PS2X_T10_SLOT_WATCH
+#define PS2X_T10_SLOT_WATCH 0
+#endif
+
+#if PS2X_T10_SLOT_WATCH
+// Vanguard M3-T10 diagnostic: log every guest store into the SDK TIMER0
+// dispatcher handler slots (8 x 4 B at 0x5109F0, walked by sub_00355300 with
+// `lw/jalr`). Zero in the ELF; the run showed them filled with foreign code
+// words / ASCII ("Read") late in the run — name the exact writing PC here.
+inline bool ps2T10SlotWatchHit(uint32_t guestAddr)
+{
+    return guestAddr - 0x5109F0u < 0x20u;
+}
+
+#endif
+
+// Range variant for host-side bulk writers (stubs/services that memcpy into
+// guest RAM): log once per op when [address, address+size) overlaps the slot
+// window. Compiles to a no-op when PS2X_T10_SLOT_WATCH is off so the call
+// sites do not need their own guards.
+inline void ps2T10RangeWatch(const char *op, uint32_t address, uint64_t size, const R5900Context *ctx)
+{
+#if PS2X_T10_SLOT_WATCH
+    constexpr uint32_t kSlotBase = 0x5109F0u;
+    constexpr uint32_t kSlotEnd = kSlotBase + 0x20u;
+    const uint64_t writeEnd = static_cast<uint64_t>(address) + size;
+    if (address < kSlotEnd && writeEnd > kSlotBase)
+    {
+        static std::atomic<uint32_t> s_logged{0};
+        if (s_logged.fetch_add(1, std::memory_order_relaxed) < 256u)
+        {
+            const uint32_t pc = ctx ? ctx->pc : 0u;
+            const uint32_t ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
+            RUNTIME_LOG("[t10-any] " << (op ? op : "write")
+                                     << " pc=0x" << std::hex << pc
+                                     << " ra=0x" << ra
+                                     << " addr=0x" << address
+                                     << "+0x" << size << std::dec
+                                     << std::endl);
+        }
+    }
+#else
+    (void)op;
+    (void)address;
+    (void)size;
+    (void)ctx;
+#endif
+}
+
 #if PS2X_ENGINE_SYNC_WATCH
 inline bool ps2EngineSyncWatchHit(uint32_t guestAddr, const uint8_t *rdram)
 {
@@ -294,6 +343,24 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
 {
     (void)valueHi;
     (void)op;
+#if PS2X_T10_SLOT_WATCH
+    if (size <= 16u && ps2T10SlotWatchHit(guestAddr))
+    {
+        static std::atomic<uint32_t> t10SlotWatchLogged{0};
+        if (t10SlotWatchLogged.load(std::memory_order_relaxed) < 4096)
+        {
+            t10SlotWatchLogged.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t pc = ctx ? ctx->pc : 0u;
+            const uint32_t ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
+            RUNTIME_LOG("[t10-write] " << op << " pc=0x" << std::hex << pc
+                                       << " ra=0x" << ra
+                                       << " addr=0x" << guestAddr
+                                       << " val=0x" << valueLo
+                                       << ":" << valueHi << std::dec
+                                       << std::endl);
+        }
+    }
+#endif
 #if PS2X_ENGINE_SYNC_WATCH
     // Vanguard bring-up diagnostic: log guest writes into the engine's
     // cooperative sync state (gate/counter/ring, deferred I/O record,

@@ -316,6 +316,7 @@ namespace ps2_stubs
             }
 
             fillPadStatus(outData, state, portState);
+            ps2T10RangeWatch("pad-fill32", dataAddr, 32u, nullptr);
 
             {
                 std::lock_guard<std::mutex> lock(g_padStateMutex);
@@ -620,6 +621,7 @@ namespace ps2_stubs
         {
             ps2TraceGuestRangeWrite(rdram, dmaAddr, 32u, "scePadPortOpen", ctx);
             std::memset(dmaStr, 0, 32);
+            ps2T10RangeWatch("pad-dmastr32", dmaAddr, 32u, ctx);
         }
         setReturnS32(ctx, 1);
     }

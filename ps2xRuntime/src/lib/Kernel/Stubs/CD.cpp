@@ -281,6 +281,23 @@ namespace ps2_stubs
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
 
+        // M3-T10 probe: log every decoded read (76/run) — the dispatcher-slot
+        // clobber (.data 0x5109F0) looks like disc data on a wrong buffer, and
+        // this stub writes sectors straight into `rdram + (buf & RAM_MASK)`.
+        {
+            static uint32_t s_t10ReadLogs = 0;
+            if (s_t10ReadLogs < 256)
+            {
+                ++s_t10ReadLogs;
+                RUNTIME_LOG("[cd-read] pc=0x" << std::hex << ctx->pc
+                                              << " ra=0x" << getRegU32(ctx, 31)
+                                              << " lbn=0x" << a0
+                                              << " sectors=" << std::dec << a1
+                                              << " buf=0x" << std::hex << a2
+                                              << std::dec << std::endl);
+            }
+        }
+
         struct CdReadArgs
         {
             uint32_t lbn = 0;

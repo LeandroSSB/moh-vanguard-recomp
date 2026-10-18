@@ -1359,6 +1359,73 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    // M3-T10 probe: the SDK dispatcher handler slots (.data 0x5109F0..0x510A10)
+    // fill with foreign code words / ASCII late in the run. The scheduler
+    // slot-watch localized the writer to execution windows entered at the
+    // vblank handlers 0x328d10/0x12e548 and the main loop 0x472870; the gen
+    // store watch ([t10-write]) and the host bulk-writer watches (LibC stubs,
+    // IopHost) all saw ZERO hits. This hook runs on EVERY guest branch from
+    // generated code — host-side code cannot hide between two branches — so a
+    // change observed here pins the writer to the exact branch site.
+    {
+        static uint32_t s_prev[8] = {};
+        static bool s_primed = false;
+        static uint32_t s_logged = 0;
+        if (rdram != nullptr && s_logged < 256u)
+        {
+            uint32_t cur[8];
+            std::memcpy(cur, rdram + 0x5109F0u, sizeof(cur));
+            if (!s_primed)
+            {
+                std::memcpy(s_prev, cur, sizeof(cur));
+                s_primed = true;
+            }
+            else if (std::memcmp(s_prev, cur, sizeof(cur)) != 0)
+            {
+                ++s_logged;
+                std::ostringstream line;
+                line << "[t10-branch] src=0x" << std::hex << sourcePc
+                     << " target=0x" << targetPc
+                     << " kind=" << describeGuestBranchKind(kind)
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                     << " slots:";
+                for (int i = 0; i < 8; ++i)
+                {
+                    line << " [" << i << "]0x" << cur[i];
+                }
+                line << std::endl;
+                RUNTIME_LOG(line.str());
+                std::memcpy(s_prev, cur, sizeof(cur));
+            }
+        }
+    }
+    // M3-T10 probe: the game's memcpy (sub_004727E4) is the function entering
+    // right before the dispatcher-slot/heap-sentinel clobbers; log its ABI
+    // args at every call so the exploding-size copy is measurable. Rate-limited
+    // to huge copies plus the first few, to keep the log small.
+    if (targetPc == 0x4727E4u)
+    {
+        static uint32_t s_t10MemcpyLogs = 0;
+        const uint32_t t10A0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0));
+        const uint32_t t10A1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0));
+        const uint32_t t10A2 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0));
+        if (s_t10MemcpyLogs < 64u || t10A2 > 0x100000u)
+        {
+            ++s_t10MemcpyLogs;
+            std::ostringstream line;
+            line << "[t10-memcpy] src=0x" << std::hex << sourcePc
+                 << " dst=0x" << t10A0
+                 << " from=0x" << t10A1
+                 << " n=0x" << t10A2;
+            if (t10A2 > 0x100000u)
+            {
+                line << "  <-- HUGE";
+            }
+            line << std::endl;
+            RUNTIME_LOG(line.str());
+        }
+    }
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 

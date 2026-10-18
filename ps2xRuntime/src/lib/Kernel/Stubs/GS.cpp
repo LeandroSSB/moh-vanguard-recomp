@@ -654,6 +654,7 @@ namespace ps2_stubs
         q[11] = 0ULL;
 
         std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
+            ps2T10RangeWatch("gs-imgload-pkt", pktAddr, totalImageBytes, ctx);
 
         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
@@ -1058,6 +1059,7 @@ namespace ps2_stubs
             return;
         }
         std::memcpy(ptr, &env, sizeof(env));
+            ps2T10RangeWatch("gs-env", envAddr, sizeof(env), ctx);
 
         setReturnS32(ctx, 8);
     }
