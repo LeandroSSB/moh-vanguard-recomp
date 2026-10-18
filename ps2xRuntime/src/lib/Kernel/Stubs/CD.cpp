@@ -8,6 +8,19 @@
 
 namespace ps2_stubs
 {
+    // M3-T6 probe counters (see CD.h).
+    std::atomic<uint32_t> g_cdProbeReadCalls{0u};
+    std::atomic<uint32_t> g_cdProbeReadOk{0u};
+    std::atomic<uint32_t> g_cdProbeReadUnresolved{0u};
+    std::atomic<uint32_t> g_cdProbeCompletionsQueued{0u};
+    std::atomic<uint32_t> g_cdProbeCompletionNoHandler{0u};
+    std::atomic<uint32_t> g_cdProbeCompletionDropped{0u};
+    std::atomic<uint32_t> g_cdProbeCallbackRegisters{0u};
+    std::atomic<uint32_t> g_cdProbeSearchFileCalls{0u};
+    std::atomic<uint32_t> g_cdProbeStStartCalls{0u};
+    std::atomic<uint32_t> g_cdProbeDiskReadyCalls{0u};
+    std::atomic<uint32_t> g_cdProbeSyncCalls{0u};
+
     namespace
     {
         constexpr uint32_t kCdStreamBlocking = 1u;
@@ -53,10 +66,12 @@ namespace ps2_stubs
             }
             if (runtime == nullptr || callback == 0u)
             {
+                ++g_cdProbeCompletionNoHandler;
                 return;
             }
             if (!runtime->hasFunction(callback))
             {
+                ++g_cdProbeCompletionDropped;
                 // The game registered a completion handler that is not a
                 // mapped function: the read finished but the event would be
                 // silently dropped. Log it (rate-limited) instead of losing
@@ -82,6 +97,7 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 28, ctx != nullptr ? getRegU32(ctx, 28) : 0u);
             SET_GPR_U32(&invocation.context, 29, 0u); // the executor binds the invocation stack
             SET_GPR_U32(&invocation.context, 31, 0u); // returning from the handler ends the invocation
+            ++g_cdProbeCompletionsQueued;
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
@@ -260,6 +276,7 @@ namespace ps2_stubs
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ++g_cdProbeReadCalls;
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
@@ -347,6 +364,7 @@ namespace ps2_stubs
 
             if (!ok)
             {
+                ++g_cdProbeReadUnresolved;
                 const uint32_t offset = a2 & PS2_RAM_MASK;
                 const size_t bytes = clampReadBytes(a1, offset);
                 if (bytes > 0)
@@ -369,6 +387,7 @@ namespace ps2_stubs
 
         if (ok)
         {
+            ++g_cdProbeReadOk;
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             // The read is already complete (synchronous model); deliver the
             // drive-completion event to the registered handler so the game's
@@ -384,6 +403,7 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ++g_cdProbeSyncCalls;
         setReturnS32(ctx, 0); // 0 = completed/not busy
     }
 
@@ -429,6 +449,7 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
         const uint32_t callback = getRegU32(ctx, 4);
+        ++g_cdProbeCallbackRegisters;
         uint32_t previous = 0u;
         {
             std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
@@ -450,6 +471,7 @@ namespace ps2_stubs
 
     void sceCdDiskReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ++g_cdProbeDiskReadyCalls;
         setReturnS32(ctx, 2);
     }
 
@@ -490,6 +512,7 @@ namespace ps2_stubs
         // state with sceCdCallback: the game arms whichever notification path
         // its engine uses, and completed reads deliver to it.
         const uint32_t callback = getRegU32(ctx, 4);
+        ++g_cdProbeCallbackRegisters;
         if (callback != 0u)
         {
             std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
@@ -637,6 +660,7 @@ namespace ps2_stubs
     {
         uint32_t fileAddr = getRegU32(ctx, 4);
         uint32_t pathAddr = getRegU32(ctx, 5);
+        ++g_cdProbeSearchFileCalls;
         const std::string path = readPs2CStringBounded(rdram, pathAddr, 260);
         const std::string normalizedPath = normalizeCdPathNoPrefix(path);
         static uint32_t traceCount = 0;
@@ -1022,6 +1046,7 @@ namespace ps2_stubs
 
     void sceCdStStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ++g_cdProbeStStartCalls;
         const uint32_t lbn = getRegU32(ctx, 4);
         const uint32_t modeAddr = getRegU32(ctx, 5);
         uint8_t spindleControl = 0u;

@@ -2,6 +2,7 @@
 
 #include "ps2_stubs.h"
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -9,6 +10,21 @@
 
 namespace ps2_stubs
 {
+
+    // M3-T6 probe: coarse counters over the CD service surface, read by the
+    // run:tick engine-state dump in ps2_runtime.cpp. Defined in CD.cpp.
+    extern std::atomic<uint32_t> g_cdProbeReadCalls;
+    extern std::atomic<uint32_t> g_cdProbeReadOk;
+    extern std::atomic<uint32_t> g_cdProbeReadUnresolved;
+    extern std::atomic<uint32_t> g_cdProbeCompletionsQueued;
+    extern std::atomic<uint32_t> g_cdProbeCompletionNoHandler;
+    extern std::atomic<uint32_t> g_cdProbeCompletionDropped;
+    extern std::atomic<uint32_t> g_cdProbeCallbackRegisters;
+    extern std::atomic<uint32_t> g_cdProbeSearchFileCalls;
+    extern std::atomic<uint32_t> g_cdProbeStStartCalls;
+    extern std::atomic<uint32_t> g_cdProbeDiskReadyCalls;
+    extern std::atomic<uint32_t> g_cdProbeSyncCalls;
+
 
     struct CdDebugFileEntry
     {

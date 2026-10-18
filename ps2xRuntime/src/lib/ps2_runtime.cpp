@@ -2581,6 +2581,54 @@ void PS2Runtime::run()
                         RUNTIME_LOG(std::dec);
                     }
 
+                    // M3-T6 probe: who feeds the post-preload idle? Game-side
+                    // tick (0x510A18, read by the dispatcher-slot timers),
+                    // stream-ring head/limits (0x68F710 obj: head at +0x24 =
+                    // 0x68F734, sentinel at +0x20 = 0x68F730), the JOBS queue
+                    // (gate 0x642DC0, sema id 0x642DCC, cursors +0x2C/+0x3C =
+                    // 0x642DEC/0x642DFC) and the CD stub counters from CD.h.
+                    {
+                        const uint32_t ringSentinel = m_memory.read32(0x68F730);
+                        const uint32_t ringHead = m_memory.read32(0x68F734);
+                        const uint32_t semaId = m_memory.read32(0x642DCC);
+                        const uint32_t qCur0 = m_memory.read32(0x642DEC);
+                        const uint32_t qCur1 = m_memory.read32(0x642DFC);
+                        const uint32_t gameTick = m_memory.read32(0x510A18);
+                        const uint32_t dispThread = m_memory.read32(0x51069C);
+                        uint32_t timerSlots = 0;
+                        for (uint32_t slot = 0; slot < 8u; ++slot)
+                        {
+                            timerSlots |= (m_memory.read32(0x5109F0 + slot * 4u) != 0u ? 1u : 0u) << slot;
+                        }
+                        const uint32_t slot0 = m_memory.read32(0x64B3A0);
+                        const uint32_t slot0Due = m_memory.read32(0x64B3A8);
+                        const uint32_t slot1 = m_memory.read32(0x64B3B0);
+                        const uint32_t slot1Due = m_memory.read32(0x64B3B8);
+                        RUNTIME_LOG("[m3t6] tick=0x" << std::hex << gameTick
+                                                     << " dispThd=" << std::dec << dispThread
+                                                     << " tmrSlots=0x" << std::hex << timerSlots
+                                                     << " slot0=0x" << slot0 << "/due=0x" << slot0Due
+                                                     << " slot1=0x" << slot1 << "/due=0x" << slot1Due
+                                                     << " ringSent=0x" << ringSentinel
+                                                     << " ringHead=0x" << ringHead
+                                                     << " gate=0x" << gateWord
+                                                     << " semaId=" << std::dec << semaId
+                                                     << " qCur0=" << qCur0
+                                                     << " qCur1=" << qCur1
+                                                     << " cd{read=" << ps2_stubs::g_cdProbeReadCalls.load()
+                                                     << ",ok=" << ps2_stubs::g_cdProbeReadOk.load()
+                                                     << ",unres=" << ps2_stubs::g_cdProbeReadUnresolved.load()
+                                                     << ",cbq=" << ps2_stubs::g_cdProbeCompletionsQueued.load()
+                                                     << ",cbNone=" << ps2_stubs::g_cdProbeCompletionNoHandler.load()
+                                                     << ",cbDrop=" << ps2_stubs::g_cdProbeCompletionDropped.load()
+                                                     << ",cbReg=" << ps2_stubs::g_cdProbeCallbackRegisters.load()
+                                                     << ",search=" << ps2_stubs::g_cdProbeSearchFileCalls.load()
+                                                     << ",stStart=" << ps2_stubs::g_cdProbeStStartCalls.load()
+                                                     << ",dready=" << ps2_stubs::g_cdProbeDiskReadyCalls.load()
+                                                     << ",sync=" << ps2_stubs::g_cdProbeSyncCalls.load()
+                                                     << "}" << std::endl);
+                    }
+
                     // M3-T4 phase probe. The steady-state main loop lives in
                     // the ring poll sub_00344A58 (tick pc 0x344cb0): it walks
                     // a stream-channel node chain (table 0x6480E0, selector
