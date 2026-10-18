@@ -27,6 +27,22 @@ namespace ps2recomp
             const std::function<bool(uint32_t, uint32_t &)> &readWord);
         static std::unordered_set<std::string> findRecursiveFunctions(
             const std::unordered_map<std::string, std::vector<std::string>> &callGraph);
+
+        // A word that compilers emit as the first instruction of a standard
+        // function prologue (stack allocation or return-address save).
+        static bool looksLikeFunctionPrologue(uint32_t instructionWord);
+
+        // Scans every loadable section for 4-byte data words that point into
+        // [textStart, textEnd) at an address that is not a known function
+        // start and whose first instruction looks like a function prologue.
+        // Such targets are callable guest entries registered through data
+        // tables (callback chains); without an entry the runtime cannot
+        // dispatch an indirect call to them.
+        static std::vector<uint32_t> collectDataReferencedEntryCandidates(
+            const std::vector<Section> &sections,
+            uint32_t textStart,
+            uint32_t textEnd,
+            const std::unordered_set<uint32_t> &knownStarts);
     };
 }
 

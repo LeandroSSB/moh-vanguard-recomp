@@ -60,6 +60,7 @@ namespace ps2recomp
         identifyRecursiveFunctions();
         analyzeRegisterUsage();
         runSignaturePass();
+        analyzeDataReferencedEntryPoints();
 
         optimizePatches();
         printAnalysisSummary();
@@ -721,6 +722,76 @@ namespace ps2recomp
         const std::function<bool(uint32_t, uint32_t &)> &readWord)
     {
         return AnalysisPasses::detectJumpTables(instructions, sections, readWord);
+    }
+
+    bool ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(uint32_t instructionWord)
+    {
+        return AnalysisPasses::looksLikeFunctionPrologue(instructionWord);
+    }
+
+    std::vector<uint32_t> ElfAnalyzer::findDataReferencedEntryCandidatesForHeuristics(
+        const std::vector<Section> &sections,
+        uint32_t textStart,
+        uint32_t textEnd,
+        const std::unordered_set<uint32_t> &knownStarts)
+    {
+        return AnalysisPasses::collectDataReferencedEntryCandidates(sections, textStart, textEnd, knownStarts);
+    }
+
+    void ElfAnalyzer::analyzeDataReferencedEntryPoints()
+    {
+        // Guest code can reach functions only through data tables of function
+        // pointers (SDK printf output chains, driver callback registries,
+        // timer tables). The CFG walk from the ELF entry never sees those
+        // targets, and a symbol-less one never becomes an entry point — the
+        // generated module then has no callable function there and an
+        // indirect call at runtime kills the calling thread. Scan the data
+        // words for prologue-shaped targets the function discovery missed
+        // and expose them as address-referenced entry points.
+        uint32_t textStart = std::numeric_limits<uint32_t>::max();
+        uint32_t textEnd = 0u;
+        for (const auto &section : m_context.sections)
+        {
+            if (!section.isCode || section.size == 0u)
+            {
+                continue;
+            }
+
+            textStart = std::min(textStart, section.address);
+            textEnd = std::max(textEnd, section.address + section.size);
+        }
+
+        if (textStart >= textEnd)
+        {
+            return;
+        }
+
+        std::unordered_set<uint32_t> knownStarts;
+        knownStarts.reserve(m_context.functions.size());
+        for (const auto &func : m_context.functions)
+        {
+            knownStarts.insert(func.start);
+        }
+
+        const std::vector<uint32_t> candidates =
+            findDataReferencedEntryCandidatesForHeuristics(m_context.sections, textStart, textEnd, knownStarts);
+        if (candidates.empty())
+        {
+            return;
+        }
+
+        for (const uint32_t address : candidates)
+        {
+            std::ostringstream name;
+            name << "sub_" << std::hex << std::setw(8) << std::setfill('0') << address
+                 << "@0x" << std::hex << std::setw(8) << std::setfill('0') << address;
+            if (m_untrackedStubFunctions.insert(name.str()).second)
+            {
+                std::cout << "Data-referenced entry candidate: " << name.str() << std::endl;
+            }
+        }
+
+        std::cout << "- " << candidates.size() << " data-referenced entry candidate(s)" << std::endl;
     }
 
     void ElfAnalyzer::detectJumpTables()

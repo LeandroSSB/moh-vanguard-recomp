@@ -236,5 +236,78 @@ void register_elf_analyzer_tests()
                 std::vector<Instruction>{invalid, bne, filler, jtLui, jtAddiu, jtLoad, jtJump}, std::vector<Section>(),
                 readWord);
             t.Equals(invalidTables.size(), static_cast<size_t>(0),
-                     "bounds over guard limit should not produce a jump table"); }); });
+                     "bounds over guard limit should not produce a jump table"); });
+
+                       tc.Run("data-referenced entry candidates", [](TestCase &t)
+                              {
+            // Games register callbacks through data tables of function
+            // pointers (SDK printf output chains, timer tables, IRQ
+            // dispatch). A pointer whose target is a prologue-shaped
+            // address that no discovered function covers is a callable
+            // guest entry the module must expose — Vanguard's printf
+            // chain killed both of its threads on exactly such a target
+            // (0x356998, referenced from the data word at 0x510a54).
+            static const uint32_t textBytes[16] = {
+                0x27BDFFF0u, // 0x00100000: addiu sp, sp, -16 (known start)
+                0x03E00008u, // 0x00100004: jr ra
+                0x00000000u, // 0x00100008
+                0x00000000u, // 0x0010000c
+                0x00000000u, // 0x00100010
+                0x00000000u, // 0x00100014
+                0x00000000u, // 0x00100018
+                0x00000000u, // 0x0010001c
+                0x27BDFFE0u, // 0x00100020: addiu sp, sp, -32 (unknown prologue -> candidate)
+                0xFFBF0020u, // 0x00100024: sd ra, 0x20(sp)
+                0x00000000u, // 0x00100028
+                0x00000000u, // 0x0010002c
+                0x00000000u, // 0x00100030: interior non-prologue (reject target)
+                0x00000000u, // 0x00100034
+                0x00000000u, // 0x00100038
+                0x00000000u, // 0x0010003c
+            };
+            static const uint32_t dataBytes[4] = {
+                0x00100020u, // pointer at 0x00200000 -> unknown prologue: candidate
+                0x00100030u, // pointer at 0x00200004 -> interior non-prologue: rejected
+                0x00200008u, // pointer at 0x00200008 -> outside text: rejected
+                0x00100000u, // pointer at 0x0020000c -> known start: rejected
+            };
+
+            std::vector<Section> sections;
+            Section textSec{};
+            textSec.name = ".text";
+            textSec.address = 0x00100000u;
+            textSec.size = sizeof(textBytes);
+            textSec.data = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(textBytes));
+            textSec.isCode = true;
+            sections.push_back(textSec);
+
+            Section dataSec{};
+            dataSec.name = ".data";
+            dataSec.address = 0x00200000u;
+            dataSec.size = sizeof(dataBytes);
+            dataSec.data = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(dataBytes));
+            dataSec.isData = true;
+            sections.push_back(dataSec);
+
+            const std::unordered_set<uint32_t> knownStarts{0x00100000u};
+
+            auto candidates = ElfAnalyzer::findDataReferencedEntryCandidatesForHeuristics(
+                sections, 0x00100000u, 0x00100040u, knownStarts);
+            t.Equals(candidates.size(), static_cast<size_t>(1),
+                     "only the unknown prologue target should be a candidate");
+            if (candidates.size() == 1u)
+            {
+                t.Equals(candidates[0], 0x00100020u, "candidate address should match the data pointer target");
+            }
+
+            t.IsTrue(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0x27BDFFF0u),
+                     "addiu sp, sp, -imm is a function prologue");
+            t.IsTrue(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0x67BDFFE0u),
+                     "daddiu sp, sp, -imm is a function prologue");
+            t.IsTrue(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0xFFBF0020u),
+                     "sd ra, imm(sp) is a function prologue");
+            t.IsFalse(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0x00000000u),
+                      "nop is not a function prologue");
+            t.IsFalse(ElfAnalyzer::looksLikeFunctionPrologueForHeuristics(0x24020001u),
+                      "addiu v0, zero, 1 is not a function prologue"); }); });
 }

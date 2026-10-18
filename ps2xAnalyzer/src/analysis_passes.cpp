@@ -3,6 +3,7 @@
 #include "ps2recomp/instructions.h"
 
 #include <algorithm>
+#include <cstring>
 #include <optional>
 #include <utility>
 
@@ -442,5 +443,113 @@ namespace ps2recomp
         }
 
         return recursive;
+    }
+
+    bool AnalysisPasses::looksLikeFunctionPrologue(uint32_t instructionWord)
+    {
+        switch (instructionWord >> 16)
+        {
+        case 0x27BDu: // addiu $sp, $sp, imm
+        case 0x67BDu: // daddiu $sp, $sp, imm
+        case 0xFFBFu: // sd $ra, imm($sp)
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    namespace
+    {
+        const Section *findSectionWithData(const std::vector<Section> &sections, uint32_t address)
+        {
+            for (const auto &section : sections)
+            {
+                if (section.data == nullptr || section.size < 4u)
+                {
+                    continue;
+                }
+
+                if (address < section.address || address + 4u > section.address + section.size)
+                {
+                    continue;
+                }
+
+                return &section;
+            }
+
+            return nullptr;
+        }
+
+        bool readSectionWord(const std::vector<Section> &sections, uint32_t address, uint32_t &outWord)
+        {
+            const Section *section = findSectionWithData(sections, address);
+            if (section == nullptr)
+            {
+                return false;
+            }
+
+            const size_t offset = static_cast<size_t>(address - section->address);
+            std::memcpy(&outWord, section->data + offset, sizeof(outWord));
+            return true;
+        }
+    }
+
+    std::vector<uint32_t> AnalysisPasses::collectDataReferencedEntryCandidates(
+        const std::vector<Section> &sections,
+        uint32_t textStart,
+        uint32_t textEnd,
+        const std::unordered_set<uint32_t> &knownStarts)
+    {
+        std::vector<uint32_t> candidates;
+        if (textStart >= textEnd)
+        {
+            return candidates;
+        }
+
+        for (const auto &section : sections)
+        {
+            if (section.data == nullptr || section.isBSS || section.size < 4u)
+            {
+                continue;
+            }
+
+            const size_t wordCount = section.size / 4u;
+            for (size_t index = 0; index < wordCount; ++index)
+            {
+                uint32_t word = 0u;
+                std::memcpy(&word, section.data + index * 4u, sizeof(word));
+
+                // Only pointers into executable text matter; keep them
+                // 4-aligned and skip the ones discovery already covers.
+                if (word < textStart || word >= textEnd || (word & 0x3u) != 0u)
+                {
+                    continue;
+                }
+
+                if (knownStarts.contains(word))
+                {
+                    continue;
+                }
+
+                uint32_t firstInstruction = 0u;
+                if (!readSectionWord(sections, word, firstInstruction))
+                {
+                    continue;
+                }
+
+                if (!looksLikeFunctionPrologue(firstInstruction))
+                {
+                    continue;
+                }
+
+                if (std::find(candidates.begin(), candidates.end(), word) == candidates.end())
+                {
+                    candidates.push_back(word);
+                }
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end());
+        return candidates;
     }
 }
