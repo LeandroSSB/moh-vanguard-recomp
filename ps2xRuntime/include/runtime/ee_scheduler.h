@@ -194,9 +194,23 @@ struct EeThreadSnapshot
     EeThreadStatus status = EeThreadStatus::Dormant;
     EeWaitReason waitReason = EeWaitReason::None;
     int waitId = 0;
+    // Bring-up diagnostics (Vanguard M3): payload details for External/Mpeg/
+    // VSync waits, so the steady-state blocker names itself in the tick dump.
+    uint32_t waitType = 0;
+    uint64_t waitToken = 0;
+    uint64_t waitAfterTick = 0;
     int suspendCount = 0;
     uint32_t wakeupCount = 0;
     uint32_t invocationDepth = 0;
+};
+
+struct EeIrqHandlerSnapshot
+{
+    int id = 0;
+    uint32_t cause = 0;
+    uint32_t handler = 0;
+    uint32_t argument = 0;
+    bool enabled = true;
 };
 
 struct EeSemaphoreSnapshot
@@ -226,6 +240,8 @@ struct EeKernelSnapshot
     std::vector<EeThreadSnapshot> threads;
     std::vector<EeSemaphoreSnapshot> semaphores;
     std::vector<EeEventFlagSnapshot> eventFlags;
+    std::vector<EeIrqHandlerSnapshot> intcHandlers;
+    std::vector<EeIrqHandlerSnapshot> dmacHandlers;
 };
 
 enum class EeEventType : uint8_t

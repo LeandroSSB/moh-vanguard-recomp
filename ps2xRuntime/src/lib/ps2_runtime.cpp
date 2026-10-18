@@ -2548,6 +2548,19 @@ void PS2Runtime::run()
                                                                 << " result=0x" << m_memory.read32(recAddr + 8)
                                                                 << std::dec);
                         }
+                        // M3-T5: the waiter (sub_0033F208) indexes the record
+                        // table with the handle's LOW byte (byte 3 of the
+                        // stack word), not handle>>24. Print the true record
+                        // the spin actually polls.
+                        const uint32_t recAddrLo = msgTable + static_cast<uint32_t>(waitHandle & 0xFFu) * 48u;
+                        if (recAddrLo < 0x02000000u)
+                        {
+                            RUNTIME_LOG("[engine-state] recLo=0x" << std::hex << recAddrLo
+                                                                  << " key=0x" << m_memory.read32(recAddrLo)
+                                                                  << " [+4]=0x" << m_memory.read32(recAddrLo + 4)
+                                                                  << " result=0x" << m_memory.read32(recAddrLo + 8)
+                                                                  << std::dec);
+                        }
                     }
                     else
                     {
@@ -2628,6 +2641,65 @@ void PS2Runtime::run()
                             }
                         }
                         RUNTIME_LOG(std::dec);
+                    }
+
+                    // M3-T5 thread-state probe. Names what the main thread
+                    // (and every other guest thread) is blocked on in the
+                    // steady state, plus the IRQ handler tables that show
+                    // which ISRs the idle loop actually runs. Same opt-in
+                    // gate as the tick dump; racy-by-design like the rest.
+                    // (Comma-free: this whole block is macro text inside
+                    // PS2_IF_AGRESSIVE_LOGS.)
+                    {
+                        const auto threadSnap = m_eeScheduler->snapshot();
+                        auto reasonName = [](EeWaitReason reason) -> const char *
+                        {
+                            switch (reason)
+                            {
+                            case EeWaitReason::None: return "None";
+                            case EeWaitReason::Sleep: return "Sleep";
+                            case EeWaitReason::Semaphore: return "Semaphore";
+                            case EeWaitReason::EventFlag: return "EventFlag";
+                            case EeWaitReason::VSync: return "VSync";
+                            case EeWaitReason::External: return "External";
+                            case EeWaitReason::Mpeg: return "Mpeg";
+                            default: return "?";
+                            }
+                        };
+                        for (const auto &t : threadSnap.threads)
+                        {
+                            RUNTIME_LOG("[thread-state] id=" << std::dec << t.id
+                                                             << " entry=0x" << std::hex << t.entry
+                                                             << " pc=0x" << t.pc
+                                                             << " sp=0x" << t.sp
+                                                             << " prio=" << std::dec << t.currentPriority
+                                                             << " status=" << static_cast<int>(t.status)
+                                                             << " wait=" << reasonName(t.waitReason)
+                                                             << " waitId=" << t.waitId
+                                                             << std::hex
+                                                             << " waitType=0x" << t.waitType
+                                                             << " waitToken=0x" << t.waitToken
+                                                             << " vsyncAfterTick=0x" << t.waitAfterTick
+                                                             << std::dec);
+                        }
+                        for (const auto &h : threadSnap.intcHandlers)
+                        {
+                            RUNTIME_LOG("[intc-handler] id=" << std::dec << h.id
+                                                             << " cause=" << h.cause
+                                                             << " handler=0x" << std::hex << h.handler
+                                                             << " arg=0x" << h.argument
+                                                             << " enabled=" << (h.enabled ? 1 : 0)
+                                                             << std::dec);
+                        }
+                        for (const auto &h : threadSnap.dmacHandlers)
+                        {
+                            RUNTIME_LOG("[dmac-handler] id=" << std::dec << h.id
+                                                             << " cause=" << h.cause
+                                                             << " handler=0x" << std::hex << h.handler
+                                                             << " arg=0x" << h.argument
+                                                             << " enabled=" << (h.enabled ? 1 : 0)
+                                                             << std::dec);
+                        }
                     }
                 }
 

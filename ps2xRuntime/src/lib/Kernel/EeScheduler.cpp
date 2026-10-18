@@ -1517,6 +1517,15 @@ void EeScheduler::publishSnapshot()
         snapshot.status = item.status;
         snapshot.waitReason = item.wait.reason;
         snapshot.waitId = waitObjectId(item.wait);
+        if (const EeExternalWait *external = std::get_if<EeExternalWait>(&item.wait.payload))
+        {
+            snapshot.waitType = external->type;
+            snapshot.waitToken = external->token;
+        }
+        else if (const EeVSyncWait *vsync = std::get_if<EeVSyncWait>(&item.wait.payload))
+        {
+            snapshot.waitAfterTick = vsync->afterTick;
+        }
         snapshot.suspendCount = item.suspendCount;
         snapshot.wakeupCount = item.wakeupCount;
         snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
@@ -1544,6 +1553,28 @@ void EeScheduler::publishSnapshot()
                                                       static_cast<uint32_t>(item.waiters.size())});
     }
     std::sort(next.eventFlags.begin(), next.eventFlags.end(), [](const auto &left, const auto &right)
+              { return left.id < right.id; });
+    // Bring-up diagnostics (Vanguard M3): publish the IRQ handler tables so
+    // the tick dump names which guest ISRs the steady state actually runs.
+    for (const auto &[id, item] : m_intcHandlers)
+    {
+        next.intcHandlers.push_back(EeIrqHandlerSnapshot{id,
+                                                         item.cause,
+                                                         item.handler,
+                                                         item.argument,
+                                                         item.enabled});
+    }
+    std::sort(next.intcHandlers.begin(), next.intcHandlers.end(), [](const auto &left, const auto &right)
+              { return left.id < right.id; });
+    for (const auto &[id, item] : m_dmacHandlers)
+    {
+        next.dmacHandlers.push_back(EeIrqHandlerSnapshot{id,
+                                                         item.cause,
+                                                         item.handler,
+                                                         item.argument,
+                                                         item.enabled});
+    }
+    std::sort(next.dmacHandlers.begin(), next.dmacHandlers.end(), [](const auto &left, const auto &right)
               { return left.id < right.id; });
     {
         std::lock_guard lock(m_snapshotMutex);
