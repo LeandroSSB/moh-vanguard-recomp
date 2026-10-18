@@ -18,6 +18,15 @@ namespace ps2_syscalls
                              bool dmac,
                              bool enabled)
         {
+            // M3-T8 probe: the game's clock heartbeat rides a timer INTC
+            // cause; if the guest masks it mid-run every downstream clock
+            // freezes. These calls are rare, so log every one.
+            RUNTIME_LOG("[t8-irqctl] " << (dmac ? "dmac" : "intc")
+                                        << (enabled ? " enable" : " disable")
+                                        << " cause=0x" << std::hex << getRegU32(ctx, 4)
+                                        << " pc=0x" << ctx->pc
+                                        << " ra=0x" << getRegU32(ctx, 31)
+                                        << std::dec << std::endl);
             setReturnS32(ctx,
                          scheduler(rdram, ctx, runtime)
                              .setIrqCauseEnabled(dmac, getRegU32(ctx, 4), enabled));

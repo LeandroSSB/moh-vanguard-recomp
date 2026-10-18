@@ -396,7 +396,19 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+    const uint32_t t8Raised = m_runtime.memory().advanceEeTimers(elapsed);
+    if (t8Raised != 0u)
+    {
+        static uint32_t s_t8RaiseCount = 0u;
+        ++s_t8RaiseCount;
+        if (s_t8RaiseCount <= 12u || (s_t8RaiseCount % 512u) == 0u)
+        {
+            RUNTIME_LOG("[t8-timer] raise #" << s_t8RaiseCount
+                                             << " mask=0x" << std::hex << t8Raised
+                                             << std::dec << std::endl);
+        }
+    }
+    m_pendingEeTimerInterrupts |= t8Raised;
     m_runtime.advanceIopEeCycles(elapsed);
     if (m_pendingEeTimerInterrupts != 0u)
     {
@@ -674,10 +686,24 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
         target->wait.reason == EeWaitReason::Sleep)
     {
+        static uint32_t s_t8WakeOk = 0u;
+        ++s_t8WakeOk;
+        if (s_t8WakeOk <= 16u || (s_t8WakeOk % 256u) == 0u)
+        {
+            RUNTIME_LOG("[t8-wake] ready tid=" << id << " #" << s_t8WakeOk << std::endl);
+        }
         makeReady(*target, KE_OK, interruptSafe);
     }
     else
     {
+        static uint32_t s_t8WakeCounted = 0u;
+        ++s_t8WakeCounted;
+        if (s_t8WakeCounted <= 16u || (s_t8WakeCounted % 256u) == 0u)
+        {
+            RUNTIME_LOG("[t8-wake] counted tid=" << id
+                                                 << " status=" << static_cast<int>(target->status)
+                                                 << " #" << s_t8WakeCounted << std::endl);
+        }
         ++target->wakeupCount;
     }
     publishSnapshot();
@@ -1262,7 +1288,29 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (!dmac && cause >= 9u && cause <= 12u)
+        {
+            static uint32_t s_t8MaskedTimer = 0u;
+            ++s_t8MaskedTimer;
+            if (s_t8MaskedTimer <= 8u || (s_t8MaskedTimer % 512u) == 0u)
+            {
+                RUNTIME_LOG("[t8-irq] timer cause " << cause
+                                                    << " SKIPPED by mask (enabled=0x"
+                                                    << std::hex << mask << std::dec
+                                                    << ") #" << s_t8MaskedTimer << std::endl);
+            }
+        }
         return;
+    }
+    if (!dmac && cause >= 9u && cause <= 12u)
+    {
+        static uint32_t s_t8DispatchedTimer = 0u;
+        ++s_t8DispatchedTimer;
+        if (s_t8DispatchedTimer <= 12u || (s_t8DispatchedTimer % 512u) == 0u)
+        {
+            RUNTIME_LOG("[t8-irq] timer cause " << cause
+                                                << " dispatched #" << s_t8DispatchedTimer << std::endl);
+        }
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
     std::vector<EeIrqHandler> matching;
@@ -1954,6 +2002,17 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         const EeAlarm alarm = it->second;
         m_alarms.erase(it);
+        {
+            static uint32_t s_t8AlarmFires = 0u;
+            ++s_t8AlarmFires;
+            if (s_t8AlarmFires <= 8u || (s_t8AlarmFires % 512u) == 0u)
+            {
+                RUNTIME_LOG("[t8-alarm] fire #" << s_t8AlarmFires
+                                                << " handler=0x" << std::hex << alarm.handler
+                                                << " arg=0x" << alarm.argument
+                                                << std::dec << std::endl);
+            }
+        }
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::Alarm;
         invocation.context.pc = alarm.handler;

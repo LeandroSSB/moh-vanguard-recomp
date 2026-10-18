@@ -1139,6 +1139,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         {
             const uint32_t previousMode = timer.mode;
             const uint32_t status = (previousMode & kEeTimerModeStatusMask) & ~(value & kEeTimerModeStatusMask);
+            if (timerIndex == 1u)
+            {
+                static uint32_t s_t8T1ModeWrites = 0u;
+                ++s_t8T1ModeWrites;
+                if (s_t8T1ModeWrites <= 10u || (s_t8T1ModeWrites % 256u) == 0u)
+                {
+                    RUNTIME_LOG("[t8-t1mode] write #" << s_t8T1ModeWrites
+                                                      << " value=0x" << std::hex << value
+                                                      << " prev=0x" << previousMode
+                                                      << std::dec << std::endl);
+                }
+            }
             timer.mode = (value & kEeTimerModeConfigMask) | status;
             if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
             {
