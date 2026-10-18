@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -2410,6 +2411,80 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        // Bring-up diagnostic (default-off): opt-in one-shot guest RAM dump
+        // for content-verification runs. PS2X_DUMP_MEM=addr,size,path[,tick]
+        // writes [addr, addr+size) of RDRAM to `path` once, when the render
+        // loop reaches iteration `tick` (default 2500, ~42 s at 60 Hz; one
+        // iteration per EndDrawing). The dump read races the game thread by
+        // design — diagnostic only, worst case a torn sample at whatever
+        // write cursor is live at that instant.
+        {
+            static const char *s_dumpSpec = std::getenv("PS2X_DUMP_MEM");
+            static bool s_dumpParsed = false;
+            static bool s_dumpValid = false;
+            static bool s_dumpDone = false;
+            static uint32_t s_dumpAddr = 0;
+            static uint32_t s_dumpSize = 0;
+            static uint64_t s_dumpAtTick = 2500;
+            static uint64_t s_dumpTick = 0;
+            static std::string s_dumpPath;
+
+            if (s_dumpSpec != nullptr && !s_dumpParsed)
+            {
+                s_dumpParsed = true;
+                const std::string spec(s_dumpSpec);
+                const size_t c1 = spec.find(',');
+                const size_t c2 = c1 == std::string::npos ? std::string::npos : spec.find(',', c1 + 1);
+                const size_t c3 = c2 == std::string::npos ? std::string::npos : spec.find(',', c2 + 1);
+                if (c1 == std::string::npos || c2 == std::string::npos)
+                {
+                    std::cerr << "[PS2X_DUMP_MEM] bad spec (want addr,size,path[,tick]): " << spec << std::endl;
+                }
+                else
+                {
+                    s_dumpAddr = static_cast<uint32_t>(std::strtoull(spec.substr(0, c1).c_str(), nullptr, 0));
+                    s_dumpSize = static_cast<uint32_t>(std::strtoull(spec.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 0));
+                    s_dumpPath = spec.substr(c2 + 1, c3 == std::string::npos ? std::string::npos : c3 - c2 - 1);
+                    if (c3 != std::string::npos)
+                    {
+                        s_dumpAtTick = std::strtoull(spec.substr(c3 + 1).c_str(), nullptr, 0);
+                    }
+                    s_dumpValid = s_dumpSize > 0
+                                  && static_cast<uint64_t>(s_dumpAddr) + s_dumpSize <= PS2_RAM_SIZE
+                                  && !s_dumpPath.empty();
+                    if (!s_dumpValid)
+                    {
+                        std::cerr << "[PS2X_DUMP_MEM] rejected spec (size/address out of RDRAM?): " << spec << std::endl;
+                    }
+                }
+            }
+
+            if (s_dumpValid && !s_dumpDone && ++s_dumpTick >= s_dumpAtTick)
+            {
+                s_dumpDone = true;
+                uint8_t *const rdram = m_memory.getRDRAM();
+                bool wrote = false;
+                std::ofstream out(s_dumpPath, std::ios::binary | std::ios::trunc);
+                if (rdram != nullptr && out.is_open())
+                {
+                    out.write(reinterpret_cast<const char *>(rdram + s_dumpAddr),
+                              static_cast<std::streamsize>(s_dumpSize));
+                    out.close();
+                    wrote = out.good();
+                }
+                if (wrote)
+                {
+                    RUNTIME_LOG("[dump-mem] wrote 0x" << std::hex << s_dumpSize << " bytes from 0x"
+                                                      << s_dumpAddr << " to " << s_dumpPath
+                                                      << " at loop tick " << std::dec << s_dumpTick << std::endl);
+                }
+                else
+                {
+                    std::cerr << "[PS2X_DUMP_MEM] failed to write " << s_dumpPath << std::endl;
+                }
+            }
+        }
+
         // Completed CD reads queue their completion handler (sceCdCallback /
         // sceCdInitEeCB) directly from the sceCdRead stub, which runs on the
         // EE executor — the thread that owns the scheduler's invocation queue.
