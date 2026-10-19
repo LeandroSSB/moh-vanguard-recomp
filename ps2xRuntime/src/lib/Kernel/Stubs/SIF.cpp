@@ -13,6 +13,11 @@
 
 namespace ps2_stubs
 {
+    // M5-T1 probe: call counters for the SIF DMA surface used by the game's
+    // statically linked IOP glue (pad/mtap/mc boot path).
+    std::atomic<uint32_t> g_sifDmaStatCalls{0u};
+    std::atomic<uint32_t> g_sifSetDmaCalls{0u};
+
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         TODO_NAMED("sceSifCmdIntrHdlr", rdram, ctx, runtime);
@@ -352,6 +357,8 @@ namespace ps2_stubs
         (void)runtime;
         (void)getRegU32(ctx, 4); // trid
 
+        ++g_sifDmaStatCalls;
+
         // Transfers are applied immediately by sceSifSetDma in this runtime.
         setReturnS32(ctx, -1);
     }
@@ -651,6 +658,8 @@ namespace ps2_stubs
 
     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ++g_sifSetDmaCalls;
+
         const uint32_t dmatAddr = getRegU32(ctx, 4);
         const uint32_t count = getRegU32(ctx, 5);
 

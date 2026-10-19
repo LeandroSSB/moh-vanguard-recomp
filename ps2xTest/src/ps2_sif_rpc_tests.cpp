@@ -626,5 +626,49 @@ void register_ps2_sif_rpc_tests()
                      "recv payload should match stack-selected transfer size");
         });
 
+        // MOH Vanguard IOP-glue contract (M5-T1): the glue's unhandled rpc
+        // 0xFF version probe must answer the "2800" tag the EE side accepts
+        // (sub_49F940), not zeros.
+        tc.Run("MOH Vanguard glue: version probe answers 2800", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kGlueClientAddr = 0x65FDC0u;
+            constexpr uint32_t kGlueRecvAddr = 0x00026000u;
+            setRegU32(env.ctx, 4, kGlueClientAddr);
+            setRegU32(env.ctx, 5, 0xFFu);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, 0u);
+            setRegU32(env.ctx, 8, 0u);
+            setRegU32(env.ctx, 9, kGlueRecvAddr);
+            setRegU32(env.ctx, 10, 4u);
+            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR, 0u);
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            const uint8_t expectedTag[4] = {'2', '8', '0', '0'};
+            t.IsTrue(std::memcmp(env.rdram.data() + kGlueRecvAddr, expectedTag, 4) == 0,
+                     "the glue version probe must answer the accepted tag");
+
+            // A different unhandled rpc keeps the zero fallback.
+            TestEnv otherEnv;
+            setRegU32(otherEnv.ctx, 4, kGlueClientAddr);
+            setRegU32(otherEnv.ctx, 5, 0x09u);
+            setRegU32(otherEnv.ctx, 6, 0u);
+            setRegU32(otherEnv.ctx, 7, 0u);
+            setRegU32(otherEnv.ctx, 8, 0u);
+            setRegU32(otherEnv.ctx, 9, kGlueRecvAddr);
+            setRegU32(otherEnv.ctx, 10, 4u);
+            setRegU32(otherEnv.ctx, 11, 0u);
+            setRegU32(otherEnv.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(otherEnv.rdram.data(), K_STACK_ADDR, 0u);
+            SifCallRpc(otherEnv.rdram.data(), &otherEnv.ctx, &otherEnv.runtime);
+
+            const std::array<uint8_t, 4> zeros{};
+            t.IsTrue(std::memcmp(otherEnv.rdram.data() + kGlueRecvAddr, zeros.data(), 4) == 0,
+                     "other unhandled rpcs still fall back to zeros");
+        });
+
     });
 }

@@ -295,12 +295,22 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
+        if (!serverPtr && ((rpcId & 0x80000000u) != 0u || PS2IopTransport::canBindRpc(runtime, rpcId)))
         {
             // EE-side servers and HLE routes need a descriptor in guest RAM.
             // With an emulated IOP, only publish it after the IRX has actually
             // registered the SID; cd->server == nullptr is the SDK's retry
             // signal while the IOP server thread is still starting.
+            //
+            // M5-T1 (MOH Vanguard): sids with bit31 set are the temporary
+            // per-function sids the game's own IOP modules serve. No emulated
+            // module registers them, and a refused bind leaves the game's
+            // SDK glue polling cd->server forever (the 1M-iteration retry in
+            // sub_49F840 through the SifBindRpc override at sub_49DE00 froze
+            // the boot thread at pc 0x49f900 with loading stuck at 199 CD
+            // reads). Allocate the descriptor so the handshake completes;
+            // calls on these sids then resolve through the normal HLE /
+            // unhandled paths.
             serverPtr = rpcAllocServerAddr(rdram);
             if (serverPtr)
             {
@@ -312,6 +322,21 @@ namespace ps2_syscalls
                 }
                 std::lock_guard<std::mutex> lock(g_rpc_mutex);
                 g_rpc_servers[rpcId] = {rpcId, serverPtr};
+            }
+        }
+
+        // M5-T1 probe: log the first bind attempt per SID. The MOH Vanguard
+        // boot path binds the pad/mtap/mc RPC servers before their IRXs have
+        // registered, and the resulting sid=0 CallRpc is what the runtime
+        // reports as unhandled.
+        {
+            static std::unordered_set<uint32_t> loggedBindSids;
+            if (loggedBindSids.insert(rpcId).second)
+            {
+                std::cerr << "[m5t1-bind] sid=0x" << std::hex << rpcId
+                          << " client=0x" << clientPtr
+                          << " server=0x" << serverPtr
+                          << std::dec << std::endl;
             }
         }
 
@@ -602,7 +627,21 @@ namespace ps2_syscalls
                 }
                 else if (!handled)
                 {
-                    rpcZeroRdram(rdram, receiveBuffer, receiveSize);
+                    // MOH Vanguard IOP-glue (M5-T1): the boot handshake asks the
+                    // IOP side for its 4-byte version tag with rpc 0xFF and only
+                    // accepts "2800" (compared in sub_49F940 against the
+                    // constant at 0x51B234). With no IOP server behind the
+                    // dynamic sid, answer the accepted tag instead of zeros so
+                    // the module queries complete instead of failing the match.
+                    static constexpr uint8_t kGlueVersionTag[4] = {'2', '8', '0', '0'};
+                    if (rpcNum == 0xFFu && receiveSize == 4u && sendBuf == 0u && receiveBuffer != 0u)
+                    {
+                        std::memcpy(rdram + receiveBuffer, kGlueVersionTag, sizeof(kGlueVersionTag));
+                    }
+                    else
+                    {
+                        rpcZeroRdram(rdram, receiveBuffer, receiveSize);
+                    }
                     zeroedFallback = true;
                 }
             }

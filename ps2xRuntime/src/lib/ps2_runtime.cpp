@@ -33,7 +33,23 @@
 namespace ps2_stubs
 {
     void resetSifState();
-}
+    // M5-T1 probe counters (defined in Kernel/Stubs/SIF.cpp).
+    extern std::atomic<uint32_t> g_sifDmaStatCalls;
+    extern std::atomic<uint32_t> g_sifSetDmaCalls;
+} // namespace ps2_stubs
+
+namespace
+{
+    // Accessors keep the M5-T1 dump site free of ps2_stubs internals.
+    uint32_t g_sifDmaStatCallsLocal()
+    {
+        return ps2_stubs::g_sifDmaStatCalls.load(std::memory_order_relaxed);
+    }
+    uint32_t g_sifSetDmaCallsLocal()
+    {
+        return ps2_stubs::g_sifSetDmaCalls.load(std::memory_order_relaxed);
+    }
+} // namespace
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
@@ -2925,6 +2941,41 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+
+                // M5-T1 probe: the boot thread parked inside the statically
+                // linked IOP-glue busy-wait at 0x49f900 (poll loop of the
+                // module-presence query behind sub_00346AA8). Dump its caller
+                // chain (saved ra words up the frames) and the poll globals:
+                // init flag 0x51B2F8, the query control block 0x665DC0 (+0x10
+                // state, +0x24 completion flag), the IOP-side buffer pointer
+                // 0x660C60 and the request-record pool 0x661E80.
+                if (dbgPc >= 0x49f8f4u && dbgPc <= 0x49f920u)
+                {
+                    // Corrected bases (M5-T1): control block = 0x660000-0x240 =
+                    // 0x65FDC0; request-record pool = 0x660000-0x1E80 = 0x65E180;
+                    // IOP request-buffer pointer = 0x660000-0x38A0 = 0x65C760.
+                    const uint32_t glueCb = 0x65FDC0u;
+                    const uint32_t gluePool = 0x65E180u;
+                    const uint32_t recordsBase = m_memory.read32(gluePool + 4u);
+                    RUNTIME_LOG("[m5t1-spin] ra=0x" << std::hex << dbgRa
+                                                    << " sp=0x" << dbgSp
+                                                    << " ra40=0x" << m_memory.read32(dbgSp + 0x40)
+                                                    << " ra70=0x" << m_memory.read32(dbgSp + 0x70)
+                                                    << " r280=0x" << m_memory.read32(dbgSp + 0x280)
+                                                    << " init=0x" << m_memory.read32(0x51B2F8)
+                                                    << " cb0=0x" << m_memory.read32(glueCb)
+                                                    << " cb8=0x" << m_memory.read32(glueCb + 8u)
+                                                    << " cb10=0x" << m_memory.read32(glueCb + 0x10u)
+                                                    << " cb24=0x" << m_memory.read32(glueCb + 0x24u)
+                                                    << " pool0=0x" << m_memory.read32(gluePool)
+                                                    << " pool4=0x" << recordsBase
+                                                    << " pool8=0x" << m_memory.read32(gluePool + 8u)
+                                                    << " rec10=0x" << (recordsBase != 0u ? m_memory.read32(recordsBase + 0x10u) : 0u)
+                                                    << " iopDst=0x" << m_memory.read32(0x65C760u)
+                                                    << " dmaStat=" << std::dec << g_sifDmaStatCallsLocal()
+                                                    << " setDma=" << g_sifSetDmaCallsLocal()
+                                                    << std::endl);
+                }
 
                 // Vanguard bring-up diagnostics: dump the engine's stage gate
                 // (0x642DC0), the deferred-call record (0x6480B8..BC) and the
