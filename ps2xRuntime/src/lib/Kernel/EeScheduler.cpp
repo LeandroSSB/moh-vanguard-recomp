@@ -2136,7 +2136,8 @@ void EeScheduler::processEvent(const EeEvent &event)
                 RUNTIME_LOG("[t8-alarm] fire #" << s_t8AlarmFires
                                                 << " handler=0x" << std::hex << alarm.handler
                                                 << " arg=0x" << alarm.argument
-                                                << std::dec << std::endl);
+                                                << std::dec << " ticks=" << alarm.ticks
+                                                << std::endl);
             }
         }
         GuestInvocation invocation{};

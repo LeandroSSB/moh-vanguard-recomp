@@ -332,6 +332,33 @@ namespace ps2_syscalls
 
     void SetAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // M5-T3 probe: the GameDelay sleep chain asks the kernel alarm for
+        // `ticks` u16 units. Log the requested length against the game's
+        // own calibration constants (0x5109E8 = alarm ticks/s the SDK
+        // calibrates, 0x510A10 = the TIM1-derived tick rate the GameDelay
+        // divider uses) and the current game tick, so a pacing mismatch
+        // (requested delay vs 64us-unit sleep) becomes measurable.
+        {
+            static uint32_t s_m5t3SetAlarm = 0;
+            const uint32_t n = s_m5t3SetAlarm++;
+            if (n < 48u || (n % 256u) == 0u)
+            {
+                const uint32_t k = *reinterpret_cast<const volatile uint32_t *>(rdram + 0x5109E8u);
+                const uint32_t m = *reinterpret_cast<const volatile uint32_t *>(rdram + 0x510A10u);
+                const uint32_t now = *reinterpret_cast<const volatile uint32_t *>(rdram + 0x510A18u);
+                RUNTIME_LOG("[m5t3-setalarm] #" << std::dec << n
+                                                << " ticks=" << static_cast<uint16_t>(getRegU32(ctx, 4))
+                                                << " ms=" << (static_cast<uint32_t>(static_cast<uint16_t>(getRegU32(ctx, 4))) * 64u) / 1000u
+                                                << " handler=0x" << std::hex << getRegU32(ctx, 5)
+                                                << " arg=0x" << getRegU32(ctx, 6)
+                                                << " ra=0x" << getRegU32(ctx, 31)
+                                                << " now=0x" << now
+                                                << std::dec
+                                                << " K=" << k
+                                                << " M=" << m
+                                                << std::endl);
+            }
+        }
         setReturnS32(ctx,
                      scheduler(rdram, ctx, runtime)
                          .setAlarm(static_cast<uint16_t>(getRegU32(ctx, 4)),

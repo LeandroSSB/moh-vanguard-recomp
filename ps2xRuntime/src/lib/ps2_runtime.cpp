@@ -1368,6 +1368,20 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+namespace
+{
+    // M5-T3 probe counters: entries into the engine's due-callback
+    // dispatcher (sub_00356818, wheel 0x64B3A0), the GameDelay sleep
+    // helper (sub_00355860), the TimerDispatch thunk (sub_0012CCC0) and
+    // the wheel add/remove services (sub_003566E8 / sub_003567B8). Read
+    // by the tick sampler further down this file.
+    std::atomic<uint32_t> g_m5t3DispatchCalls{0};
+    std::atomic<uint32_t> g_m5t3GameDelayCalls{0};
+    std::atomic<uint32_t> g_m5t3TimerDispatchCalls{0};
+    std::atomic<uint32_t> g_m5t3AddTimerCalls{0};
+    std::atomic<uint32_t> g_m5t3RemoveTimerCalls{0};
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1376,6 +1390,100 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    // M5-T3 probe: the IOP-server callback slots. The ELF statically
+    // initializes *(0x510B6C)=0x3627F0 / *(0x510B70)=0x362810 (handlers the
+    // server loop sub_0036C628 calls via jalr when the IOP flag 0x64D5AD
+    // raises); a fatal run jumped to 0x20 through this slot. Watch the
+    // window between guest branches — any writer (guest store, host bulk,
+    // DMA) is caught as a change, and the executing branch site pins when.
+    {
+        static uint32_t s_prevCb[8] = {};
+        static bool s_primedCb = false;
+        static uint32_t s_loggedCb = 0;
+        if (rdram != nullptr && s_loggedCb < 12u)
+        {
+            uint32_t cur[8];
+            std::memcpy(cur, rdram + 0x510B60u, sizeof(cur));
+            if (!s_primedCb)
+            {
+                std::memcpy(s_prevCb, cur, sizeof(cur));
+                s_primedCb = true;
+            }
+            else if (std::memcmp(s_prevCb, cur, sizeof(cur)) != 0)
+            {
+                ++s_loggedCb;
+                std::ostringstream line;
+                line << "[m5t3-cbslot] src=0x" << std::hex << sourcePc
+                     << " target=0x" << targetPc
+                     << " kind=" << describeGuestBranchKind(kind)
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                     << " slots:";
+                for (int i = 0; i < 8; ++i)
+                {
+                    line << " [" << i << "]0x" << cur[i];
+                }
+                line << std::endl;
+                RUNTIME_LOG(line.str());
+                std::memcpy(s_prevCb, cur, sizeof(cur));
+            }
+        }
+    }
+    // M5-T3 probe: count who drives the timer chain. The dispatcher is
+    // invoked ONLY from the 7 wait-wrapper call sites (0x12CCC0 etc.);
+    // during the LOADING stall the wheel holds due callbacks that nobody
+    // dispatches. Log the first entries of each kind with the caller and
+    // the GameDelay delay argument.
+    if (targetPc == 0x356818u)
+    {
+        const uint32_t n = ++g_m5t3DispatchCalls;
+        static uint32_t s_logged = 0;
+        if (s_logged < 12u)
+        {
+            ++s_logged;
+            RUNTIME_LOG("[m5t3-dispatch] #" << std::dec << n
+                                            << " src=0x" << std::hex << sourcePc
+                                            << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                                            << std::dec << std::endl);
+        }
+    }
+    else if (targetPc == 0x355860u)
+    {
+        const uint32_t n = ++g_m5t3GameDelayCalls;
+        static uint32_t s_logged = 0;
+        if (s_logged < 12u)
+        {
+            ++s_logged;
+            RUNTIME_LOG("[m5t3-delay] #" << std::dec << n
+                                         << " src=0x" << std::hex << sourcePc
+                                         << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0))
+                                         << std::dec << std::endl);
+        }
+    }
+    else if (targetPc == 0x12CCC0u)
+    {
+        ++g_m5t3TimerDispatchCalls;
+    }
+    else if (targetPc == 0x3566E8u)
+    {
+        const uint32_t n = ++g_m5t3AddTimerCalls;
+        static uint32_t s_logged = 0;
+        if (s_logged < 8u)
+        {
+            ++s_logged;
+            RUNTIME_LOG("[m5t3-addtimer] #" << std::dec << n
+                                            << " src=0x" << std::hex << sourcePc
+                                            << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0))
+                                            << " a1=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0))
+                                            << " a2=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0))
+                                            << std::dec << std::endl);
+        }
+    }
+    else if (targetPc == 0x3567B8u)
+    {
+        ++g_m5t3RemoveTimerCalls;
+    }
+
     // M3-T10 probe: the SDK dispatcher handler slots (.data 0x5109F0..0x510A10)
     // fill with foreign code words / ASCII late in the run. The scheduler
     // slot-watch localized the writer to execution windows entered at the
@@ -3295,6 +3403,46 @@ void PS2Runtime::run()
                                                                 << " s3=0x" << s3
                                                                 << " head=0x" << (inRam(s3 + 0x24) ? m_memory.read32(s3 + 0x24) : 0u)
                                                                 << std::dec);
+                            }
+                        }
+                        // M5-T3 probe: counter summary + the GameDelay
+                        // caller of every sleeping thread. The SleepThread
+                        // stub (0x49B480) has no frame, so a thread parked
+                        // at pc=0x49B488 still owns sub_00355860's frame
+                        // (addiu sp,-0x70; sd ra,0x30(sp)): *(sp+0x30) is
+                        // the return site into GameDelay's caller, and the
+                        // caller's own frame starts at sp+0x70.
+                        {
+                            static const char *s_m5t3Env = std::getenv("PS2X_ENABLE_M5T3");
+                            if (s_m5t3Env != nullptr && s_m5t3Env[0] == '1')
+                            {
+                                RUNTIME_LOG("[m5t3] disp=" << std::dec << g_m5t3DispatchCalls.load()
+                                                           << " delay=" << g_m5t3GameDelayCalls.load()
+                                                           << " tdisp=" << g_m5t3TimerDispatchCalls.load()
+                                                           << " add=" << g_m5t3AddTimerCalls.load()
+                                                           << " rem=" << g_m5t3RemoveTimerCalls.load()
+                                                           << " cb6C=0x" << std::hex << m_memory.read32(0x510B6Cu)
+                                                           << " cb70=0x" << m_memory.read32(0x510B70u)
+                                                           << " iopFlag=" << (m_memory.read8(0x64D5ADu) & 0xFFu)
+                                                           << " gate=0x" << m_memory.read32(0x642DC0u)
+                                                           << " qCnt=0x" << m_memory.read32(0x642DD0u)
+                                                           << std::dec);
+                                for (const auto &t : threadSnap.threads)
+                                {
+                                    if (t.waitReason != EeWaitReason::Sleep)
+                                    {
+                                        continue;
+                                    }
+                                    RUNTIME_LOG("[m5t3-sleep] id=" << std::dec << t.id
+                                                                   << " sp=0x" << std::hex << t.sp
+                                                                   << " pc=0x" << t.pc
+                                                                   << " gdCaller=0x" << m_memory.read32(t.sp + 0x30u)
+                                                                   << " up0=0x" << m_memory.read32(t.sp + 0x70u)
+                                                                   << " up8=0x" << m_memory.read32(t.sp + 0x78u)
+                                                                   << " up16=0x" << m_memory.read32(t.sp + 0x80u)
+                                                                   << " up32=0x" << m_memory.read32(t.sp + 0x90u)
+                                                                   << std::dec);
+                                }
                             }
                         }
                         for (const auto &h : threadSnap.intcHandlers)
