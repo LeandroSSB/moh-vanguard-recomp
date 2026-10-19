@@ -538,6 +538,29 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
+
+        // Vanguard M3-T12: dump the raw presentation request periodically so the
+        // display-path decode can see who (never) moves DISPFB1. Opt-in:
+        // PS2X_ENABLE_T12_DISPLAY=1.
+        static const char *s_t12PrEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+        if (s_t12PrEnv != nullptr && s_t12PrEnv[0] == '1')
+        {
+            static std::atomic<uint32_t> s_t12LatchCount{0};
+            const uint32_t t12Idx = s_t12LatchCount.fetch_add(1, std::memory_order_relaxed);
+            if ((t12Idx & 0x1Fu) == 0u)
+            {
+                std::cout << "[t12-present] n=" << t12Idx
+                          << " tick=" << request.vsyncTick
+                          << " pmode=0x" << std::hex << request.pmode
+                          << " smode2=0x" << request.smode2
+                          << " dispfb1=0x" << request.dispfb1
+                          << " display1=0x" << request.display1
+                          << " dispfb2=0x" << request.dispfb2
+                          << " display2=0x" << request.display2
+                          << std::dec
+                          << std::endl;
+            }
+        }
     }
 
     PresentationFrame frame{};
@@ -683,6 +706,30 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         if (nreg == 0)
             nreg = 16;
 
+        // Vanguard M3-T12: log every tag transition inside large packets so the
+        // decode can follow multi-tag uploads (setup tag + IMAGE data tag).
+        // Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+        {
+            static const char *s_t12TagEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+            if (s_t12TagEnv != nullptr && s_t12TagEnv[0] == '1' && sizeBytes > 128u)
+            {
+                static std::atomic<uint32_t> s_t12TagCount{0};
+                const uint32_t t12Idx = s_t12TagCount.fetch_add(1, std::memory_order_relaxed);
+                if (t12Idx < 64u)
+                {
+                    std::cout << "[t12-giftag] idx=" << t12Idx
+                              << " pktsize=" << sizeBytes
+                              << " off=" << (offset - 16u)
+                              << " nloop=" << nloop
+                              << " flg=" << static_cast<uint32_t>(flg)
+                              << " nreg=" << nreg
+                              << " desc=0x" << std::hex << (tagHi & 0xFFFFull)
+                              << std::dec
+                              << std::endl;
+                }
+            }
+        }
+
         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
 
         bool pre = ((tagLo >> 46) & 1) != 0;
@@ -797,6 +844,30 @@ void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
     if (!data || sizeBytes == 0 || !m_backend)
         return;
 
+    // Vanguard M3-T12: name every host-side VRAM upload target (dbp/dpsm +
+    // destination rect) so the T12 decode can answer "where do the 128 frame
+    // uploads land". Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+    static const char *s_t12UpEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+    if (s_t12UpEnv != nullptr && s_t12UpEnv[0] == '1')
+    {
+        static std::atomic<uint32_t> s_t12UpCount{0};
+        const uint32_t t12Idx = s_t12UpCount.fetch_add(1, std::memory_order_relaxed);
+        if (t12Idx < 48u)
+        {
+            std::cout << "[t12-upload] idx=" << t12Idx
+                      << " sbp=0x" << std::hex << (bitbltbuf & 0x3FFFull)
+                      << " dbp=0x" << ((bitbltbuf >> 32) & 0x3FFFull)
+                      << " dpsm=" << ((bitbltbuf >> 56) & 0x1Full)
+                      << " dsax=" << ((trxpos >> 32) & 0x7FFull)
+                      << " dsay=" << ((trxpos >> 48) & 0x7FFull)
+                      << " rrw=" << (trxreg & 0xFFFull)
+                      << " rrh=" << ((trxreg >> 32) & 0xFFFull)
+                      << " bytes=0x" << sizeBytes
+                      << std::dec
+                      << std::endl;
+        }
+    }
+
     writeRegisterUnlocked(GS_REG_BITBLTBUF, bitbltbuf);
     writeRegisterUnlocked(GS_REG_TRXPOS, trxpos);
     writeRegisterUnlocked(GS_REG_TRXREG, trxreg);
@@ -827,6 +898,26 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
         setupNreg != 1u ||
         (setupTagHi & 0xFull) != kPackedAdDescriptor)
     {
+        // Vanguard M3-T12: name which native-upload precheck failed for large
+        // packets (the T12 run saw a 215 KB packet fall out of this path with
+        // its image data never reaching VRAM). Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+        static const char *s_t12NfEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+        if (s_t12NfEnv != nullptr && s_t12NfEnv[0] == '1' && sizeBytes > 128u)
+        {
+            static std::atomic<uint32_t> s_t12NfCount{0};
+            const uint32_t t12Idx = s_t12NfCount.fetch_add(1, std::memory_order_relaxed);
+            if (t12Idx < 32u)
+            {
+                std::cout << "[t12-nativefail] idx=" << t12Idx
+                          << " size=" << sizeBytes
+                          << " nloop=" << setupNloop
+                          << " flg=" << static_cast<uint32_t>(setupFlg)
+                          << " nreg=" << setupNreg
+                          << " desc=0x" << std::hex << (setupTagHi & 0xFull)
+                          << std::dec
+                          << std::endl;
+            }
+        }
         return false;
     }
 
@@ -1067,6 +1158,23 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    // Vanguard M3-T12: capture every GIF A+D register write. The T11 gate left
+    // the game's display env half-applied (DISPLAY1 written by the game, while
+    // DISPFB1 still held the reset default 0x1400) and draws/uploads were only
+    // known from the T8 splash snapshot. Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+    static const char *s_t12Env = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+    if (s_t12Env != nullptr && s_t12Env[0] == '1')
+    {
+        static std::atomic<uint32_t> s_t12RegCount{0};
+        const uint32_t t12Idx = s_t12RegCount.fetch_add(1, std::memory_order_relaxed);
+        if (t12Idx < 600u)
+        {
+            std::cout << "[t12-gsreg] idx=" << t12Idx
+                      << " reg=0x" << std::hex << static_cast<uint32_t>(regAddr)
+                      << " value=0x" << value << std::dec
+                      << std::endl;
+        }
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1609,6 +1717,28 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    // Vanguard M3-T12: log every image-transfer delivery with the active
+    // transfer regs so the decode can see whether the 210 KB splash upload's
+    // pixels ever reach the backend. Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+    static const char *s_t12ImgEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+    if (s_t12ImgEnv != nullptr && s_t12ImgEnv[0] == '1')
+    {
+        static std::atomic<uint32_t> s_t12ImgCount{0};
+        const uint32_t t12Idx = s_t12ImgCount.fetch_add(1, std::memory_order_relaxed);
+        if (t12Idx < 64u)
+        {
+            std::cout << "[t12-imgdata] idx=" << t12Idx
+                      << " dbp=0x" << std::hex << m_bitbltbuf.dbp
+                      << " dpsm=" << static_cast<uint32_t>(m_bitbltbuf.dpsm)
+                      << " dsax=" << m_trxpos.dsax
+                      << " dsay=" << m_trxpos.dsay
+                      << " rrw=" << m_trxreg.rrw
+                      << " rrh=" << m_trxreg.rrh
+                      << " bytes=0x" << sizeBytes
+                      << std::dec
+                      << std::endl;
+        }
+    }
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }

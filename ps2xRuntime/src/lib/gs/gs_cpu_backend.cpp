@@ -1497,6 +1497,39 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // Vanguard M3-T12: name exactly which guard (if any) drops a delivered
+    // image transfer before it reaches VRAM. Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+    {
+        static const char *s_t12UpEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+        if (s_t12UpEnv != nullptr && s_t12UpEnv[0] == '1')
+        {
+            static std::atomic<uint32_t> s_t12UpCount{0};
+            const uint32_t t12Idx = s_t12UpCount.fetch_add(1, std::memory_order_relaxed);
+            if (t12Idx < 64u)
+            {
+                const char *verdict = "ok";
+                if (!data || sizeBytes == 0u)
+                    verdict = "drop:nodata";
+                else if (!m_vram)
+                    verdict = "drop:novram";
+                else if (m_transferState.direction != 0u)
+                    verdict = "drop:dir";
+                else if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u ||
+                         m_transferState.totalPixels == 0u)
+                    verdict = "drop:nopixels";
+                std::cout << "[t12-bkupload] idx=" << t12Idx
+                          << " verdict=" << verdict
+                          << " bytes=0x" << std::hex << sizeBytes
+                          << " dbp=0x" << m_transfer.bitbltbuf.dbp
+                          << " dpsm=" << static_cast<uint32_t>(m_transfer.bitbltbuf.dpsm)
+                          << " rrw=" << std::dec << m_transfer.trxreg.rrw
+                          << " rrh=" << m_transfer.trxreg.rrh
+                          << " totalPx=" << m_transferState.totalPixels
+                          << " copiedPx=" << m_transferState.copiedPixels
+                          << std::endl;
+            }
+        }
+    }
     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
@@ -1869,9 +1902,68 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
     if (snapshot.empty())
         return {};
 
+    // Vanguard M3-T12: census of the local memory the present actually reads.
+    // Counts 256-byte chunks with any nonzero byte in the three regions the
+    // game was seen using (frame buffer 0, frame buffer at page 140, texture
+    // at page 4480), plus the non-black pixel count of the converted output.
+    // Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+    static const char *s_t12VramEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+    if (s_t12VramEnv != nullptr && s_t12VramEnv[0] == '1')
+    {
+        static std::atomic<uint32_t> s_t12VramCount{0};
+        const uint32_t t12Idx = s_t12VramCount.fetch_add(1, std::memory_order_relaxed);
+        if ((t12Idx & 0x3Fu) == 0u)
+        {
+            const uint8_t *t12SnapData = snapshot.data();
+            const uint64_t t12SnapSize = snapshot.size();
+            auto countNonzeroChunks = [t12SnapData, t12SnapSize](uint32_t baseBytes, uint32_t sizeBytes)
+            {
+                uint32_t nonzero = 0u;
+                const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(
+                    static_cast<uint64_t>(baseBytes) + sizeBytes, t12SnapSize));
+                for (uint32_t off = baseBytes; off + 256u <= end; off += 256u)
+                {
+                    if (std::any_of(t12SnapData + off, t12SnapData + off + 256u,
+                                    [](uint8_t b) { return b != 0u; }))
+                        ++nonzero;
+                }
+                return nonzero;
+            };
+            constexpr uint32_t kBufferBytes = 640u * 448u * 4u; // 0x118000
+            const uint32_t buf0 = countNonzeroChunks(0u, kBufferBytes);
+            const uint32_t buf140 = countNonzeroChunks(140u * 2048u, kBufferBytes);
+            const uint32_t tex4480 = countNonzeroChunks(4480u * 2048u, 2048u * 64u);
+            std::cout << "[t12-vram] n=" << t12Idx
+                      << " tick=" << request.vsyncTick
+                      << " buf0=" << buf0 << "/" << (kBufferBytes / 256u)
+                      << " buf140=" << buf140 << "/" << (kBufferBytes / 256u)
+                      << " tex4480=" << tex4480 << "/" << (2048u * 64u / 256u)
+                      << " dispfb1=0x" << std::hex << request.dispfb1
+                      << std::dec
+                      << std::endl;
+        }
+    }
+
     thread_local GSCpuBackend snapshotBackend;
     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
-    return snapshotBackend.PresentFromLocalMemory(request);
+    PresentationFrame t12Frame = snapshotBackend.PresentFromLocalMemory(request);
+    if (s_t12VramEnv != nullptr && s_t12VramEnv[0] == '1')
+    {
+        static std::atomic<uint32_t> s_t12OutCount{0};
+        const uint32_t t12OutIdx = s_t12OutCount.fetch_add(1, std::memory_order_relaxed);
+        if ((t12OutIdx & 0x3Fu) == 0u)
+        {
+            std::cout << "[t12-out] n=" << t12OutIdx
+                      << " w=" << t12Frame.width
+                      << " h=" << t12Frame.height
+                      << " px=" << t12Frame.pixels.size() / 4u
+                      << " nonblack=" << countNonBlackPixels(t12Frame.pixels, t12Frame.width, t12Frame.height)
+                      << " dispFbp=" << t12Frame.displayFbp
+                      << " srcFbp=" << t12Frame.sourceFbp
+                      << std::endl;
+        }
+    }
+    return t12Frame;
 }
 
 PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)

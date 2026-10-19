@@ -962,6 +962,27 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        // Vanguard M3-T12: log direct EE stores into the display registers
+        // (PMODE/SMODE2/DISPFBx/DISPLAYx). Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+        {
+            static const char *s_t12EeEnv = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+            if (s_t12EeEnv != nullptr && s_t12EeEnv[0] == '1' &&
+                (regOff == 0x0000u || regOff == 0x0020u || regOff == 0x0070u ||
+                 regOff == 0x0080u || regOff == 0x0090u || regOff == 0x00A0u))
+            {
+                static std::atomic<uint32_t> s_t12EeCount{0};
+                const uint32_t t12Idx = s_t12EeCount.fetch_add(1, std::memory_order_relaxed);
+                if (t12Idx < 64u)
+                {
+                    std::cout << "[t12-ee32] idx=" << t12Idx
+                              << " addr=0x" << std::hex << address
+                              << " off=0x" << regOff
+                              << " value=0x" << value
+                              << std::dec
+                              << std::endl;
+                }
+            }
+        }
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1022,6 +1043,27 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        // Vanguard M3-T12: log direct EE 64-bit stores into the display
+        // registers. Opt-in: PS2X_ENABLE_T12_DISPLAY=1.
+        {
+            static const char *s_t12Ee64Env = std::getenv("PS2X_ENABLE_T12_DISPLAY");
+            if (s_t12Ee64Env != nullptr && s_t12Ee64Env[0] == '1' &&
+                (regOff == 0x0000u || regOff == 0x0020u || regOff == 0x0070u ||
+                 regOff == 0x0080u || regOff == 0x0090u || regOff == 0x00A0u))
+            {
+                static std::atomic<uint32_t> s_t12Ee64Count{0};
+                const uint32_t t12Idx = s_t12Ee64Count.fetch_add(1, std::memory_order_relaxed);
+                if (t12Idx < 64u)
+                {
+                    std::cout << "[t12-ee64] idx=" << t12Idx
+                              << " addr=0x" << std::hex << address
+                              << " off=0x" << regOff
+                              << " value=0x" << value
+                              << std::dec
+                              << std::endl;
+                }
+            }
+        }
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
