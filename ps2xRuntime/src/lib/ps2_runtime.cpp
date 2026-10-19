@@ -3021,6 +3021,32 @@ void PS2Runtime::run()
                                                      << "}" << std::endl);
                     }
 
+                    // M3-T13 probe: decode the main thread's park at
+                    // pc=0x323328 (the GIF-DMA sync spin sub_00323300,
+                    // called from sub_00322E18). Frame layout at the spin:
+                    // [sp+0x0]=ra (0x322e54), [sp+0x20]=sub_00322E18's s1
+                    // (func_3236E0 verdict), [sp+0x30]=its s0 (the sync
+                    // record: +0 pending id, +4 pending flag). Opt-in:
+                    // PS2X_ENABLE_T13_GIFDMA=1.
+                    if (dbgPc >= 0x323300u && dbgPc < 0x3236e0u)
+                    {
+                        static const char *s_t13SpinEnv = std::getenv("PS2X_ENABLE_T13_GIFDMA");
+                        if (s_t13SpinEnv != nullptr && s_t13SpinEnv[0] == '1')
+                        {
+                            const uint32_t recPtr = m_memory.read32(dbgSp + 0x30);
+                            const uint32_t rec0 = recPtr != 0u && recPtr < 0x02000000u ? m_memory.read32(recPtr) : 0u;
+                            const uint32_t rec4 = recPtr != 0u && recPtr < 0x02000000u ? m_memory.read32(recPtr + 4u) : 0u;
+                            RUNTIME_LOG("[t13-spin] pc=0x" << std::hex << dbgPc
+                                                           << " sp=0x" << dbgSp
+                                                           << " recPtr=0x" << recPtr
+                                                           << " rec0=0x" << rec0
+                                                           << " rec4=0x" << rec4
+                                                           << " s1saved=0x" << m_memory.read32(dbgSp + 0x20)
+                                                           << " chcr=0x" << m_memory.read32(0x1000A000u)
+                                                           << std::dec << std::endl);
+                        }
+                    }
+
                     // M3-T4 phase probe. The steady-state main loop lives in
                     // the ring poll sub_00344A58 (tick pc 0x344cb0): it walks
                     // a stream-channel node chain (table 0x6480E0, selector

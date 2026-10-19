@@ -1368,6 +1368,27 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
+            // Vanguard M3-T13: log every GIF-channel (D2) CHCR kick so the
+            // sync spin at pc=0x323328 can be decoded against what the game
+            // actually writes. Opt-in: PS2X_ENABLE_T13_GIFDMA=1.
+            if (channelBase == 0x1000A000u)
+            {
+                static const char *s_t13Env = std::getenv("PS2X_ENABLE_T13_GIFDMA");
+                if (s_t13Env != nullptr && s_t13Env[0] == '1')
+                {
+                    static std::atomic<uint32_t> s_t13D2Writes{0};
+                    const uint32_t n = s_t13D2Writes.fetch_add(1, std::memory_order_relaxed) + 1u;
+                    if (n <= 16u || (n % 4096u) == 0u)
+                    {
+                        RUNTIME_LOG("[t13-d2w] n=" << n
+                                                   << " chcr=0x" << std::hex << value
+                                                   << " madr=0x" << madr
+                                                   << " qwc=" << std::dec << qwc
+                                                   << std::endl);
+                    }
+                }
+            }
+
             if (tryProcessScratchpadDma(channelBase, value))
             {
                 return true;
@@ -1466,6 +1487,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    // Vanguard M3-T13: decode the GIF chain walk (start TADR,
+                    // tags processed, last tag upper word = CHCR.TAG readback
+                    // source). Opt-in: PS2X_ENABLE_T13_GIFDMA=1.
+                    const uint32_t t13WalkStartTadr = tagAddr;
+                    uint32_t t13WalkEndReason = 0u; // 1=END 2=IRQ 3=max 4=break 5=irq&&tie-after-tag
+                    bool t13WalkLog = false;
+                    if (channelBase == 0x1000A000u)
+                    {
+                        static const char *s_t13WalkEnv = std::getenv("PS2X_ENABLE_T13_GIFDMA");
+                        if (s_t13WalkEnv != nullptr && s_t13WalkEnv[0] == '1')
+                        {
+                            static std::atomic<uint32_t> s_t13Walks{0};
+                            const uint32_t wn = s_t13Walks.fetch_add(1, std::memory_order_relaxed) + 1u;
+                            t13WalkLog = (wn <= 32u || (wn % 256u) == 0u);
+                        }
+                    }
 
                     while (tagsProcessed < kMaxChainTags)
                     {
@@ -1578,9 +1615,38 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
-                            endChain = true;
+                        {
+                            // Vanguard M3-T13: do NOT suspend here. This
+                            // runtime completes DMA transfers synchronously,
+                            // so a TIE suspension has no resume protocol to
+                            // ride on: the drain cleared STR and QWC while
+                            // CHCR.TAG kept the suspending CNT tag, and guests
+                            // that poll for the terminal END tag id (Vanguard
+                            // spins on ((CHCR >> 28) & 7) == 7) deadlock. The
+                            // channel interrupt still fires once, at the drain
+                            // (queueCompletedDmacCause in
+                            // processPendingTransfers), which is where this
+                            // runtime delivers all DMA completions.
+                            t13WalkEndReason = 5u;
+                        }
+                        if (endChain && t13WalkEndReason == 0u)
+                        {
+                            t13WalkEndReason = (id == 7u || id == 0u) ? 1u : 4u;
+                        }
                         if (endChain)
                             break;
+                    }
+
+                    // Vanguard M3-T13 chain-walk summary (see block above).
+                    if (t13WalkLog)
+                    {
+                        RUNTIME_LOG("[t13-walk] tadr0=0x" << std::hex << t13WalkStartTadr
+                                                          << " tadrEnd=0x" << tagAddr
+                                                          << " tags=" << std::dec << tagsProcessed
+                                                          << " reason=" << t13WalkEndReason
+                                                          << " lastUpper=0x" << std::hex << lastTagUpper
+                                                          << " tie=" << ((chcr & 0x80u) != 0u ? 1 : 0)
+                                                          << std::dec << std::endl);
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
@@ -2425,6 +2491,30 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
             {
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
+                // Vanguard M3-T13: count GIF-channel CHCR reads and whether
+                // the game's sync condition ((CHCR >> 28) & 7) == 7 is ever
+                // met. Opt-in: PS2X_ENABLE_T13_GIFDMA=1.
+                if (address == 0x1000A000u)
+                {
+                    static const char *s_t13ReadEnv = std::getenv("PS2X_ENABLE_T13_GIFDMA");
+                    if (s_t13ReadEnv != nullptr && s_t13ReadEnv[0] == '1')
+                    {
+                        static std::atomic<uint32_t> s_t13D2Reads{0};
+                        static std::atomic<uint32_t> s_t13D2Reads7{0};
+                        const uint32_t n = s_t13D2Reads.fetch_add(1, std::memory_order_relaxed) + 1u;
+                        if (((channelStatus >> 28) & 7u) == 7u)
+                        {
+                            s_t13D2Reads7.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (n <= 8u || (n % 1000000u) == 0u)
+                        {
+                            RUNTIME_LOG("[t13-d2r] n=" << n
+                                                       << " val=0x" << std::hex << channelStatus
+                                                       << " hit7=" << std::dec << s_t13D2Reads7.load(std::memory_order_relaxed)
+                                                       << std::endl);
+                        }
+                    }
+                }
                 return channelStatus;
             }
         }
