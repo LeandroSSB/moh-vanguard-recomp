@@ -1,6 +1,9 @@
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
+#include "../Stubs/SIF.h"
+
+#include <array>
 
 namespace ps2_syscalls
 {
@@ -1033,6 +1036,38 @@ namespace ps2_syscalls
                                                  << " psize=0x" << packetSize
                                                  << " extra=0x" << destExtra << std::dec << std::endl);
             ++logCount;
+        }
+
+        // Vanguard M5-T2: the loader's stream-request queue (producer
+        // sub_00360408 -> sub_0036E110, consumer thread entry 0x36E578) posts
+        // 48-byte requests with cid=0 and the loader blocks in sub_0036E3E8
+        // until a completion reply zeroes the request record's seq word
+        // (sub_0036E4A0, reached from the SIF-cmd handler sub_0036C1A8 that
+        // the game registers with sceSifAddCmdHandler(cid=1) at 0x36CD50).
+        // No loaded IOP module serves cid=0, so that reply never comes back
+        // and the LOADING poll spins forever. Answer the handshake the absent
+        // IOP side would answer: echo a completion reply whose [+0xC] is the
+        // request handle (the request packet's +0x14 seq word; its high byte
+        // selects the request bucket) and whose [+0x10] = 2, the "complete the
+        // bucket record" branch of sub_0036C1A8. cid!=0 traffic (the game's
+        // own reply direction) is never echoed.
+        if (cid == 0u && packetSize >= 0x18u && packetAddr != 0u)
+        {
+            uint32_t requestHandle = 0u;
+            (void)readStackU32(rdram, packetAddr, 0x14u, requestHandle);
+            if (requestHandle != 0u)
+            {
+                // 32 bytes: sub_0036C1A8 reads +0xC and +0x10, and the SIF-cmd
+                // header alone is 16 bytes - keep the status word inside the
+                // copied payload.
+                std::array<uint8_t, 32> reply{};
+                reply[0x0Cu] = static_cast<uint8_t>(requestHandle & 0xFFu);
+                reply[0x0Du] = static_cast<uint8_t>((requestHandle >> 8) & 0xFFu);
+                reply[0x0Eu] = static_cast<uint8_t>((requestHandle >> 16) & 0xFFu);
+                reply[0x0Fu] = static_cast<uint8_t>((requestHandle >> 24) & 0xFFu);
+                reply[0x10u] = 2u;
+                ps2_stubs::dispatchSifCommand(rdram, runtime, 1u, reply.data(), reply.size());
+            }
         }
 
         // Return non-zero on success.

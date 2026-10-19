@@ -2977,6 +2977,62 @@ void PS2Runtime::run()
                                                     << std::endl);
                 }
 
+                // M5-T2 probe: the LOADING gate poll. Main thread loops
+                // 0x360620 -> jal 0x36A3F8 -> 0x36E3E8(ticket) until it
+                // returns non-zero. 0x36E3E8 returns 1 only when
+                // *(ticketHi+0x14) != ticketLo (ticketHi = 32-byte request
+                // record, +0x14 = its seq). While busy it pumps
+                // ReferSemaStatus/SignalSema on *(0x5B27EC) when
+                // *(0x64B638) - *(0x5B27F4) >= 501. Consumer = thread 6
+                // (entry 0x36E578): WaitSema(*(0x5B27EC)), skips back if
+                // *(0x5B27E4) != 0, drains request buckets at
+                // 0x656690+12*slot, forwards 48-byte packets via
+                // sceSifSendCmd(0, 0x656660, 0x30, ...) and copies
+                // *(0x64B638) -> *(0x5B27F4). Opt-in: PS2X_ENABLE_M5T2=1.
+                if ((dbgPc >= 0x360600u && dbgPc < 0x360700u) ||
+                    (dbgPc >= 0x36e5b0u && dbgPc < 0x36e714u))
+                {
+                    static const char *s_m5t2Env = std::getenv("PS2X_ENABLE_M5T2");
+                    if (s_m5t2Env != nullptr && s_m5t2Env[0] == '1')
+                    {
+                        const uint32_t semaId = m_memory.read32(0x5B27ECu);
+                        const uint32_t ticketLo = m_memory.read32(dbgSp + 0xE0u);
+                        const uint32_t ticketHi = m_memory.read32(dbgSp + 0xE4u);
+                        const EeSemaphore *queueSema = m_eeScheduler->semaphore(static_cast<int>(semaId));
+                        std::string bucketInfo;
+                        for (uint32_t slot = 0; slot < 3u; ++slot)
+                        {
+                            const uint32_t base = 0x656690u + slot * 12u;
+                            bucketInfo += " b" + std::to_string(slot) + "=0x" +
+                                          [&]
+                                          {
+                                              std::ostringstream os;
+                                              os << std::hex << m_memory.read32(base) << "/n" << std::dec
+                                                 << m_memory.read32(base + 8u);
+                                              return os.str();
+                                          }();
+                        }
+                        RUNTIME_LOG("[m5t2-gate] pc=0x" << std::hex << dbgPc
+                                                        << " tickLo=0x" << ticketLo
+                                                        << " tickHi=0x" << ticketHi
+                                                        << " rec14=0x" << (ticketHi != 0u && ticketHi < 0x02000000u ? m_memory.read32(ticketHi + 0x14u) : 0u)
+                                                        << " rec0=0x" << (ticketHi != 0u && ticketHi < 0x02000000u ? m_memory.read32(ticketHi) : 0u)
+                                                        << " rec4=0x" << (ticketHi != 0u && ticketHi < 0x02000000u ? m_memory.read32(ticketHi + 4u) : 0u)
+                                                        << " empty=0x" << m_memory.read32(0x5B27E4u)
+                                                        << " cur0=0x" << m_memory.read32(0x5B27E0u)
+                                                        << " semaId=0x" << semaId
+                                                        << " sCnt=" << std::dec << (queueSema ? queueSema->count : -1)
+                                                        << " sMax=" << (queueSema ? queueSema->maxCount : -1)
+                                                        << " sWait=" << (queueSema ? static_cast<int>(queueSema->waiters.size()) : -1)
+                                                        << " prod=0x" << std::hex << m_memory.read32(0x64B638u)
+                                                        << " ack=0x" << m_memory.read32(0x5B27F4u)
+                                                        << " freeHead=0x" << m_memory.read32(0x6566B8u)
+                                                        << " poolInUse=" << std::dec << m_memory.read32(0x6566C0u)
+                                                        << bucketInfo
+                                                        << std::endl);
+                    }
+                }
+
                 // Vanguard bring-up diagnostics: dump the engine's stage gate
                 // (0x642DC0), the deferred-call record (0x6480B8..BC) and the
                 // main loop's pending message-wait (sub_0033F208 saves its
