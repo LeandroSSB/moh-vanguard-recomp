@@ -124,6 +124,15 @@ struct GuestThread
     std::function<void(R5900Context &)> resumeCompletion;
     std::vector<GuestInvocation> invocations;
 
+    // Vanguard M5-T4 bring-up diagnostics: the last dispatch of this thread
+    // that HAD a recompiled function (updated by the executor right before
+    // the call). When the thread later parks on an unmapped pc, the dump can
+    // name the last good frame instead of leaving a silent DORMANT.
+    uint32_t lastGoodPc = 0;
+    uint32_t lastGoodRa = 0;
+    uint32_t lastGoodSp = 0;
+    bool invalidJumpLogged = false;
+
     [[nodiscard]] R5900Context &activeContext()
     {
         return invocations.empty() ? context : invocations.back().context;

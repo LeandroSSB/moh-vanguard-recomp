@@ -391,6 +391,74 @@ void EeScheduler::run()
             }
             else
             {
+                // Vanguard M5-T4: the park itself must be loud. A thread that
+                // reaches an unmapped pc is a corruption victim (smashed
+                // return address / callback pointer); dump the full register
+                // window, a stack walk from sp (marking words that look like
+                // code addresses = the would-be return chain) and the last
+                // dispatch that still had a function, once per thread.
+                if (!running->invalidJumpLogged)
+                {
+                    running->invalidJumpLogged = true;
+                    std::ostringstream oss;
+                    oss << "[ee-run:invalid-jump] tid=" << running->id
+                        << " badPc=0x" << std::hex << context.pc
+                        << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(context.r[31], 0))
+                        << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0))
+                        << " gp=0x" << static_cast<uint32_t>(_mm_extract_epi32(context.r[28], 0))
+                        << " inv=" << std::dec << running->invocations.size()
+                        << " eeCycle=0x" << std::hex << m_eeCycle
+                        << " vsync=" << std::dec << m_vsyncTick
+                        << " lastGood: pc=0x" << std::hex << running->lastGoodPc
+                        << " ra=0x" << running->lastGoodRa
+                        << " sp=0x" << running->lastGoodSp
+                        << " status=" << std::dec << static_cast<int>(running->status)
+                        << " waitReason=" << static_cast<int>(running->wait.reason)
+                        << "\n";
+                    static constexpr const char *kGprNames[32] = {
+                        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+                        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+                        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+                    for (uint32_t i = 0; i < 32u; i += 4u)
+                    {
+                        oss << "[ee-run:invalid-jump] gpr";
+                        for (uint32_t j = i; j < i + 4u; ++j)
+                        {
+                            oss << ' ' << kGprNames[j] << "=0x"
+                                << std::hex << static_cast<uint32_t>(_mm_extract_epi32(context.r[j], 0));
+                        }
+                        oss << std::dec << "\n";
+                    }
+                    const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0));
+                    constexpr uint32_t kStackWalkWords = 48u;
+                    if (m_rdram != nullptr && sp < PS2_RAM_SIZE &&
+                        sp + kStackWalkWords * sizeof(uint32_t) <= PS2_RAM_SIZE)
+                    {
+                        for (uint32_t w = 0; w < kStackWalkWords; w += 4u)
+                        {
+                            oss << "[ee-run:invalid-jump] stack sp+0x" << std::hex << (w * 4u) << ":";
+                            for (uint32_t k = w; k < w + 4u; ++k)
+                            {
+                                const uint32_t addr = sp + k * sizeof(uint32_t);
+                                uint32_t word = 0u;
+                                std::memcpy(&word, m_rdram + addr, sizeof(word));
+                                oss << " [+" << std::hex << (k * 4u) << "]0x" << word;
+                                if (m_runtime.hasFunction(word))
+                                {
+                                    oss << "<code>";
+                                }
+                            }
+                            oss << std::dec << "\n";
+                        }
+                    }
+                    else
+                    {
+                        oss << "[ee-run:invalid-jump] stack sp=0x" << std::hex << sp
+                            << " unreadable" << std::dec << "\n";
+                    }
+                    RUNTIME_LOG(oss.str());
+                }
                 m_runtime.reportMissingFunction(m_rdram,
                                                 &context,
                                                 context.pc,
@@ -415,6 +483,9 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            running->lastGoodPc = context.pc;
+            running->lastGoodRa = static_cast<uint32_t>(_mm_extract_epi32(context.r[31], 0));
+            running->lastGoodSp = static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0));
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;

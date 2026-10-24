@@ -223,6 +223,13 @@ inline void setReturnU64(R5900Context *ctx, uint64_t value)
 inline constexpr uint32_t PS2_PATH_WATCH_ADDR = 0x01EFFFA0u;
 inline constexpr uint32_t PS2_PATH_WATCH_BYTES = 0x200u;
 
+// The EE kernel anchors the main thread's stack at the top of RAM with the
+// kernel-default 32 KiB stack (main sp = PS2_RAM_SIZE - 0x10). Host-managed
+// allocations that must never collide with live guest frames — the async
+// callback stacks used by interrupt/alarm/SIF invocations — have to start
+// below this line.
+inline constexpr uint32_t kAsyncCallbackStackMainReserve = 0x8000u;
+
 inline uint32_t ps2PathWatchPhysAddr()
 {
     return PS2_PATH_WATCH_ADDR & PS2_RAM_MASK;
@@ -289,6 +296,177 @@ inline void ps2T10RangeWatch(const char *op, uint32_t address, uint64_t size, co
     (void)size;
     (void)ctx;
 #endif
+}
+
+// Vanguard M5-T4 diagnostic: armed saved-ra-slot watch. The T3 decode showed
+// a run dying at pc=0x20 because the saved $ra of sub_00462410 (frame 0x50,
+// ra slot at sp+0x10, written by `sd ra,0x10(sp)` @0x462428) had been
+// overwritten with 0x20 by an unknown writer while the frame was live. This
+// watch arms on entry to the frame function, derives the slot address from
+// the entry sp, and names every write that touches the slot while the frame
+// is live — the legit prologue store is tagged "expected", anything else is
+// FOREIGN. A verify at every guest branch catches writers that bypass the
+// per-store hooks (host services writing rdram directly).
+//
+// Opt-in (default off, zero behavior change):
+//   PS2X_RA_SLOT_WATCH=1       enable
+//   PS2X_RA_SLOT_ENTRY=0x...   frame function entry (default 0x462410)
+//   PS2X_RA_SLOT_FRAME=0x50    frame size (sp decrement at entry)
+//   PS2X_RA_SLOT_RA_OFF=0x10   offset of the saved ra inside the frame
+//   PS2X_RA_SLOT_SD_PC=0x...   pc of the prologue `sd ra` (default entry+0x18)
+//   PS2X_RA_SLOT_RETURN=0x...  pc of the epilogue `jr ra` (disarm site)
+struct Ps2RaSlotWatchState
+{
+    std::atomic<bool> armed{false};
+    std::atomic<bool> validated{false};
+    std::atomic<uint32_t> slotBase{0};
+    std::atomic<uint32_t> expectedRa{0};
+    std::atomic<uint32_t> armTid{0};
+    std::atomic<uint32_t> logs{0};
+};
+
+inline Ps2RaSlotWatchState g_ps2RaSlotWatch;
+
+inline bool ps2RaSlotWatchEnabled()
+{
+    static const bool s_enabled = []()
+    {
+        const char *env = std::getenv("PS2X_RA_SLOT_WATCH");
+        return env != nullptr && env[0] == '1';
+    }();
+    return s_enabled;
+}
+
+struct Ps2RaSlotWatchConfig
+{
+    uint32_t entry = 0x462410u;
+    uint32_t frameSize = 0x50u;
+    uint32_t raOffset = 0x10u;
+    uint32_t sdPc = 0x462428u;
+    uint32_t returnPc = 0x462500u;
+};
+
+// Called per guest branch: parse the env block once (function-local static).
+inline const Ps2RaSlotWatchConfig &ps2RaSlotWatchConfig()
+{
+    static const Ps2RaSlotWatchConfig s_config = []()
+    {
+        Ps2RaSlotWatchConfig c;
+        const auto read = [](const char *name, uint32_t fallback)
+        {
+            const char *env = std::getenv(name);
+            return env != nullptr ? static_cast<uint32_t>(std::strtoull(env, nullptr, 0)) : fallback;
+        };
+        c.entry = read("PS2X_RA_SLOT_ENTRY", c.entry);
+        c.frameSize = read("PS2X_RA_SLOT_FRAME", c.frameSize);
+        c.raOffset = read("PS2X_RA_SLOT_RA_OFF", c.raOffset);
+        c.sdPc = read("PS2X_RA_SLOT_SD_PC", c.sdPc);
+        c.returnPc = read("PS2X_RA_SLOT_RETURN", c.returnPc);
+        return c;
+    }();
+    return s_config;
+}
+
+inline void ps2RaSlotWatchLogClobber(const char *tag,
+                                     uint32_t writerPc,
+                                     uint32_t writerRa,
+                                     uint32_t writerSp,
+                                     uint32_t addr,
+                                     uint32_t size,
+                                     uint64_t valueLo,
+                                     const char *op)
+{
+    if (g_ps2RaSlotWatch.logs.fetch_add(1, std::memory_order_relaxed) >= 64u)
+    {
+        return;
+    }
+    RUNTIME_LOG("[ra-slot-watch] " << tag << ' ' << (op != nullptr ? op : "write")
+                                   << " writerPc=0x" << std::hex << writerPc
+                                   << " writerRa=0x" << writerRa
+                                   << " writerSp=0x" << writerSp
+                                   << " addr=0x" << addr
+                                   << " size=0x" << size
+                                   << " val=0x" << valueLo
+                                   << " slot=0x" << g_ps2RaSlotWatch.slotBase.load(std::memory_order_relaxed)
+                                   << " expectedRa=0x" << g_ps2RaSlotWatch.expectedRa.load(std::memory_order_relaxed)
+                                   << std::dec << std::endl);
+}
+
+inline void ps2RaSlotWatchCheckWrite(uint32_t addr,
+                                     uint32_t size,
+                                     uint64_t valueLo,
+                                     const char *op,
+                                     const R5900Context *ctx)
+{
+    if (!ps2RaSlotWatchEnabled() || !g_ps2RaSlotWatch.armed.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+    const uint32_t base = g_ps2RaSlotWatch.slotBase.load(std::memory_order_relaxed);
+    const uint64_t writeEnd = static_cast<uint64_t>(addr) + size;
+    if (addr >= base + 8u || writeEnd <= base)
+    {
+        return;
+    }
+    const uint32_t writerPc = ctx ? ctx->pc : 0u;
+    const uint32_t sdPc = ps2RaSlotWatchConfig().sdPc;
+    if (writerPc != 0u && writerPc == sdPc)
+    {
+        if (!g_ps2RaSlotWatch.validated.exchange(true, std::memory_order_relaxed))
+        {
+            ps2RaSlotWatchLogClobber("expected", writerPc,
+                                     ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u,
+                                     ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u,
+                                     addr, size, valueLo, op);
+        }
+        return;
+    }
+    if (!g_ps2RaSlotWatch.validated.load(std::memory_order_relaxed))
+    {
+        return; // before the prologue store the slot holds stale data
+    }
+    ps2RaSlotWatchLogClobber("FOREIGN", writerPc,
+                             ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u,
+                             ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u,
+                             addr, size, valueLo, op);
+}
+
+// Branch-site verify: catch writers that bypass ps2TraceGuestWrite (host
+// services writing rdram directly). Called from dispatchGuestBranch so a
+// change between two guest branches pins the window to that site.
+inline void ps2RaSlotWatchVerify(uint8_t *rdram, uint32_t sourcePc, uint32_t targetPc, uint32_t kind)
+{
+    if (!ps2RaSlotWatchEnabled() || !g_ps2RaSlotWatch.armed.load(std::memory_order_relaxed) ||
+        rdram == nullptr)
+    {
+        return;
+    }
+    if (!g_ps2RaSlotWatch.validated.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+    const uint32_t base = g_ps2RaSlotWatch.slotBase.load(std::memory_order_relaxed);
+    if (base + 8u > PS2_RAM_SIZE)
+    {
+        return;
+    }
+    uint32_t words[2];
+    std::memcpy(words, rdram + base, sizeof(words));
+    const uint32_t expected = g_ps2RaSlotWatch.expectedRa.load(std::memory_order_relaxed);
+    if (words[0] != expected || words[1] != 0u)
+    {
+        if (g_ps2RaSlotWatch.logs.fetch_add(1, std::memory_order_relaxed) < 64u)
+        {
+            RUNTIME_LOG("[ra-slot-watch] CLOBBER at-branch src=0x" << std::hex << sourcePc
+                                                                   << " target=0x" << targetPc
+                                                                   << " kind=" << kind
+                                                                   << " slot=0x" << base
+                                                                   << " now=[0x" << words[0]
+                                                                   << ",0x" << words[1]
+                                                                   << "] expectedRa=0x" << expected
+                                                                   << std::dec << std::endl);
+        }
+    }
 }
 
 #if PS2X_ENGINE_SYNC_WATCH
@@ -381,6 +559,8 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
         }
     }
 #endif
+    // Vanguard M5-T4: armed saved-ra-slot watch (env opt-in).
+    ps2RaSlotWatchCheckWrite(guestAddr, size, valueLo, op, ctx);
 #if PS2X_ENGINE_SYNC_WATCH
     // Vanguard bring-up diagnostic: log guest writes into the engine's
     // cooperative sync state (gate/counter/ring, deferred I/O record,
@@ -453,6 +633,9 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
     {
         return;
     }
+    // Vanguard M5-T4: the armed ra-slot watch must see host bulk writers too
+    // (checked before the env range filter, which is a different feature).
+    ps2RaSlotWatchCheckWrite(guestAddr, size, 0u, op, ctx);
     const uint64_t writeEnd = static_cast<uint64_t>(guestAddr) + size;
     const bool overlaps = s_watchAddr == 0u ||
                           (guestAddr < s_watchAddr + s_watchSize && writeEnd > s_watchAddr);
@@ -715,7 +898,13 @@ private:
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
-    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    // Starts BELOW the EE main thread's stack: the kernel anchors the main
+    // thread at the top of RAM (main sp = PS2_RAM_SIZE - 0x10) with the
+    // kernel-default 32 KiB stack, so callback chunks carved from plain
+    // PS2_RAM_SIZE would hand out stack pointers inside the main thread's
+    // live frames (M5-T4: vblank/alarm/SIF invocations smashed saved $ra
+    // words and parked threads silently DORMANT on garbage pcs).
+    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};

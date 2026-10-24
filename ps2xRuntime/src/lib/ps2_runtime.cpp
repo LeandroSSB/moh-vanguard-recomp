@@ -523,7 +523,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackTop = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -992,7 +992,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackTop = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
     }
 
     LoadedModule module;
@@ -1390,6 +1390,30 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    // M5-T4 probe: armed saved-ra-slot watch (env PS2X_RA_SLOT_WATCH=1).
+    // Arm on entry to the watched frame function; disarm at its epilogue
+    // return; verify the slot at every branch so host-side writers that
+    // bypass the per-store hooks are caught between two branch sites.
+    if (ps2RaSlotWatchEnabled())
+    {
+        const bool isCall = kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall;
+        const Ps2RaSlotWatchConfig &cfg = ps2RaSlotWatchConfig();
+        if (isCall && targetPc == cfg.entry)
+        {
+            const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
+            const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
+            g_ps2RaSlotWatch.slotBase.store(sp - cfg.frameSize + cfg.raOffset, std::memory_order_relaxed);
+            g_ps2RaSlotWatch.expectedRa.store(ra, std::memory_order_relaxed);
+            g_ps2RaSlotWatch.validated.store(false, std::memory_order_relaxed);
+            g_ps2RaSlotWatch.armed.store(true, std::memory_order_relaxed);
+        }
+        else if (sourcePc == cfg.returnPc && kind == GuestBranchKind::Return)
+        {
+            g_ps2RaSlotWatch.armed.store(false, std::memory_order_relaxed);
+        }
+        ps2RaSlotWatchVerify(rdram, sourcePc, targetPc, static_cast<uint32_t>(kind));
+    }
+
     // M5-T3 probe: the IOP-server callback slots. The ELF statically
     // initializes *(0x510B6C)=0x3627F0 / *(0x510B70)=0x362810 (handlers the
     // server loop sub_0036C628 calls via jalr when the IOP flag 0x64D5AD

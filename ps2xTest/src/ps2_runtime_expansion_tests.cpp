@@ -432,6 +432,40 @@ void register_ps2_runtime_expansion_tests()
                      "central dispatcher should receive the exact jump target");
         });
 
+        tc.Run("async callback stacks never overlap the EE main-thread stack region", [](TestCase &t)
+        {
+            // M5-T4 root cause: the EE kernel anchors the main thread's stack
+            // at the top of RAM (main sp = PS2_RAM_SIZE - 0x10, kernel-default
+            // 32 KiB stack). Async callback invocations (vblank INTC handlers,
+            // alarms, SIF command replies) run on reservation chunks carved
+            // from the top of RAM; handing out a chunk that overlaps the main
+            // thread's live frames smashes saved $ra words while the thread is
+            // suspended and parks it silently DORMANT on a garbage pc (the
+            // M5-T4 bifurcation: pc=0x20 / 0x19cxxxx deaths in ~half the
+            // runs). Callback stacks must live strictly below that region.
+            constexpr uint32_t kMainStackReserve = 0x8000u;
+            constexpr uint32_t kMainStackBase = PS2_RAM_SIZE - kMainStackReserve;
+            constexpr uint32_t kChunkSize = 0x4000u;
+
+            PS2Runtime runtime;
+            uint32_t prevBase = PS2_RAM_SIZE;
+            for (uint32_t i = 0; i < 8u; ++i)
+            {
+                const uint32_t sp = runtime.reserveAsyncCallbackStack(kChunkSize, 16u);
+                t.IsTrue(sp != 0u, "async callback stack space should be available");
+                if (sp == 0u)
+                {
+                    break;
+                }
+                t.IsTrue(sp <= kMainStackBase - 0x10u,
+                         "callback stack pointer must stay below the main-thread stack region");
+                const uint32_t chunkBase = sp - kChunkSize;
+                t.IsTrue(chunkBase + kChunkSize <= prevBase,
+                         "consecutive callback chunks must not overlap");
+                prevBase = chunkBase;
+            }
+        });
+
         tc.Run("dispatchGuestBranch call returns false when callee transfers elsewhere", [](TestCase &t)
         {
             PS2Runtime runtime;
