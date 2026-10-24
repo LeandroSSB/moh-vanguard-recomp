@@ -195,6 +195,22 @@ namespace
     constexpr uint32_t kMpegNoDuplicateProducerPc = 0x00125050u;
     constexpr uint32_t kMpegNoDuplicateHandle = 0x00124000u;
     constexpr uint32_t kMpegNoDuplicateImage = 0x00131000u;
+    constexpr uint32_t kMpegAddBsWakeMainPc = 0x00125200u;
+    constexpr uint32_t kMpegAddBsWakeResumePc = 0x00125210u;
+    constexpr uint32_t kMpegAddBsWakeProducerPc = 0x00125220u;
+    constexpr uint32_t kMpegAddBsWakeProducerResumePc = 0x00125230u;
+    constexpr uint32_t kMpegAddBsWatchdogPc = 0x00125240u;
+    constexpr uint32_t kMpegAddBsProbePc = 0x00125250u;
+    constexpr uint32_t kMpegAddBsProbeResumePc = 0x00125260u;
+    constexpr uint32_t kMpegAddBsWakeHandle = 0x00125000u;
+    constexpr uint32_t kMpegAddBsWakeImage = 0x00130000u;
+    constexpr uint32_t kMpegAddBsWakeData = 0x00138000u;
+    constexpr uint32_t kMpegAddBsWakeFeedSize = 0x1400u;
+    std::atomic<int32_t> gMpegAddBsWakeResult{-999};
+    std::atomic<uint32_t> gMpegAddBsWakeStage{0u};
+    std::atomic<uint32_t> gMpegAddBsProducerStage{0u};
+    std::atomic<uint32_t> gMpegAddBsProbeCount{0u};
+
     constexpr uint32_t kIpuInitMainPc = 0x00125100u;
     constexpr uint32_t kIpuInitResumePc = 0x00125104u;
     constexpr uint32_t kIpuSetD4Pc = 0x00126428u;
@@ -218,6 +234,87 @@ namespace
     void testIpuInitResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         gIpuInitResult.store(getRegS32(*ctx, 2), std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testMpegAddBsFeedMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, kMpegAddBsWakeHandle);
+        ctx->pc = kMpegAddBsProbeResumePc;
+        ps2_stubs::sceMpegInit(rdram, ctx, runtime);
+        // register the type-1 (non-stream) need-data callback, RCMP-style
+        setRegU32(*ctx, 4, kMpegAddBsWakeHandle);
+        setRegU32(*ctx, 5, 1u);
+        setRegU32(*ctx, 6, kMpegAddBsProbePc);
+        setRegU32(*ctx, 7, 0u);
+        ctx->pc = kMpegAddBsProbeResumePc;
+        ps2_stubs::sceMpegAddCallback(rdram, ctx, runtime);
+        gMpegAddBsWakeStage.store(1u, std::memory_order_release);
+        setRegU32(*ctx, 4, kMpegAddBsWakeHandle);
+        setRegU32(*ctx, 5, kMpegAddBsWakeImage);
+        ctx->pc = kMpegAddBsWakeResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    void testMpegAddBsFeedProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t call = gMpegAddBsProbeCount.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        if (call == 1u)
+        {
+            // first starve: feed partial bitstream the parser buffers without
+            // emitting a frame (bare sequence-header start code + padding)
+            std::memset(rdram + kMpegAddBsWakeData, 0u, 32u);
+            rdram[kMpegAddBsWakeData + 2u] = 0x01u;
+            rdram[kMpegAddBsWakeData + 3u] = 0xB3u;
+            setRegU32(*ctx, 4, kMpegAddBsWakeHandle);
+            setRegU32(*ctx, 5, kMpegAddBsWakeData);
+            setRegU32(*ctx, 6, kMpegAddBsWakeFeedSize);
+            ctx->pc = kMpegAddBsProbeResumePc;
+            ps2_stubs::sceMpegAddBs(rdram, ctx, runtime);
+            return;
+        }
+        // second starve: feed the RCMP dry-queue filler (the MPEG
+        // sequence-end code, 0x000001B7 x4) so the movie ENDS through the
+        // AddBs path itself and GetPicture returns to its continuation
+        std::memset(rdram + kMpegAddBsWakeData, 0u, 32u);
+        for (size_t i = 0u; i < 16u; i += 4u)
+        {
+            rdram[kMpegAddBsWakeData + i + 2u] = 0x01u;
+            rdram[kMpegAddBsWakeData + i + 3u] = 0xB7u;
+        }
+        setRegU32(*ctx, 4, kMpegAddBsWakeHandle);
+        setRegU32(*ctx, 5, kMpegAddBsWakeData);
+        setRegU32(*ctx, 6, 16u);
+        ctx->pc = kMpegAddBsProbeResumePc;
+        ps2_stubs::sceMpegAddBs(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void testMpegAddBsFeedResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegAddBsWakeStage.store(3u, std::memory_order_release);
+        gMpegAddBsWakeResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testMpegAddBsFeedWatchdogOnly(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Watchdog: bound the scheduler wait whether or not the need-data
+        // pump cycles (RED keeps this test from hanging forever).
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testMpegAddBsFeedProducerResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegAddBsProducerStage.store(2u, std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    void testMpegAddBsFeedWatchdog(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -843,6 +940,34 @@ void register_ps2_runtime_expansion_tests()
                      "EOF should resume the blocked GetPicture continuation");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegNoDuplicateHandle + 0x08u), 1u,
                      "only the injected decoder frame should be counted as served");
+        });
+
+        tc.Run("sceMpegAddBs resumes a starved GetPicture even without a decoded frame", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kMpegAddBsWakeMainPc, testMpegAddBsFeedMain);
+            runtime.registerFunction(kMpegAddBsWakeResumePc, testMpegAddBsFeedResume);
+            runtime.registerFunction(kMpegAddBsWatchdogPc, testMpegAddBsFeedWatchdogOnly);
+            runtime.registerFunction(kMpegAddBsProbePc, testMpegAddBsFeedProbe);
+            gMpegAddBsWakeResult.store(-999, std::memory_order_release);
+            gMpegAddBsWakeStage.store(0u, std::memory_order_release);
+
+            R5900Context mainContext{};
+            mainContext.pc = kMpegAddBsWakeMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.setAlarm(256u, kMpegAddBsWatchdogPc, 0u, 0u, 0u);
+            ee.run();
+
+            t.Equals(gMpegAddBsProbeCount.load(std::memory_order_acquire), 2u,
+                     "the need-data callback must re-fire after a fed-but-frameless AddBs");
+            t.Equals(gMpegAddBsWakeStage.load(std::memory_order_acquire), 3u,
+                     "GetPicture should reach its continuation once the stream ends");
+            t.Equals(gMpegAddBsWakeResult.load(std::memory_order_acquire), 0,
+                     "the resumed continuation should observe a successful wake");
         });
 
         tc.Run("sceSdRemote isolates voice transfers from block streaming state", [](TestCase &t)

@@ -1043,6 +1043,24 @@ namespace ps2_stubs
 
             playback.sawInput = true;
             updateMpegPictureTiming(playback, data, size);
+            // Vanguard M5-T7: end-of-stream must be detected BEFORE the
+            // sequence-header sync block — while the decoder is still waiting
+            // for a video sequence header (or after a decoder reset) the sync
+            // block swallows every chunk into its sync buffer and returns, so
+            // a late end-code check is unreachable exactly when a movie ends
+            // without usable frames. On the sceMpegAddBs path the RCMP player
+            // signals end-of-movie by feeding the MPEG sequence-end code
+            // (0x000001B7) once its chunk queue runs dry; mirror the PSS
+            // program-end handling so GetPicture returns to the game instead
+            // of starving forever after the movie finished.
+            if (containsMpegSequenceEnd(data, size))
+            {
+                playback.sawSequenceEnd = true;
+                playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+                playback.streamEnded = true;
+                flushDecoderIfEnded(playback);
+                return;
+            }
             if (playback.waitingForVideoSequenceHeader)
             {
                 playback.videoSequenceSyncBuffer.insert(
@@ -1090,11 +1108,6 @@ namespace ps2_stubs
                 playback.decodedFrames.clear();
             }
 
-            if (containsMpegSequenceEnd(data, size))
-            {
-                playback.sawSequenceEnd = true;
-                playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
-            }
 
             if (!playback.decoder)
             {
@@ -1906,8 +1919,20 @@ namespace ps2_stubs
             if (copied != 0u)
             {
                 playback.needDataCallbackQueued = false; // fed: arm the next starve episode
+                // Vanguard M5-T7: a fed-but-frameless AddBs must still wake the
+                // parked GetPicture. The SDK wake contract is "new bitstream
+                // arrived", not "a frame completed": the FFmpeg-backed parser
+                // buffers partial pictures, so without this wake the starve ->
+                // need-data-callback -> AddBs pump deadlocks after its first
+                // feed (GetPicture never re-enters, so the callback is never
+                // re-queued and the parser never sees more data). GetPicture
+                // re-checks, finds no frame yet, and re-queues the callback.
+                wakePictureWaiter = true;
             }
-            wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+            else
+            {
+                wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+            }
         }
 
         if (wakePictureWaiter)
