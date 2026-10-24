@@ -652,6 +652,31 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                        << std::endl);
 }
 
+class PS2Runtime; // M5-T11 probe forward declaration
+
+// -----------------------------------------------------------------------------
+// Vanguard M5-T11 probe (runtime-only, opt-in PS2X_ENABLE_M5T11=1): pin who
+// poisons the engine event-dispatcher's control flow with 0x100 (T10 decode:
+// tid=1 invalid-jump badPc=0x100 ra=0x100, deterministic, after the MPEG ring
+// dries). Instruments:
+//   [m5t11-edge]  ring of the last 128 inter-function edges (src/dst/kind/sp)
+//   [m5t11-bad]   one-shot catch of ANY branch targeting a non-code address
+//                 (<0x100000, !=0): full GPRs + stack scan + ring tail
+//   [m5t11-task]  dispatcher-entry capture (sub_00462508): manager words +
+//                 task-block watch ([*(a2+4)]..+0x1C, incl. the [task+0xC]
+//                 handler slot the jalr takes) with the writing branch site
+//   [m5t11-async] every reserveAsyncCallbackStack block (base/top): the T7
+//                 async stacks march DOWN from 0x1FF8000; if they touch live
+//                 game data the registry names the overlap at death time
+bool ps2xM5T11Enabled();
+void ps2xM5T11RecordEdge(uint32_t src, uint32_t dst, uint32_t kind, uint32_t sp, uint32_t ra);
+void ps2xM5T11CatchBogusTarget(const PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t src, uint32_t dst, uint32_t kind);
+void ps2xM5T11NoteDispatcherEntry(uint8_t *rdram, uint32_t a0, uint32_t a2);
+void ps2xM5T11VerifyDispatcherSlot(uint8_t *rdram, uint32_t srcPc);
+void ps2xM5T11NoteAsyncBlock(uint32_t base, uint32_t top);
+void ps2xM5T11FormatRing(std::ostringstream &oss, uint32_t tail);
+void ps2xM5T11FormatAsyncBlocks(std::ostringstream &oss);
+
 class PS2Runtime
 {
 public:

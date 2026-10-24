@@ -1445,6 +1445,29 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         ps2RaSlotWatchVerify(rdram, sourcePc, targetPc, static_cast<uint32_t>(kind));
     }
 
+    // Vanguard M5-T11 probe: edge ring + bogus-target catch + dispatcher
+    // entry capture (opt-in PS2X_ENABLE_M5T11=1, zero cost when off).
+    if (ps2xM5T11Enabled())
+    {
+        const uint32_t sp11 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
+        const uint32_t ra11 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
+        ps2xM5T11RecordEdge(sourcePc, targetPc, static_cast<uint32_t>(kind), sp11, ra11);
+        if (targetPc != 0u && targetPc < 0x00100000u)
+        {
+            ps2xM5T11CatchBogusTarget(this, rdram, ctx, sourcePc, targetPc, static_cast<uint32_t>(kind));
+        }
+        if (targetPc == 0x462508u && (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall))
+        {
+            ps2xM5T11NoteDispatcherEntry(rdram,
+                                         static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)),
+                                         static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0)));
+        }
+        else
+        {
+            ps2xM5T11VerifyDispatcherSlot(rdram, sourcePc);
+        }
+    }
+
     // M5-T3 probe: the IOP-server callback slots. The ELF statically
     // initializes *(0x510B6C)=0x3627F0 / *(0x510B70)=0x362810 (handlers the
     // server loop sub_0036C628 calls via jalr when the IOP flag 0x64D5AD
@@ -2911,6 +2934,10 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     }
 
     m_asyncCallbackStackTop = base;
+    if (ps2xM5T11Enabled())
+    {
+        ps2xM5T11NoteAsyncBlock(base, top);
+    }
     return top - 0x10u;
 }
 
@@ -3105,6 +3132,249 @@ const EeScheduler &PS2Runtime::eeScheduler() const
     return *m_eeScheduler;
 }
 
+// -----------------------------------------------------------------------------
+// Vanguard M5-T11 probe implementation (see ps2_runtime.h for the contract).
+namespace
+{
+    constexpr uint32_t kM5T11RingSize = 128u;
+
+    struct Ps2M5T11Edge
+    {
+        uint32_t src = 0u;
+        uint32_t dst = 0u;
+        uint32_t kind = 0u;
+        uint32_t sp = 0u;
+        uint32_t ra = 0u;
+    };
+
+    struct Ps2M5T11State
+    {
+        std::array<Ps2M5T11Edge, kM5T11RingSize> ring{};
+        uint32_t ringNext = 0u;
+        uint64_t edges = 0u;
+        uint32_t badLogged = 0u;
+        // dispatcher task watch (sub_00462508 entry capture)
+        bool taskPrimed = false;
+        uint32_t taskBase = 0u;
+        uint32_t taskPrev[8] = {};
+        uint32_t managerPrev[2] = {};
+        bool managerPrimed = false;
+        uint32_t taskLogged = 0u;
+        // async callback stack block registry
+        struct Block
+        {
+            uint32_t base = 0u;
+            uint32_t top = 0u;
+        };
+        std::vector<Block> blocks;
+    };
+
+    Ps2M5T11State g_m5t11;
+
+    bool m5t11ReadU32(const uint8_t *rdram, uint32_t addr, uint32_t &out)
+    {
+        if (rdram == nullptr || addr > PS2_RAM_SIZE - sizeof(uint32_t))
+        {
+            out = 0u;
+            return false;
+        }
+        std::memcpy(&out, rdram + addr, sizeof(out));
+        return true;
+    }
+} // namespace
+
+bool ps2xM5T11Enabled()
+{
+    static const bool s_enabled = []()
+    {
+        const char *env = std::getenv("PS2X_ENABLE_M5T11");
+        return env != nullptr && env[0] == '1';
+    }();
+    return s_enabled;
+}
+
+void ps2xM5T11RecordEdge(uint32_t src, uint32_t dst, uint32_t kind, uint32_t sp, uint32_t ra)
+{
+    Ps2M5T11Edge &e = g_m5t11.ring[g_m5t11.ringNext];
+    e.src = src;
+    e.dst = dst;
+    e.kind = kind;
+    e.sp = sp;
+    e.ra = ra;
+    g_m5t11.ringNext = (g_m5t11.ringNext + 1u) % kM5T11RingSize;
+    ++g_m5t11.edges;
+}
+
+void ps2xM5T11FormatRing(std::ostringstream &oss, uint32_t tail)
+{
+    const uint32_t count = tail < kM5T11RingSize ? tail : kM5T11RingSize;
+    oss << " ring(oldest to newest):";
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const uint32_t idx = (g_m5t11.ringNext + kM5T11RingSize - count + i) % kM5T11RingSize;
+        const Ps2M5T11Edge &e = g_m5t11.ring[idx];
+        oss << " [0x" << std::hex << e.src << "-@0x" << e.dst
+            << " k" << std::dec << e.kind << "]" << std::hex;
+    }
+    oss << std::dec << " edges=" << g_m5t11.edges;
+}
+
+void ps2xM5T11FormatAsyncBlocks(std::ostringstream &oss)
+{
+    oss << " asyncBlocks(" << g_m5t11.blocks.size() << "):";
+    for (const Ps2M5T11State::Block &b : g_m5t11.blocks)
+    {
+        oss << " [0x" << std::hex << b.base << "..0x" << b.top << ")" << std::hex;
+    }
+    oss << std::dec;
+}
+
+void ps2xM5T11CatchBogusTarget(const PS2Runtime *runtime,
+                               uint8_t *rdram,
+                               R5900Context *ctx,
+                               uint32_t src,
+                               uint32_t dst,
+                               uint32_t kind)
+{
+    if (g_m5t11.badLogged >= 4u || rdram == nullptr || ctx == nullptr)
+    {
+        return;
+    }
+    ++g_m5t11.badLogged;
+    static constexpr const char *kGprNames[32] = {
+        "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+    const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
+    std::ostringstream oss;
+    oss << "[m5t11-bad] #" << std::dec << g_m5t11.badLogged
+        << " kind=" << kind
+        << " src=0x" << std::hex << src
+        << " dst=0x" << dst
+        << " pc=0x" << ctx->pc << std::dec << "\n";
+    for (uint32_t i = 0; i < 32u; i += 4u)
+    {
+        oss << "[m5t11-bad] gpr";
+        for (uint32_t j = i; j < i + 4u; ++j)
+        {
+            oss << ' ' << kGprNames[j] << "=0x"
+                << std::hex << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[j], 0));
+        }
+        oss << std::dec << "\n";
+    }
+    if (sp >= 0x00100000u && sp + 0x200u <= PS2_RAM_SIZE)
+    {
+        for (uint32_t w = 0; w < 0x80u; w += 4u)
+        {
+            oss << "[m5t11-bad] stack sp+0x" << std::hex << (w * 4u) << ":";
+            for (uint32_t k = w; k < w + 4u; ++k)
+            {
+                const uint32_t addr = sp + k * sizeof(uint32_t);
+                uint32_t word = 0u;
+                m5t11ReadU32(rdram, addr, word);
+                oss << " [+" << std::hex << (k * 4u) << "]0x" << word;
+                if (word == 0x100u)
+                {
+                    oss << "<100>";
+                }
+                if (runtime != nullptr && runtime->hasFunction(word))
+                {
+                    oss << "<code>";
+                }
+            }
+            oss << std::dec << "\n";
+        }
+    }
+    ps2xM5T11FormatRing(oss, 48);
+    ps2xM5T11FormatAsyncBlocks(oss);
+    oss << std::endl;
+    RUNTIME_LOG(oss.str());
+}
+
+void ps2xM5T11NoteDispatcherEntry(uint8_t *rdram, uint32_t a0, uint32_t a2)
+{
+    if (rdram == nullptr)
+    {
+        return;
+    }
+    uint32_t mgr[2] = {0u, 0u};
+    m5t11ReadU32(rdram, a0, mgr[0]);
+    m5t11ReadU32(rdram, a0 + 4u, mgr[1]);
+    uint32_t task = 0u;
+    m5t11ReadU32(rdram, a2 + 4u, task);
+    if (!g_m5t11.managerPrimed || mgr[0] != g_m5t11.managerPrev[0] || mgr[1] != g_m5t11.managerPrev[1] ||
+        task != g_m5t11.taskBase)
+    {
+        if (g_m5t11.taskLogged < 64u)
+        {
+            ++g_m5t11.taskLogged;
+            RUNTIME_LOG("[m5t11-task] mgr=0x" << std::hex << a0
+                                              << " {mask=0x" << mgr[0] << ", table=0x" << mgr[1] << "}"
+                                              << " group=0x" << a2
+                                              << " task=0x" << task << std::dec << std::endl);
+        }
+        g_m5t11.managerPrimed = true;
+        g_m5t11.managerPrev[0] = mgr[0];
+        g_m5t11.managerPrev[1] = mgr[1];
+        g_m5t11.taskBase = task;
+        g_m5t11.taskPrimed = false;
+    }
+}
+
+void ps2xM5T11VerifyDispatcherSlot(uint8_t *rdram, uint32_t srcPc)
+{
+    if (rdram == nullptr || !g_m5t11.managerPrimed || g_m5t11.taskLogged >= 64u)
+    {
+        return;
+    }
+    const uint32_t base = g_m5t11.taskBase;
+    if (base == 0u || base > PS2_RAM_SIZE - 0x20u)
+    {
+        return;
+    }
+    uint32_t cur[8] = {};
+    for (uint32_t i = 0; i < 8u; ++i)
+    {
+        m5t11ReadU32(rdram, base + i * 4u, cur[i]);
+    }
+    if (!g_m5t11.taskPrimed)
+    {
+        std::memcpy(g_m5t11.taskPrev, cur, sizeof(cur));
+        g_m5t11.taskPrimed = true;
+        return;
+    }
+    if (std::memcmp(g_m5t11.taskPrev, cur, sizeof(cur)) == 0)
+    {
+        return;
+    }
+    ++g_m5t11.taskLogged;
+    std::ostringstream line;
+    line << "[m5t11-slot] task=0x" << std::hex << base
+         << " writer-site=0x" << srcPc << " changed:";
+    for (uint32_t i = 0; i < 8u; ++i)
+    {
+        if (cur[i] != g_m5t11.taskPrev[i])
+        {
+            line << " [+" << std::hex << (i * 4u) << "]0x" << cur[i]
+                 << "(was 0x" << g_m5t11.taskPrev[i] << ")";
+        }
+    }
+    line << std::dec << std::endl;
+    RUNTIME_LOG(line.str());
+    std::memcpy(g_m5t11.taskPrev, cur, sizeof(cur));
+}
+
+void ps2xM5T11NoteAsyncBlock(uint32_t base, uint32_t top)
+{
+    if (g_m5t11.blocks.size() < 64u)
+    {
+        g_m5t11.blocks.push_back({base, top});
+    }
+    RUNTIME_LOG("[m5t11-async] block #" << std::dec << g_m5t11.blocks.size()
+                                        << " [0x" << std::hex << base << "..0x" << top << ")"
+                                        << std::dec << std::endl);
+}
 void PS2Runtime::postEeEvent(EeEvent event)
 {
     m_eeScheduler->postEvent(event);

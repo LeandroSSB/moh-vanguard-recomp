@@ -592,6 +592,17 @@ namespace ps2_syscalls
                 g_gameHeapBase = heapBase;
                 g_gameHeapLimit = heapLimit;
             }
+            // Vanguard M5-T11 probe: the game's heap window decides
+            // where the T7 async callback stacks may safely live.
+            if (ps2xM5T11Enabled())
+            {
+                RUNTIME_LOG("[m5t11-heap] SetupHeap base=0x" << std::hex << heapBaseRaw
+                            << " aligned=0x" << heapBase
+                            << " size=0x" << heapSize
+                            << " limit=0x" << heapLimit
+                            << " runtimeHeap=0x" << runtime->guestHeapBase()
+                            << std::dec << std::endl);
+            }
 
             // Re-base the runtime STAGING heap to [suggestedBase, heapBase):
             // configureGuestHeap(0, ...) falls back to the loader's suggested

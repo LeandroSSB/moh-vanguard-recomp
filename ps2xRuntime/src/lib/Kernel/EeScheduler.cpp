@@ -3,6 +3,8 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
+#include "ps2_runtime.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -490,6 +492,18 @@ void EeScheduler::run()
                     {
                         oss << "[ee-run:invalid-jump] stack sp=0x" << std::hex << sp
                             << " unreadable" << std::dec << "\n";
+                    }
+                    // Vanguard M5-T11 probe: for a bogus badPc (0x100 class)
+                    // also dump the inter-function edge ring and the async
+                    // callback-stack block registry: the ring names the last
+                    // real control-flow edges before the poisoned dispatch;
+                    // the registry shows whether the poisoned window sits
+                    // inside an async stack block (T7 allocator vs game data).
+                    if (context.pc < 0x00100000u)
+                    {
+                        ps2xM5T11FormatRing(oss, 64);
+                        ps2xM5T11FormatAsyncBlocks(oss);
+                        oss << "\n";
                     }
                     RUNTIME_LOG(oss.str());
                 }
