@@ -99,6 +99,79 @@ void register_ps2_iop_tests()
                      "unknown Scmd commands should be logged");
         });
 
+        tc.Run("an EE-to-IOP SIF DMA wakes the resident IOP side", [](TestCase &t)
+        {
+            iop_test::Host host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            // Synthetic resident IRX shaped like MOH Vanguard's SNDDRV.IRX
+            // (decoded from cdrom0:\IOP\SNDDRV.IRX;1): _start creates a server
+            // thread that parks in SleepThread (the sifcmd GetNextRequest poll
+            // shape), hands the thread to sifcmd SetRpcQueue, and registers an
+            // intrman handler for DMAC channel 1 (SIF1, the EE->IOP channel).
+            // On hardware the incoming SIF DMA raises SIF1 in the IOP; the
+            // bridge must wake the sleeping RPC-server thread and raise that
+            // interrupt instead of discarding the transfer.
+            iop_test::Irx image;
+            image.words(0x00u, {
+                0x3C040001u, 0x34840200u,             // a0 = &thread desc 0x10200
+                0x0C004021u, 0x00000000u,             // jal thbase:4 CreateThread
+                0x3C030001u, 0xAC620248u,             // save tid @0x10248
+                0x34450000u,                          // a1 = tid
+                0x3C040001u, 0x34840240u,             // a0 = queue data 0x10240
+                0x0C00402Cu, 0x00000000u,             // jal sifcmd:19 SetRpcQueue
+                0x24040001u, 0x3C060001u,             // a0 = irq 1; a2 = handler
+                0x0C004033u, 0x34C60300u,             // jal intrman:4 RegisterIntrHandler(1, ., 0x10300)
+                0x24040001u, 0x0C004035u, 0x00000000u,// jal intrman:6 EnableIntr(1)
+                0x3C030001u, 0x8C640248u,             // a0 = saved tid
+                0x0C004023u, 0x24050000u,             // jal thbase:6 StartThread(tid, 0)
+                0x3C020001u, 0x34420244u,             // v0 = 0x10244
+                0x240300A5u, 0xAC430000u,             // *0x10244 = 0xA5 (start marker)
+                0x24020000u, 0x03E00008u,             // v0 = 0, return (resident)
+            });
+            image.words(0x70u, {0x41E00000u, 0u, 0x0101u, 0x61626874u, 0x00006573u,   // "thbase"
+                                0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u,
+                                0x03E00008u, 0x24000018u});
+            image.words(0x9Cu, {0x41E00000u, 0u, 0x0101u, 0x63666973u, 0x0000646Du,   // "sifcmd"
+                                0x03E00008u, 0x24000013u});
+            image.words(0xB8u, {0x41E00000u, 0u, 0x0101u, 0x72746E69u, 0x006E616Du,   // "intrman"
+                                0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u});
+            image.words(0x200u, {0u, 0u, 0x10280u, 0x400u, 0x20u, 0u});               // thread desc
+            image.words(0x280u, {0x0C004025u, 0u,                                     // jal thbase:24 SleepThread
+                                 0x3C020001u, 0x3442024Cu, 0x24030001u, 0xAC430000u,  // *0x1024C = 1 (wake marker)
+                                 0x080040A0u, 0u});                                   // loop back to sleep
+            image.words(0x300u, {0x3C020001u, 0x34420250u, 0x24030001u, 0xAC430000u,  // *0x10250 = 1
+                                 0x03E00008u, 0u});                                   // SIF1 irq handler
+            image.install(host, 0x1000u);
+            const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModuleBuffer(0x1000u);
+            t.IsTrue(loaded.handled && loaded.startResult == 0,
+                     "the resident wake-probe IRX should start and stay resident");
+
+            subsystem.runEeCycles(8u * 4096u);
+            uint32_t startMarker = 0u;
+            uint32_t wakeMarker = 0u;
+            uint32_t irqMarker = 0u;
+            t.IsTrue(subsystem.readMemory(0x10244u, &startMarker, sizeof(startMarker)) && startMarker == 0xA5u,
+                     "_start should have run on the emulated IOP");
+            t.IsTrue(subsystem.readMemory(0x1024Cu, &wakeMarker, sizeof(wakeMarker)) && wakeMarker == 0u,
+                     "the RPC-server thread should park before any EE->IOP SIF traffic");
+            t.IsTrue(subsystem.readMemory(0x10250u, &irqMarker, sizeof(irqMarker)) && irqMarker == 0u,
+                     "the SIF1 handler should be idle before any EE->IOP SIF traffic");
+
+            // The Vanguard sound streamer's exact transfer shape: sceSifSetDma
+            // of one 0xAF0-byte packet from EE 0x653a00 into SNDDRV's BSS ring
+            // at IOP 0x33854 (~821 packets/s in the T8 runs).
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     0x653A00u, 0x33854u, 0xAF0u});
+            subsystem.runEeCycles(8u * 4096u);
+
+            t.IsTrue(subsystem.readMemory(0x1024Cu, &wakeMarker, sizeof(wakeMarker)) && wakeMarker == 1u,
+                     "the EE->IOP DMA must wake the sleeping sifcmd RPC-server thread");
+            t.IsTrue(subsystem.readMemory(0x10250u, &irqMarker, sizeof(irqMarker)) && irqMarker == 1u,
+                     "the EE->IOP DMA must raise the SIF1 completion interrupt in the IOP");
+        });
+
         tc.Run("unknown SID remains unhandled without a loaded IRX", [](TestCase &t)
         {
             iop_test::Host host;

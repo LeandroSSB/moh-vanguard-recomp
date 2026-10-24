@@ -193,21 +193,8 @@ namespace ps2x::iop::detail
             return true;
         case 25:
         case 26:
-        {
-            const int id = static_cast<int>(cpu.gpr[4]);
-            const auto it = m_threads.find(id);
-            if (it == m_threads.end())
-            {
-                setV0(-1);
-                return true;
-            }
-            if (it->second.state == IopThreadState::Sleep)
-                it->second.state = IopThreadState::Ready;
-            else
-                ++it->second.wakeupCount;
-            setV0(0);
+            setV0(wakeThread(static_cast<int>(cpu.gpr[4])) ? 0 : -1);
             return true;
-        }
         case 27:
         case 28:
         {
@@ -669,6 +656,18 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
+    bool IopKernel::wakeThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end())
+            return false;
+        if (it->second.state == IopThreadState::Sleep)
+            it->second.state = IopThreadState::Ready;
+        else
+            ++it->second.wakeupCount;
+        return true;
+    }
+
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
         for (auto &[id, thread] : m_threads)
@@ -709,10 +708,16 @@ namespace ps2x::iop::detail
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
     {
-        if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
-            thread.state = IopThreadState::Dormant;
-        else if (thread.state == IopThreadState::Running)
-            thread.state = IopThreadState::Ready;
+        // An import call returns through the sentinel, so the sentinel alone
+        // cannot mean "thread finished": a thread that blocked inside an
+        // import (SleepThread/DelayThread/WaitSema/WaitEventFlag) also exits
+        // its timeslice through the sentinel with the block state already
+        // recorded. Clobbering that state to Dormant made every sleeping or
+        // waiting resident-IRX thread unrunnable forever (the T8 "deaf IOP").
+        // Only a thread still Running at its sentinel actually finished.
+        const bool returnedFromCall = thread.cpu.pc == returnSentinel || thread.cpu.stopped;
+        if (thread.state == IopThreadState::Running)
+            thread.state = returnedFromCall ? IopThreadState::Dormant : IopThreadState::Ready;
         m_currentThread = nullptr;
         cleanupDeadThreads();
     }

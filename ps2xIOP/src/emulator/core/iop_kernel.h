@@ -59,6 +59,11 @@ namespace ps2x::iop::detail
 
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+        // Wake a sleeping thread by id (thbase WakeupThread semantics). Used
+        // by the SIF bridge to deliver EE->IOP wakeups to resident IRX
+        // RPC-server threads that park in SleepThread while polling
+        // sceSifGetNextRequest (SNDDRV shape).
+        [[nodiscard]] bool wakeThread(int id);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;

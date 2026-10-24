@@ -588,6 +588,19 @@ namespace ps2x::iop::detail
             }
         }
 
+        // EE->IOP SIF notification from the runtime transport. The bytes were
+        // already copied into IOP RAM by the transport; what the emulated IOP
+        // still needs is the completion event, so schedule the SIF1 (IOP DMAC
+        // channel 1, EE->IOP) interrupt for any resident guest handler
+        // registered through intrman. The sifcmd bridge wake (RPC-server
+        // threads) happens in IopRpcBridge::onSifTransfer.
+        void onSifTransfer(const SifTransfer &transfer)
+        {
+            rpc.onSifTransfer(transfer);
+            if (transfer.kind == SifTransferKind::SetDma && transfer.phase == SifTransferPhase::AfterCopy)
+                pendingDmaInterrupts[1] = totalCycles + 16u;
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -760,7 +773,7 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
-        m_impl->rpc.onSifTransfer(transfer);
+        m_impl->onSifTransfer(transfer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)

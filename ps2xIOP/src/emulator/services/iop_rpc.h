@@ -54,6 +54,11 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+        // Telemetry for the debug snapshot / probes: how many EE->IOP SIF DMA
+        // completions reached the bridge and where the last one landed.
+        [[nodiscard]] uint64_t eeToIopDmaCount() const noexcept { return m_eeToIopDmaCount; }
+        [[nodiscard]] uint32_t lastEeToIopDmaDest() const noexcept { return m_lastEeToIopDmaDest; }
+        [[nodiscard]] uint32_t lastEeToIopDmaSize() const noexcept { return m_lastEeToIopDmaSize; }
 
     private:
         struct RpcServer
@@ -72,7 +77,13 @@ namespace ps2x::iop::detail
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
+        // sifcmd SetRpcQueue(queueData, threadId) registrations: the resident
+        // server thread that polls sceSifGetNextRequest on that queue.
+        std::unordered_map<uint32_t, uint32_t> m_queueThreads;
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
+        uint64_t m_eeToIopDmaCount = 0u;
+        uint32_t m_lastEeToIopDmaDest = 0u;
+        uint32_t m_lastEeToIopDmaSize = 0u;
     };
 }

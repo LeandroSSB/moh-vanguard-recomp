@@ -3246,6 +3246,35 @@ void PS2Runtime::run()
                                                << " vif=" << curVif
                                                << std::endl);
 
+                // M5-T8 fix round: IOP liveness snapshot (measurement only).
+                // Opt-in PS2X_IOP_SNAPSHOT_SECS=N dumps the emulated IOP's
+                // debugSnapshot() every N seconds (60 ticks/s), with deltas,
+                // to prove/disprove whether resident IOP modules' threads
+                // execute at all past boot (T8: SNDDRV.IRX starvation claim).
+                {
+                    static const char *s_iopSnapEnv = std::getenv("PS2X_IOP_SNAPSHOT_SECS");
+                    static const uint32_t s_iopSnapSecs = s_iopSnapEnv != nullptr ? static_cast<uint32_t>(std::atoi(s_iopSnapEnv)) : 0u;
+                    if (s_iopSnapSecs != 0u && (tick % (s_iopSnapSecs * 60u)) == 0u)
+                    {
+                        static uint64_t s_prevInstr = 0u;
+                        static uint64_t s_prevCycles = 0u;
+                        static uint32_t s_shot = 0u;
+                        const auto iopSnap = iopDebugSnapshot();
+                        RUNTIME_LOG("[iop-snapshot] shot=" << ++s_shot
+                                    << std::dec
+                                    << " instr=" << iopSnap.emulatorInstructions
+                                    << " (d=" << (iopSnap.emulatorInstructions - s_prevInstr) << ")"
+                                    << " cycles=" << iopSnap.emulatorCycles
+                                    << " (d=" << (iopSnap.emulatorCycles - s_prevCycles) << ")"
+                                    << " threads=" << iopSnap.emulatorThreads
+                                    << " modules=" << iopSnap.emulatorLoadedModules
+                                    << " rpcServers=" << iopSnap.emulatorRpcServers
+                                    << std::endl);
+                        s_prevInstr = iopSnap.emulatorInstructions;
+                        s_prevCycles = iopSnap.emulatorCycles;
+                    }
+                }
+
                 // M5-T8 park probe (opt-in PS2X_ENABLE_M5T8=1): name WHERE the
                 // main thread sleeps. GameDelay (0x355860) saves its return
                 // address at 0x30(sp); the sampled ra 0x3558d4 is only the

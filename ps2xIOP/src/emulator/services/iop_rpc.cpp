@@ -21,8 +21,12 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_queueThreads.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
+        m_eeToIopDmaCount = 0u;
+        m_lastEeToIopDmaDest = 0u;
+        m_lastEeToIopDmaSize = 0u;
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
@@ -234,6 +238,12 @@ namespace ps2x::iop::detail
             setV0(0);
             return true;
         case 19: // SetRpcQueue
+            // Remember which resident thread serves this queue so EE->IOP SIF
+            // traffic can wake it (real sifcmd does this from the SIF1 DMA
+            // interrupt; SNDDRV-style IRX servers park in SleepThread between
+            // sceSifGetNextRequest polls).
+            if (cpu.gpr[4] != 0u)
+                m_queueThreads[cpu.gpr[4]] = cpu.gpr[5];
             setV0(cpu.gpr[4]);
             return true;
         case 20:
@@ -322,11 +332,25 @@ namespace ps2x::iop::detail
 
     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
     {
-        // The EE SIF transport owns the actual directional memory movement.
-        // Services still receive both phases through IopSubsystem, but mirroring
-        // IOP bytes through an equal-numbered EE address would alias two distinct
-        // PS2 address spaces and can overwrite live game data.
-        (void)transfer;
+        // The EE SIF transport owns the actual directional memory movement
+        // (ps2xRuntime copies the bytes into IOP RAM before the AfterCopy
+        // notification), and mirroring IOP bytes through an equal-numbered EE
+        // address would alias two distinct PS2 address spaces and can
+        // overwrite live game data. What the bridge must still do is the
+        // wake-up half of the handshake: on hardware an EE->IOP SIF DMA
+        // completion raises the SIF1 interrupt in the IOP and sifcmd wakes
+        // the registered RPC-server threads. Resident IRX servers (MOH
+        // Vanguard's SNDDRV.IRX streams ~821 packets/s this way) park their
+        // server thread in SleepThread while polling sceSifGetNextRequest,
+        // so without this wake the module never observes the packets even
+        // though the bytes land in its IOP buffer.
+        if (transfer.kind != SifTransferKind::SetDma || transfer.phase != SifTransferPhase::AfterCopy)
+            return;
+        ++m_eeToIopDmaCount;
+        m_lastEeToIopDmaDest = transfer.destinationAddress;
+        m_lastEeToIopDmaSize = transfer.size;
+        for (const auto &[queue, threadId] : m_queueThreads)
+            (void)m_kernel.wakeThread(static_cast<int>(threadId));
     }
 
     void IopRpcBridge::removeServersInRange(uint32_t base, uint32_t size)
