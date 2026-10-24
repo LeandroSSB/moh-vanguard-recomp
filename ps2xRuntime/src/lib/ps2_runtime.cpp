@@ -1523,6 +1523,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // 0x27a268 loop runs them). The shape-A/B run bifurcation freezes the
     // init at cbIdx=6 — this names the exact branch site that flips any
     // meta word.
+    static const bool s_m5t8Gate = []()
+    {
+        const char *env = std::getenv("PS2X_ENABLE_M5T8");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (s_m5t8Gate)
     {
         static bool s_metaPrimed = false;
         static uint32_t s_metaPrev[12] = {};
@@ -1581,6 +1587,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // branch — the shape-B deadlock is main parked in WaitSema(lock) while
     // the owner word says someone else; this names the branch that takes or
     // releases the lock last.
+    if (s_m5t8Gate)
     {
         static bool s_lockPrimed = false;
         static uint32_t s_lockPrev[3] = {};
