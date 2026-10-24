@@ -343,6 +343,40 @@ void EeScheduler::run()
 
         if (context.pc == 0u)
         {
+            // M5-T10 probe (runtime-only, opt-in PS2X_ENABLE_M5T10=1): a
+            // guest thread reached pc=0 — either it RETURNED from its entry
+            // (created with ra=0) or it jalr'd a null pointer. Either way it
+            // dies here (makeDormant). Dump the dying thread's registers and
+            // the stack tail: if sp sits at the CreateThread stack top the
+            // entry returned cleanly (shallow frames still readable below);
+            // a deep sp with stale ra words names the null-call frame.
+            static const bool s_m5t10Exit = []()
+            {
+                const char *env = std::getenv("PS2X_ENABLE_M5T10");
+                return env != nullptr && env[0] == '1';
+            }();
+            if (s_m5t10Exit && running->id != 0)
+            {
+                std::ostringstream ex;
+                ex << "[m5t10-exit] tid=" << running->id
+                   << " entry=0x" << std::hex << running->entry
+                   << " ra=0x" << getRegU32(&context, 31)
+                   << " sp=0x" << getRegU32(&context, 29)
+                   << " gp=0x" << getRegU32(&context, 28)
+                   << " s0=0x" << getRegU32(&context, 16)
+                   << " stackTop=0x" << ((running->stack != 0u) ? ((running->stack + running->stackSize) & ~0xFu) : 0u);
+                const uint32_t spExit = getRegU32(&context, 29);
+                if (spExit >= 0x00100000u && spExit + 0x100u <= 0x02000000u)
+                {
+                    for (uint32_t w = 0; w < 64u; ++w)
+                    {
+                        ex << " +" << std::dec << (w * 4u) << std::hex
+                           << "=0x" << m_runtime.memory().read32(spExit + w * 4u);
+                    }
+                }
+                ex << std::dec << std::endl;
+                RUNTIME_LOG(ex.str());
+            }
             if (!running->invocations.empty())
             {
                 GuestInvocation completed = std::move(running->invocations.back());

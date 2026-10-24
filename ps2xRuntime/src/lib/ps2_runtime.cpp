@@ -1394,6 +1394,23 @@ namespace
     uint32_t g_m5t9PumpEntries = 0;
     uint32_t g_m5t9CdHandlerEntries = 0;
     uint32_t g_m5t9CdReadEntries = 0;
+
+    // M5-T10 probe: entries into the message-machinery actors (submit-pump
+    // 0x33fe80, completion bomb 0x340320, deferred-I/O armer 0x344160,
+    // drain 0x3441c0). Same single-executor-thread assumption as the T9
+    // counters. s_m5t10PrevPending tracks [0x647F6C] between branches to
+    // catch the post (0->X) and consume (X->0) transitions.
+    uint32_t g_m5t10SubmitEntries = 0;
+    uint32_t g_m5t10BombEntries = 0;
+    uint32_t g_m5t10ArmEntries = 0;
+    uint32_t g_m5t10DrainEntries = 0;
+    // M5-T10 iteration-2: demand-side actors (barrier group service,
+    // app transfer start/advance, MPEG ring-fill spin).
+    uint32_t g_m5t10BarrierEntries = 0;
+    uint32_t g_m5t10XferStartEntries = 0;
+    uint32_t g_m5t10XferAdvEntries = 0;
+    uint32_t g_m5t10RingFillEntries = 0;
+    uint32_t s_m5t10PrevPending = 0;
 }
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1539,6 +1556,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const char *env = std::getenv("PS2X_ENABLE_M5T8");
         return env != nullptr && env[0] == '1';
     }();
+    // M5-T10 probe gate (opt-in PS2X_ENABLE_M5T10=1): message-machinery
+    // watch — post/consume transitions of [0x647F6C], entries into the
+    // submit-pump/bomb/armer/drain, and the bomb's JALR into the record
+    // completion callbacks.
+    static const bool s_m5t10Gate = []()
+    {
+        const char *env = std::getenv("PS2X_ENABLE_M5T10");
+        return env != nullptr && env[0] == '1';
+    }();
     if (s_m5t8Gate)
     {
         static bool s_metaPrimed = false;
@@ -1630,6 +1656,160 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                      << std::dec << std::endl;
                 RUNTIME_LOG(line.str());
             }
+        }
+    }
+
+    // M5-T10 probe (runtime-only, opt-in PS2X_ENABLE_M5T10=1): the message
+    // machinery around the app record table ([0x647F70] -> base, 48-byte
+    // records; manager 0x647F48: +0x24 [0x647F6C] pending-record ptr,
+    // +0x10 [0x647F58] pending count, +0x30 [0x647F78] queue head).
+    // (a) Count/log branch entries into the four actors: submit-pump
+    //     0x33fe80 (a0 = record), completion bomb 0x340320 (a0 = ok flag),
+    //     deferred-I/O armer 0x344160 (a0 = fd|type<<24) and drain
+    //     0x3441c0 — the T7 playbook applied to the parked record.
+    // (b) Watch [0x647F6C] transitions: 0->X names the poster's submit
+    //     (with the record's key), X->0 names the completer (with the
+    //     result word it wrote).
+    // (c) The bomb fires the record's callback [rec+0x28] via JALR — the
+    //     indirect-call target names the consuming server live.
+    if (s_m5t10Gate && rdram != nullptr)
+    {
+        const volatile uint32_t *pendingPtr =
+            reinterpret_cast<const volatile uint32_t *>(rdram + 0x647F6Cu);
+        const uint32_t pending = *pendingPtr;
+        {
+            uint32_t hit = 0;
+            uint32_t *counter = nullptr;
+            uint32_t a0 = 0;
+            switch (targetPc)
+            {
+            case 0x33fe80u: counter = &g_m5t10SubmitEntries; a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)); break;
+            case 0x340320u: counter = &g_m5t10BombEntries; a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)); break;
+            case 0x344160u: counter = &g_m5t10ArmEntries; a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)); break;
+            case 0x3441c0u: counter = &g_m5t10DrainEntries; a0 = *reinterpret_cast<const volatile uint32_t *>(rdram + 0x6480B8u); break;
+            default: break;
+            }
+            if (counter == nullptr)
+            {
+                // M5-T10 iteration-2: the demand-side actors. The load
+                // barrier group-service 0x290af8 (a0 = group {+0x28 count,
+                // +0x10 queue slots}), the app transfer START 0x11e8c8 and
+                // chunk-advance 0x11e9b0 (a0 = state {+0x18 remaining,
+                // +0x24 state}), the MPEG ring-fill spin 0x3250d0.
+                uint32_t extra0 = 0, extra1 = 0;
+                switch (targetPc)
+                {
+                case 0x290af8u: counter = &g_m5t10BarrierEntries; a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)); break;
+                case 0x11e8c8u: counter = &g_m5t10XferStartEntries; a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)); break;
+                case 0x11e9b0u:
+                    counter = &g_m5t10XferAdvEntries;
+                    a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[16], 0)); // s0 = state
+                    break;
+                case 0x3250d0u: counter = &g_m5t10RingFillEntries; break;
+                default: break;
+                }
+                if (counter != nullptr && a0 >= 0x00100000u && a0 < 0x02000000u)
+                {
+                    extra0 = *reinterpret_cast<const volatile uint32_t *>(rdram + a0 + 0x18u);
+                    extra1 = *reinterpret_cast<const volatile uint32_t *>(rdram + a0 + 0x24u);
+                }
+                if (counter != nullptr)
+                {
+                    hit = ++(*counter);
+                    if (hit <= 24u || (hit % 4096u) == 0u)
+                    {
+                        std::ostringstream line;
+                        line << "[m5t10-demand] pc=0x" << std::hex << targetPc
+                             << " #" << std::dec << hit
+                             << " src=0x" << std::hex << sourcePc
+                             << " kind=" << describeGuestBranchKind(kind)
+                             << " a0=0x" << a0
+                             << " rem=0x" << extra0
+                             << " st=0x" << extra1
+                             << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                             << std::dec << std::endl;
+                        RUNTIME_LOG(line.str());
+                    }
+                    // The barrier group-service: sample the group's queue
+                    // words at a low rate to see EMPTY vs BACKED-UP.
+                    if (targetPc == 0x290af8u && (hit <= 8u || (hit % 4096u) == 0u) &&
+                        a0 >= 0x00100000u && a0 + 0x40u < 0x02000000u)
+                    {
+                        std::ostringstream gline;
+                        gline << "[m5t10-group] grp=0x" << std::hex << a0
+                              << " n=" << std::dec << *reinterpret_cast<const volatile uint32_t *>(rdram + a0 + 0x28u)
+                              << std::hex;
+                        for (uint32_t w = 0; w < 8u; ++w)
+                        {
+                            gline << " w" << w << "=0x" << *reinterpret_cast<const volatile uint32_t *>(rdram + a0 + 0x10u + w * 4u);
+                        }
+                        gline << std::dec << std::endl;
+                        RUNTIME_LOG(gline.str());
+                    }
+                }
+            }
+            else
+            {
+                hit = ++(*counter);
+                if (hit <= 24u || (hit % 4096u) == 0u)
+                {
+                    std::ostringstream line;
+                    line << "[m5t10-entry] pc=0x" << std::hex << targetPc
+                         << " #" << std::dec << hit
+                         << " src=0x" << std::hex << sourcePc
+                         << " kind=" << describeGuestBranchKind(kind)
+                         << " a0=0x" << a0
+                         << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                         << std::dec << std::endl;
+                    RUNTIME_LOG(line.str());
+                }
+            }
+        }
+        // (c) the bomb's JALR into [rec+0x28]: the per-record completer
+        {
+            static uint32_t s_cbEntries = 0;
+            if (kind == GuestBranchKind::IndirectCall && sourcePc >= 0x34038Cu && sourcePc <= 0x340390u)
+            {
+                const uint32_t hit = ++s_cbEntries;
+                if (hit <= 24u || (hit % 512u) == 0u)
+                {
+                    std::ostringstream line;
+                    line << "[m5t10-cb] #" << std::dec << hit
+                         << " target=0x" << std::hex << targetPc
+                         << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                         << std::dec << std::endl;
+                    RUNTIME_LOG(line.str());
+                }
+            }
+        }
+        // (b) pending-pointer transitions (post / consume)
+        if (pending != s_m5t10PrevPending)
+        {
+            if (s_m5t10PrevPending != 0u && pending == 0u)
+            {
+                const uint32_t rec = s_m5t10PrevPending;
+                if (rec >= 0x00100000u && rec < 0x02000000u)
+                {
+                    std::ostringstream line;
+                    line << "[m5t10-consume] rec=0x" << std::hex << rec
+                         << " key=0x" << *reinterpret_cast<const volatile uint32_t *>(rdram + rec)
+                         << " result=0x" << *reinterpret_cast<const volatile uint32_t *>(rdram + rec + 8u)
+                         << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                         << std::dec << std::endl;
+                    RUNTIME_LOG(line.str());
+                }
+            }
+            else if (pending != 0u && pending >= 0x00100000u && pending < 0x02000000u)
+            {
+                std::ostringstream line;
+                line << "[m5t10-post] rec=0x" << std::hex << pending
+                     << " key=0x" << *reinterpret_cast<const volatile uint32_t *>(rdram + pending)
+                     << " f4=0x" << *reinterpret_cast<const volatile uint32_t *>(rdram + pending + 4u)
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << std::dec << std::endl;
+                RUNTIME_LOG(line.str());
+            }
+            s_m5t10PrevPending = pending;
         }
     }
 
@@ -3460,6 +3640,80 @@ void PS2Runtime::run()
                         }
                         m5t9 << std::endl;
                         RUNTIME_LOG(m5t9.str());
+                    }
+                }
+
+                // M5-T10 probe (runtime-only, opt-in PS2X_ENABLE_M5T10=1):
+                // dump the app message-record table DIRECTLY (base pointer at
+                // [0x647F70], 48-byte records — the engine-state dump only
+                // names the record while waitHandle!=0; at the terminal state
+                // main parks in the load-barrier/ring-fill spins with
+                // waitHandle=0 and the parked record goes dark). Full dump
+                // every 1800 ticks (30 s wall) covers t=60/150/240; between
+                // dumps a delta watch logs any result word that CHANGES so
+                // transient completions are caught too.
+                {
+                    static const bool s_m5t10State = []()
+                    {
+                        const char *env = std::getenv("PS2X_ENABLE_M5T10");
+                        return env != nullptr && env[0] == '1';
+                    }();
+                    const uint32_t msgTablePtr = m_memory.read32(0x647F70u);
+                    if (s_m5t10State && msgTablePtr >= 0x00100000u && msgTablePtr < 0x02000000u)
+                    {
+                    constexpr uint32_t kM5t10Records = 24u;
+                    static uint32_t s_resPrev[kM5t10Records] = {};
+                    static bool s_resPrimed = false;
+                    if ((tick % 1800u) == 0u || !s_resPrimed)
+                    {
+                        const uint32_t pendRec = m_memory.read32(0x647F6Cu);
+                        RUNTIME_LOG("[m5t10-table] tick=" << std::dec << tick
+                                     << " pendRec=0x" << std::hex << pendRec
+                                     << " pendCnt=" << std::dec << m_memory.read32(0x647F58u)
+                                     << " budget=" << m_memory.read32(0x647F50u)
+                                     << " qHead=0x" << std::hex << m_memory.read32(0x647F78u)
+                                     << " seq=" << std::dec << m_memory.read32(0x5104F8u)
+                                     << " totals{sub=" << g_m5t10SubmitEntries
+                                     << ",bomb=" << g_m5t10BombEntries
+                                     << ",arm=" << g_m5t10ArmEntries
+                                     << ",drain=" << g_m5t10DrainEntries
+                                     << ",barrier=" << g_m5t10BarrierEntries
+                                     << ",xfer=" << g_m5t10XferStartEntries
+                                     << "/" << g_m5t10XferAdvEntries
+                                     << ",ring=" << g_m5t10RingFillEntries << "}");
+                        for (uint32_t i = 0; i < kM5t10Records; ++i)
+                        {
+                            const uint32_t rec = msgTablePtr + i * 48u;
+                            const uint32_t key = m_memory.read32(rec);
+                            if (key == 0u)
+                                continue;
+                            RUNTIME_LOG("[m5t10-msg] r" << std::dec << i
+                                         << std::hex
+                                         << " key=0x" << key
+                                         << " f4=0x" << m_memory.read32(rec + 4u)
+                                         << " res=0x" << m_memory.read32(rec + 8u)
+                                         << " arg14=0x" << m_memory.read32(rec + 0x14u)
+                                         << " off18=0x" << m_memory.read32(rec + 0x18u)
+                                         << " gate1c=0x" << m_memory.read32(rec + 0x1Cu)
+                                         << " buf20=0x" << m_memory.read32(rec + 0x20u)
+                                         << " desc24=0x" << m_memory.read32(rec + 0x24u)
+                                         << " cb28=0x" << m_memory.read32(rec + 0x28u)
+                                         << " nxt2c=0x" << m_memory.read32(rec + 0x2Cu)
+                                         << std::dec);
+                        }
+                    }
+                    for (uint32_t i = 0; i < kM5t10Records; ++i)
+                    {
+                        const uint32_t res = m_memory.read32(msgTablePtr + i * 48u + 8u);
+                        if (s_resPrimed && res != s_resPrev[i])
+                        {
+                            RUNTIME_LOG("[m5t10-res] r" << std::dec << i
+                                         << std::hex << " 0x" << s_resPrev[i]
+                                         << " -> 0x" << res << std::dec);
+                        }
+                        s_resPrev[i] = res;
+                    }
+                    s_resPrimed = true;
                     }
                 }
 
