@@ -492,6 +492,10 @@ namespace ps2_stubs
             uint32_t decodeMode = 0u;
             uint32_t imageBufferAddr = 0u;
             bool sawInput = false;
+            // Vanguard M5: set while the need-data callback (sceMpegAddCallback
+            // type 1) is queued/undelivered; sceMpegAddBs clears it on feed so
+            // each starve episode drives exactly one callback round.
+            bool needDataCallbackQueued = false;
             bool sawSequenceEnd = false;
             bool streamEnded = false;
             bool decoderFailed = false;
@@ -1899,6 +1903,10 @@ namespace ps2_stubs
                 feedElementaryStream(playback, src, chunk);
                 copied += chunk;
             }
+            if (copied != 0u)
+            {
+                playback.needDataCallbackQueued = false; // fed: arm the next starve episode
+            }
             wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
         }
 
@@ -2308,7 +2316,65 @@ namespace ps2_stubs
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
+                // Vanguard M5: the SDK's need-data callback (sceMpegAddCallback
+                // type 1, non-stream) is what makes the game feed new bitstream
+                // via sceMpegAddBs. The runtime stored the callback but only the
+                // DemuxPssRing stream-callback path ever fired it; a game that
+                // feeds via AddBs starved here forever (sawInput=0). Queue the
+                // registered need-data callback once per starve; sceMpegAddBs
+                // clears the flag when new data lands.
+                uint32_t needDataFunc = 0u;
+                uint32_t needDataArg = 0u;
+                if (!playback.needDataCallbackQueued)
+                {
+                    auto callbacksIt = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+                    if (callbacksIt != g_mpeg_stub_state.callbacksByMpeg.end())
+                    {
+                        for (const MpegRegisteredCallback &callback : callbacksIt->second)
+                        {
+                            if (callback.stream || callback.type != 1u || callback.func == 0u)
+                            {
+                                continue;
+                            }
+                            needDataFunc = callback.func;
+                            needDataArg = callback.data;
+                            playback.needDataCallbackQueued = true;
+                            break; // one driver per starve episode
+                        }
+                    }
+                }
                 lock.unlock();
+                if (needDataFunc != 0u)
+                {
+                    if (runtime->hasFunction(needDataFunc))
+                    {
+                        GuestInvocation invocation{};
+                        invocation.kind = GuestInvocationKind::RpcCallback;
+                        invocation.context.pc = needDataFunc;
+                        SET_GPR_U32(&invocation.context, 4, mpegAddr);
+                        SET_GPR_U32(&invocation.context, 5, 0u);
+                        SET_GPR_U32(&invocation.context, 6, needDataArg);
+                        // $gp travels with the stub's calling context so
+                        // callback code addressing globals through it reads the
+                        // game's data (same convention as the CD completion).
+                        SET_GPR_U32(&invocation.context, 28, ctx != nullptr ? getRegU32(ctx, 28) : 0u);
+                        SET_GPR_U32(&invocation.context, 29, 0u); // executor binds the invocation stack
+                        SET_GPR_U32(&invocation.context, 31, 0u); // return ends the invocation
+                        runtime->eeScheduler().queueInvocation(std::move(invocation));
+                    }
+                    else
+                    {
+                        playback.needDataCallbackQueued = false; // retry when mapped
+                        static uint32_t dropLogCount = 0u;
+                        if (dropLogCount < 8u)
+                        {
+                            std::cerr << "[MPEG] need-data callback 0x" << std::hex << needDataFunc
+                                      << " not a mapped function; starved GetPicture (mpeg=0x" << mpegAddr
+                                      << ")" << std::endl;
+                            ++dropLogCount;
+                        }
+                    }
+                }
                 runtime->eeScheduler().waitExternal(
                     EeWaitReason::Mpeg,
                     kMpegPictureWaitType,
