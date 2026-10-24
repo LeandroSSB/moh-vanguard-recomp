@@ -1523,7 +1523,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         targetPc == 0x48F338u || targetPc == 0x48F3E8u || targetPc == 0x48F600u ||
         targetPc == 0x48F640u || targetPc == 0x48F6A8u || targetPc == 0x48F708u ||
         targetPc == 0x48F760u || targetPc == 0x48FDA0u;
-    if (m5t7Movie)
+    // Opt-in (review fix): like every sibling bring-up probe, this one is
+    // default-off - it hardcodes Vanguard movie-region addresses and would
+    // otherwise log for any game whose code maps into 0x481000-0x483000.
+    static const bool m5t7ProbeEnabled = []()
+    {
+        const char *env = std::getenv("PS2X_ENABLE_M5T7");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (m5t7ProbeEnabled && m5t7Movie)
     {
         const uint32_t n = ++g_m5t7MovieDispatches;
         static uint32_t s_logged = 0;
