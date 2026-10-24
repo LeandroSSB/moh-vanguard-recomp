@@ -1517,6 +1517,102 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // has 0 static xrefs and 0 executions, yet GetPicture (entry [2] ->
     // sub_00481BC8 -> sub_00481B30) runs and starves. Log every guest branch
     // landing in the movie region to name the live dispatcher(s) and pin
+    // M5-T8 probe (runtime-only, opt-in PS2X_ENABLE_M5T8=1): clone of the
+    // t10 slot-watch pointed at the engine-init callback table 0x4F0470
+    // (11 entries {meta, fn}; AdvanceEngineStep step-5 skips meta!=0, the
+    // 0x27a268 loop runs them). The shape-A/B run bifurcation freezes the
+    // init at cbIdx=6 — this names the exact branch site that flips any
+    // meta word.
+    {
+        static bool s_metaPrimed = false;
+        static uint32_t s_metaPrev[12] = {};
+        static uint32_t s_metaLogged = 0;
+        if (rdram != nullptr && s_metaLogged < 64u)
+        {
+            uint32_t cur[12];
+            std::memcpy(cur, rdram + 0x4F0470u, sizeof(cur));
+            if (!s_metaPrimed)
+            {
+                std::memcpy(s_metaPrev, cur, sizeof(cur));
+                s_metaPrimed = true;
+            }
+            else if (std::memcmp(s_metaPrev, cur, sizeof(cur)) != 0)
+            {
+                ++s_metaLogged;
+                std::ostringstream line;
+                line << "[m5t8-meta] src=0x" << std::hex << sourcePc
+                     << " target=0x" << targetPc
+                     << " kind=" << describeGuestBranchKind(kind)
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                     << " metas:";
+                for (int i = 0; i < 12; ++i)
+                {
+                    line << " [" << std::dec << i << "]0x" << std::hex << cur[i];
+                }
+                line << std::endl;
+                RUNTIME_LOG(line.str());
+                std::memcpy(s_metaPrev, cur, sizeof(cur));
+            }
+        }
+    }
+
+    // M5-T8 probe: catch ANY branch whose target lands on the alternate
+    // engine-callback loop head 0x27a268 (no static xrefs — if it runs, the
+    // entry is a computed/indirect jump and this names it).
+    {
+        static uint32_t s_loopEntries = 0;
+        if (s_loopEntries < 16u && targetPc >= 0x27a268u && targetPc < 0x27a270u)
+        {
+            ++s_loopEntries;
+            std::ostringstream line;
+            line << "[m5t8-loopentry] #" << std::dec << s_loopEntries
+                 << " src=0x" << std::hex << sourcePc
+                 << " kind=" << describeGuestBranchKind(kind)
+                 << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                 << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                 << std::endl;
+            RUNTIME_LOG(line.str());
+        }
+    }
+
+    // M5-T8 probe: watch the sound-middleware recursive-mutex triple
+    // (sema id 0x64D610, owner 0x64D614, recursion 0x64D618) on every guest
+    // branch — the shape-B deadlock is main parked in WaitSema(lock) while
+    // the owner word says someone else; this names the branch that takes or
+    // releases the lock last.
+    {
+        static bool s_lockPrimed = false;
+        static uint32_t s_lockPrev[3] = {};
+        static uint32_t s_lockLogged = 0;
+        if (rdram != nullptr && s_lockLogged < 64u)
+        {
+            uint32_t cur[3];
+            std::memcpy(cur, rdram + 0x64D610u, sizeof(cur));
+            if (!s_lockPrimed)
+            {
+                std::memcpy(s_lockPrev, cur, sizeof(cur));
+                s_lockPrimed = true;
+            }
+            else if (std::memcmp(s_lockPrev, cur, sizeof(cur)) != 0)
+            {
+                ++s_lockLogged;
+                std::ostringstream line;
+                line << "[m5t8-lockw] src=0x" << std::hex << sourcePc
+                     << " target=0x" << targetPc
+                     << " kind=" << describeGuestBranchKind(kind)
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                     << " sema=0x" << cur[0]
+                     << " owner=0x" << cur[1]
+                     << " rec=0x" << cur[2]
+                     << std::endl;
+                RUNTIME_LOG(line.str());
+                std::memcpy(s_lockPrev, cur, sizeof(cur));
+            }
+        }
+    }
+
     // whether the init entry is ever requested.
     const bool m5t7Movie =
         (targetPc >= 0x481000u && targetPc < 0x483000u) ||
@@ -1535,7 +1631,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     {
         const uint32_t n = ++g_m5t7MovieDispatches;
         static uint32_t s_logged = 0;
-        if (s_logged < 200u)
+        if (s_logged < 4096u) // M5-T8: raise cap so POST-movie dispatches survive the playback-time volume
         {
             ++s_logged;
             std::ostringstream line;
@@ -3092,6 +3188,36 @@ void PS2Runtime::run()
                     }
                 }
             }
+            // M5-T8 probe (runtime-only, opt-in PS2X_ENABLE_M5T8=1): watch the
+            // engine-init step machine. AdvanceEngineStep (0x279f00) stores the
+            // next step at 0x630120 and the callback index at 0x630110; the
+            // wait loop 0x27a430 { TimerDispatch 0x12ccc0; 0x355948(sleep);
+            // 0x279f00 } runs until step==8. The engine init 0x27afa0 (boot
+            // chain 0x12d870) resets both to 0 and re-enters the wait loop, so
+            // a post-movie re-init stalls WHERE the step counter stops.
+            {
+                static const char *s_m5t8Env = std::getenv("PS2X_ENABLE_M5T8");
+                static const bool s_m5t8 = s_m5t8Env != nullptr && s_m5t8Env[0] == '1';
+                if (s_m5t8)
+                {
+                    static uint32_t s_prevStep = 0xFFFFFFFFu;
+                    static bool s_stepInit = false;
+                    const uint32_t step = m_memory.read32(0x630120u);
+                    const uint32_t cbIdx = m_memory.read32(0x630110u);
+                    if (!s_stepInit || step != s_prevStep)
+                    {
+                        RUNTIME_LOG("[m5t8-step] loopTick=" << std::dec << tick
+                                     << " step=" << step
+                                     << " cbIdx=" << cbIdx
+                                     << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                                     << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
+                                     << std::dec << std::endl);
+                        s_prevStep = step;
+                        s_stepInit = true;
+                    }
+                }
+            }
+
             if ((tick % 120) == 0)
             {
                 uint64_t curDma = m_memory.dmaStartCount();
@@ -3119,6 +3245,89 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+
+                // M5-T8 park probe (opt-in PS2X_ENABLE_M5T8=1): name WHERE the
+                // main thread sleeps. GameDelay (0x355860) saves its return
+                // address at 0x30(sp); the sampled ra 0x3558d4 is only the
+                // SleepThread veneer return INSIDE GameDelay, so the real
+                // caller is the saved word. Dump two extra frame words
+                // (0x70/0x100 above sp) plus the engine-step machine and the
+                // app message records (table [0x647F70] base 0x1E9DE00,
+                // 48-byte records: key +0, result +8).
+                {
+                    static const char *s_m5t8Env2 = std::getenv("PS2X_ENABLE_M5T8");
+                    static const bool s_m5t8Park = s_m5t8Env2 != nullptr && s_m5t8Env2[0] == '1';
+                    const bool s_m5t8MainPark = dbgSp >= 0x1ff0000u && dbgSp < 0x2000000u;
+                    const bool s_m5t8WorkerPark = dbgSp >= 0x1bd0000u && dbgSp < 0x1c20000u;
+                    if (s_m5t8Park && dbgPc == 0x49b488u && dbgRa == 0x3558d4u && (s_m5t8MainPark || s_m5t8WorkerPark))
+                    {
+                        std::ostringstream parkLine;
+                        parkLine << "[m5t8-park] tick=" << std::dec << tick
+                                 << " caller=0x" << std::hex << m_memory.read32(dbgSp + 0x30)
+                                 << " up70=0x" << m_memory.read32(dbgSp + 0x70)
+                                 << " up78=0x" << m_memory.read32(dbgSp + 0x78)
+                                 << " upA0=0x" << m_memory.read32(dbgSp + 0xA0)
+                                 << " up100=0x" << m_memory.read32(dbgSp + 0x100)
+                                 << " step=" << std::dec << m_memory.read32(0x630120u)
+                                 << " cbIdx=" << m_memory.read32(0x630110u);
+                        parkLine << " cbMetas=";
+                        for (uint32_t i = 0; i < 11u; ++i)
+                        {
+                            parkLine << m_memory.read32(0x4F0470u + i * 8u) << ",";
+                        }
+                        const uint32_t msgTable = m_memory.read32(0x647F70u);
+                        parkLine << " msgTable=0x" << std::hex << msgTable;
+                        if (msgTable >= 0x00100000u && msgTable < 0x02000000u)
+                        {
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                const uint32_t rec = msgTable + i * 48u;
+                                parkLine << " r" << std::dec << i << "{k=0x" << std::hex << m_memory.read32(rec)
+                                         << ",res=" << std::dec << m_memory.read32(rec + 8u) << "}";
+                            }
+                        }
+                        parkLine << std::endl;
+                        RUNTIME_LOG(parkLine.str());
+                    }
+                }
+
+                // M5-T8b: the WaitSema flavor of the park. Main (stack region
+                // 0x1ff00000+) blocked in the middleware recursive mutex
+                // (0x36dcb8: WaitSema(*(0x64BB00+0x1b10)), owner +0x1b14,
+                // recursion +0x1b18). Dump the lock state, the sema waiter
+                // counts and a ra-chain guess up main's frames.
+                {
+                    static const char *s_m5t8Env3 = std::getenv("PS2X_ENABLE_M5T8");
+                    static const bool s_m5t8Lock = s_m5t8Env3 != nullptr && s_m5t8Env3[0] == '1';
+                    if (s_m5t8Lock)
+                    {
+                        const uint32_t lockSema = m_memory.read32(0x64D610u);
+                        const uint32_t lockOwner = m_memory.read32(0x64D614u);
+                        const uint32_t lockRec = m_memory.read32(0x64D618u);
+                        std::ostringstream lockLine;
+                        lockLine << "[m5t8-lock] tick=" << std::dec << tick
+                                 << " caller=0x" << std::hex << m_memory.read32(dbgSp)
+                                 << " chain=";
+                        for (uint32_t off = 0x30u; off <= 0x120u; off += 0x10u)
+                        {
+                            lockLine << "0x" << m_memory.read32(dbgSp + off) << " ";
+                        }
+                        lockLine << std::dec << " lockSema=" << lockSema
+                                 << " owner=" << lockOwner
+                                 << " rec=" << lockRec;
+                        auto semInfo = [&](int id)
+                        {
+                            const EeSemaphore *sem = m_eeScheduler->semaphore(id);
+                            return sem ? (std::to_string(sem->count) + "/" + std::to_string(sem->waiters.size())) : std::string("?");
+                        };
+                        lockLine << " sem" << lockSema << "{cnt/wt}=" << semInfo(static_cast<int>(lockSema))
+                                 << " q60=" << m_memory.read32(0x642DCCu)
+                                 << " q65=" << m_memory.read32(0x64D5A4u)
+                                 << " q66=" << m_memory.read32(0x5B27ECu)
+                                 << std::endl;
+                        RUNTIME_LOG(lockLine.str());
+                    }
+                }
 
                 // M5-T1 probe: the boot thread parked inside the statically
                 // linked IOP-glue busy-wait at 0x49f900 (poll loop of the
@@ -3436,6 +3645,7 @@ void PS2Runtime::run()
                             RUNTIME_LOG("[thread-state] id=" << std::dec << t.id
                                                              << " entry=0x" << std::hex << t.entry
                                                              << " pc=0x" << t.pc
+                                                             << " ra=0x" << t.ra
                                                              << " sp=0x" << t.sp
                                                              << " prio=" << std::dec << t.currentPriority
                                                              << " status=" << static_cast<int>(t.status)
@@ -3445,6 +3655,7 @@ void PS2Runtime::run()
                                                              << " waitType=0x" << t.waitType
                                                              << " waitToken=0x" << t.waitToken
                                                              << " vsyncAfterTick=0x" << t.waitAfterTick
+                                                             << " wakeups=" << t.wakeupCount
                                                              << std::dec);
                         }
                         // M3-T5b: when the main thread's saved pc sits in the
