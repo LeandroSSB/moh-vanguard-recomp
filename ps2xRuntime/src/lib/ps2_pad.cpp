@@ -1,6 +1,10 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_input_script.h"
 #include "ps2_host_backend.h"
+#include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <vector>
 
 namespace
 {
@@ -29,6 +33,36 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 {
     if (!data || size < 32)
         return false;
+
+    // Vanguard M5: opt-in scripted input (PS2X_INPUT_SCRIPT=<path>). When
+    // set, the pad report comes from the script timeline (elapsed ms since
+    // the first read) and physical input is ignored, so bring-up
+    // verification is deterministic and needs no human hands.
+    static const bool useInputScript = []()
+    {
+        const char *env = std::getenv("PS2X_INPUT_SCRIPT");
+        return env != nullptr && env[0] != '\0';
+    }();
+    static const std::vector<ps2x::PadScriptEvent> inputScript = []()
+    {
+        std::vector<ps2x::PadScriptEvent> events;
+        if (useInputScript)
+        {
+            const char *env = std::getenv("PS2X_INPUT_SCRIPT");
+            ps2x::LoadPadScript(env, events);
+        }
+        return events;
+    }();
+    static const std::chrono::steady_clock::time_point inputScriptStart =
+        std::chrono::steady_clock::now();
+    if (useInputScript && !inputScript.empty())
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - inputScriptStart)
+                                 .count();
+        ps2x::ApplyPadScript(inputScript, static_cast<uint32_t>(elapsed), data);
+        return true;
+    }
 
     std::memset(data, 0, 32);
     data[0] = 0x01;
