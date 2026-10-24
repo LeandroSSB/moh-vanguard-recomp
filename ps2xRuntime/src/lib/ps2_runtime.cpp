@@ -1380,6 +1380,9 @@ namespace
     std::atomic<uint32_t> g_m5t3TimerDispatchCalls{0};
     std::atomic<uint32_t> g_m5t3AddTimerCalls{0};
     std::atomic<uint32_t> g_m5t3RemoveTimerCalls{0};
+
+    // M5-T7 probe: guest branches landing in the RCMP movie region.
+    std::atomic<uint32_t> g_m5t7MovieDispatches{0};
 }
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1506,6 +1509,41 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     else if (targetPc == 0x3567B8u)
     {
         ++g_m5t3RemoveTimerCalls;
+    }
+
+    // M5-T7 probe: RCMP movie region dispatch. The player-init sub_004817B0
+    // (RCMP dispatch table entry [1] @0x5af6e4; registers the need-data
+    // callback cbFunc 0x481660 via the sceMpegAddCallback override 0x48F760)
+    // has 0 static xrefs and 0 executions, yet GetPicture (entry [2] ->
+    // sub_00481BC8 -> sub_00481B30) runs and starves. Log every guest branch
+    // landing in the movie region to name the live dispatcher(s) and pin
+    // whether the init entry is ever requested.
+    const bool m5t7Movie =
+        (targetPc >= 0x481000u && targetPc < 0x483000u) ||
+        targetPc == 0x48F338u || targetPc == 0x48F3E8u || targetPc == 0x48F600u ||
+        targetPc == 0x48F640u || targetPc == 0x48F6A8u || targetPc == 0x48F708u ||
+        targetPc == 0x48F760u || targetPc == 0x48FDA0u;
+    if (m5t7Movie)
+    {
+        const uint32_t n = ++g_m5t7MovieDispatches;
+        static uint32_t s_logged = 0;
+        if (s_logged < 200u)
+        {
+            ++s_logged;
+            std::ostringstream line;
+            line << "[m5t7-branch] #" << std::dec << n
+                 << " src=0x" << std::hex << sourcePc
+                 << " target=0x" << targetPc
+                 << " kind=" << describeGuestBranchKind(kind)
+                 << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                 << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                 << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0))
+                 << " a1=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0))
+                 << " a2=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0))
+                 << " a3=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[7], 0))
+                 << std::endl;
+            RUNTIME_LOG(line.str());
+        }
     }
 
     // M3-T10 probe: the SDK dispatcher handler slots (.data 0x5109F0..0x510A10)
