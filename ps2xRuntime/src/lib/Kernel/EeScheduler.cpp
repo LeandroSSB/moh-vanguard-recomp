@@ -305,7 +305,7 @@ void EeScheduler::run()
                 renewTimeSlice();
                 if (getRegU32(&invocation.context, 29) == 0u)
                 {
-                    SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+                    SET_GPR_U32(&invocation.context, 29, invocationEntrySp(*owner));
                 }
                 owner->invocations.push_back(std::move(invocation));
             }
@@ -409,7 +409,7 @@ void EeScheduler::run()
             m_pendingInvocations.pop_front();
             if (getRegU32(&invocation.context, 29) == 0u)
             {
-                SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+                SET_GPR_U32(&invocation.context, 29, invocationEntrySp(*running));
             }
             running->invocations.push_back(std::move(invocation));
             continue;
@@ -1384,7 +1384,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assert(owner != nullptr);
     if (getRegU32(&invocation.context, 29) == 0u)
     {
-        SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+        SET_GPR_U32(&invocation.context, 29, invocationEntrySp(*owner));
     }
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
@@ -1402,7 +1402,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     {
         if (getRegU32(&it->context, 29) == 0u)
         {
-            SET_GPR_U32(&it->context, 29, invocationStackTop());
+            SET_GPR_U32(&it->context, 29, invocationEntrySp(*owner));
         }
         it->sequence = ++m_invocationSequence;
         owner->invocations.push_back(std::move(*it));
@@ -1423,6 +1423,52 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
                        {
                            return invocation.kind == kind && invocation.tag == tag;
                        });
+}
+
+// M5-T11 fix: see the declaration in ee_scheduler.h. The owner's own
+// suspended $sp is the base every interrupt callback would use on real
+// hardware; the reserved-block path survives only for threads that have
+// no guest stack at all (the internal dispatcher threads).
+uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner)
+{
+    assertExecutor();
+    // The ACTIVE context: the thread's own suspended $sp, or, while an
+    // invocation chain is parked/aborted mid-frame, the innermost frame's
+    // $sp - a nested callback must push below it, exactly like a second
+    // interrupt taken inside a handler on real hardware.
+    const uint32_t ownSp = getRegU32(&owner.activeContext(), 29);
+    if (ownSp != 0u)
+    {
+        uint32_t floor = 0x00100000u;
+        if (owner.stack != 0u && owner.stackSize != 0u)
+        {
+            floor = owner.stack; // CreateThread stack base (low address)
+        }
+        else
+        {
+            // main thread: kernel-default 32 KiB stack anchored at the top of RAM
+            floor = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
+        }
+        if (ownSp > floor && (ownSp - floor) >= 0x1000u)
+        {
+            return ownSp;
+        }
+    }
+    // Stackless owner (internal dispatcher thread): the callback still
+    // interrupted a real guest context on hardware. Run it below the MAIN
+    // thread's suspended $sp so no host block is ever carved out of the
+    // band the game's malloc arena lives in. The reserved block survives
+    // only as a degenerate last resort.
+    if (const GuestThread *mainThread = thread(kMainThreadId))
+    {
+        const uint32_t mainSp = getRegU32(&mainThread->activeContext(), 29);
+        const uint32_t mainFloor = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
+        if (mainSp != 0u && mainSp > mainFloor && (mainSp - mainFloor) >= 0x1000u)
+        {
+            return mainSp;
+        }
+    }
+    return invocationStackTop();
 }
 
 uint32_t EeScheduler::invocationStackTop()

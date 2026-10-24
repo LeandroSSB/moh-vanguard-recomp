@@ -87,7 +87,8 @@ namespace ps2_syscalls
                 invocation.context = *ctx;
                 invocation.context.pc = handler.function;
                 SET_GPR_U32(&invocation.context, 4, handler.argument);
-                SET_GPR_U32(&invocation.context, 29, ee.invocationStackTop());
+                // M5-T11: let invokeCurrentSequence bind the stack (owner-aware).
+                SET_GPR_U32(&invocation.context, 29, 0u);
                 SET_GPR_U32(&invocation.context, 31, 0u);
                 invocations.push_back(std::move(invocation));
             }

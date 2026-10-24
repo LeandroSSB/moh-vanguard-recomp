@@ -344,6 +344,15 @@ public:
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
+    // M5-T11 fix: hardware runs interrupt/SIF/RPC callbacks on the interrupted
+    // thread's OWN stack (frames below its live $sp). The T7 host-reserved
+    // blocks carved out of the top-of-RAM band march DOWN as new
+    // (thread, depth) keys appear - and Vanguard's malloc arena reaches that
+    // band, so callback frames poisoned live game data (the deterministic
+    // tid=1 pc=0x100 invalid-jump death). Bind guest-backed invocations to
+    // the owner's suspended $sp; only threads without a guest stack (the
+    // internal dispatcher threads) still use a reserved block.
+    [[nodiscard]] uint32_t invocationEntrySp(const GuestThread &owner);
     [[nodiscard]] uint32_t invocationStackTop();
 
     int addIrqHandler(bool dmac,

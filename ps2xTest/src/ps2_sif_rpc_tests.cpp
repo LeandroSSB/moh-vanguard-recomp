@@ -196,6 +196,17 @@ namespace
         runtime->eeScheduler().signalSemaphore(g_m5t2SemaphoreId, true);
     }
 
+    // M5-T11: sp-probe handler - records the invocation's bound $sp at entry.
+    uint32_t g_m5t11HandlerSp = 0;
+
+    void m5t11SpProbeHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_m5t11HandlerSp = ::getRegU32(ctx, 29); // before the handler pushes anything
+        ++g_m5t2HandlerRuns;
+        ctx->pc = 0u;
+        runtime->eeScheduler().signalSemaphore(g_m5t2SemaphoreId, true);
+    }
+
     // Runs the scheduler on a worker thread with a hard watchdog so a missing
     // completion fails the test instead of hanging the suite.
     bool m5t2RunSchedulerWithWatchdog(TestEnv &env)
@@ -797,6 +808,50 @@ void register_ps2_sif_rpc_tests()
             t.Equals(g_m5t2HandlerArg, kHandlerArg, "the completion handler should receive its registered argument");
             t.Equals(g_m5t2ReplyHandle, kRequestHandle, "the reply must carry the request handle at +0xC");
             t.Equals(g_m5t2ReplyStatus, 2u, "the reply status at +0x10 must be 2 (complete the bucket record)");
+        });
+
+        // M5-T11: hardware runs interrupt/SIF/RPC callbacks on the interrupted
+        // thread's OWN stack, pushing below its live $sp. The T7 host-reserved
+        // blocks marched DOWN from 0x1FF8000 into Vanguard's malloc arena (its
+        // heap reaches that band) and the callback frames poisoned live game
+        // data - the deterministic tid=1 pc=0x100 invalid-jump death. The
+        // invocation binding must use the owner's suspended $sp.
+        tc.Run("guest invocations run on the owning thread's own stack", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kMainSp = 0x01FFF000u; // a live main-thread sp (top-of-RAM 32 KiB stack)
+
+            env.runtime.registerFunction(K_M5T2_WAIT_PC, m5t2WaitMain);
+            env.runtime.registerFunction(K_M5T2_HANDLER_PC, m5t11SpProbeHandler);
+            setRegU32(env.ctx, 4, 1u);
+            setRegU32(env.ctx, 5, K_M5T2_HANDLER_PC);
+            setRegU32(env.ctx, 6, 0u);
+            ps2_stubs::sceSifAddCmdHandler(env.rdram.data(), &env.ctx, &env.runtime);
+
+            g_m5t2SemaphoreId = 0;
+            g_m5t2HandlerRuns = 0u;
+            g_m5t11HandlerSp = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T2_WAIT_PC;
+            setRegU32(mainContext, 29, kMainSp); // main suspended mid-pump at this sp
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            // Post a cid-0 request: the synthesized cid-1 completion arrives as
+            // an invocation owned by the main thread.
+            constexpr uint32_t kPktAddr = 0x656660u;
+            writeGuestU32(env.rdram.data(), kPktAddr + 0x14u, 0x00000001u);
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, kPktAddr);
+            setRegU32(env.ctx, 6, 0x30u);
+            setRegU32(env.ctx, 7, 0u);
+            sceSifSendCmd(env.rdram.data(), &env.ctx, &env.runtime);
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "the scheduler must deliver the completion invocation");
+            t.Equals(g_m5t2HandlerRuns, 1u, "the cid-1 handler should run exactly once");
+            t.Equals(g_m5t11HandlerSp, kMainSp,
+                     "the invocation must be bound to the owner's suspended sp (the T7 block "
+                     "stacks march down through the game's malloc arena)");
         });
 
         // The reply direction (cid=1) is the game's own completion traffic:

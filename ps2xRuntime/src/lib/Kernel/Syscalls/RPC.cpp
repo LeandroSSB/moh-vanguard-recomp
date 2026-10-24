@@ -714,7 +714,8 @@ namespace ps2_syscalls
             callback.context = parent;
             callback.context.pc = callbackFunction;
             SET_GPR_U32(&callback.context, 4, endParameter);
-            SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+            // M5-T11: let invokeCurrent bind the stack (owner-aware, T7 blocks no longer march through the game heap).
+            SET_GPR_U32(&callback.context, 29, 0u);
             SET_GPR_U32(&callback.context, 31, 0u);
             callback.onComplete = [completeClient](const R5900Context &, R5900Context &base)
             {
@@ -733,7 +734,8 @@ namespace ps2_syscalls
             SET_GPR_U32(&invocation.context, 5, guestA1);
             SET_GPR_U32(&invocation.context, 6, guestA2);
             SET_GPR_U32(&invocation.context, 7, guestA3);
-            SET_GPR_U32(&invocation.context, 29, runtime->eeScheduler().invocationStackTop());
+            // M5-T11: let invokeCurrent bind the stack (owner-aware, T7 blocks no longer march through the game heap).
+            SET_GPR_U32(&invocation.context, 29, 0u);
             SET_GPR_U32(&invocation.context, 31, 0u);
             invocation.onComplete = [finishCall](const R5900Context &completed, R5900Context &parent)
             {
