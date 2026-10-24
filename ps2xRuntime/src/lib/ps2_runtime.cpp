@@ -1383,6 +1383,17 @@ namespace
 
     // M5-T7 probe: guest branches landing in the RCMP movie region.
     std::atomic<uint32_t> g_m5t7MovieDispatches{0};
+
+    // M5-T9 probe: entries into the JOBS chain functions (armer 0x33e398,
+    // stage machine 0x33e108, pump 0x33e9f0, CD completion handler
+    // 0x33de28, the worker's sector-read service 0x4ad0f8). Plain
+    // non-atomic counters: dispatchGuestBranch runs on the single EE
+    // executor thread, same as the g_m5t3 counters' increments.
+    uint32_t g_m5t9ArmerEntries = 0;
+    uint32_t g_m5t9StageEntries = 0;
+    uint32_t g_m5t9PumpEntries = 0;
+    uint32_t g_m5t9CdHandlerEntries = 0;
+    uint32_t g_m5t9CdReadEntries = 0;
 }
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1579,6 +1590,46 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                  << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
                  << std::endl;
             RUNTIME_LOG(line.str());
+        }
+    }
+
+    // M5-T9 probe (runtime-only, opt-in PS2X_ENABLE_M5T9=1): the JOBS chain
+    // lives-or-dies at four entry points. The timer wheel must keep FIRING
+    // the armer 0x33e398 (slot 0); the armer must pass the (gate&6)==6 check
+    // to call the stage machine 0x33e108; the pump 0x33e9f0 must enqueue
+    // (gate 0xA + SignalSema 60); the CD completion handler 0x33de28 must
+    // signal per read. Watching the branch entries separates "the runtime
+    // wheel stopped firing" (armer entries freeze) from "the game stopped
+    // creating work" (armer fires but gate stays 0). First 24 entries each,
+    // then a periodic count every 4096th.
+    if (s_m5t8Gate)
+    {
+        uint32_t hit = 0;
+        uint32_t *counter = nullptr;
+        switch (targetPc)
+        {
+        case 0x33e398u: counter = &g_m5t9ArmerEntries; break;
+        case 0x33e108u: counter = &g_m5t9StageEntries; break;
+        case 0x33e9f0u: counter = &g_m5t9PumpEntries; break;
+        case 0x33de28u: counter = &g_m5t9CdHandlerEntries; break;
+        case 0x4ad0f8u: counter = &g_m5t9CdReadEntries; break;
+        default: break;
+        }
+        if (counter != nullptr)
+        {
+            hit = ++(*counter);
+            if (hit <= 24u || (hit % 4096u) == 0u)
+            {
+                std::ostringstream line;
+                line << "[m5t9-entry] pc=0x" << std::hex << targetPc
+                     << " #" << std::dec << hit
+                     << " src=0x" << std::hex << sourcePc
+                     << " kind=" << describeGuestBranchKind(kind)
+                     << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     << " gate=0x" << (rdram != nullptr ? *reinterpret_cast<const volatile uint32_t *>(rdram + 0x642DC0u) : 0u)
+                     << std::dec << std::endl;
+                RUNTIME_LOG(line.str());
+            }
         }
     }
 
@@ -3362,6 +3413,53 @@ void PS2Runtime::run()
                                  << " q66=" << m_memory.read32(0x5B27ECu)
                                  << std::endl;
                         RUNTIME_LOG(lockLine.str());
+                    }
+                }
+
+                // M5-T9 probe (runtime-only, opt-in PS2X_ENABLE_M5T9=1): the
+                // JOBS-desync triad at a glance — the semaphore-60 object
+                // itself (count/max/waiters), the queue counter 0x642DD0, the
+                // gate 0x642DC0, the worker thread (entry 0x33df70) state and
+                // the registered CD completion handler (the known sema-60
+                // signaler). Freezes the T9 verdict: signals arriving into a
+                // parked waiter = lost wake (runtime); no signals at all =
+                // producer protocol (game-side path dead).
+                {
+                    static const bool s_m5t9State = []()
+                    {
+                        const char *env = std::getenv("PS2X_ENABLE_M5T9");
+                        return env != nullptr && env[0] == '1';
+                    }();
+                    if (s_m5t9State)
+                    {
+                        const EeSemaphore *s60 = m_eeScheduler->semaphore(60);
+                        std::ostringstream m5t9;
+                        m5t9 << "[m5t9-state] tick=" << std::dec << tick
+                             << " sem60{cnt=" << (s60 ? s60->count : -1)
+                             << ",max=" << (s60 ? s60->maxCount : -1)
+                             << ",wt=" << (s60 ? s60->waiters.size() : 0u) << "}"
+                             << " qCnt=" << m_memory.read32(0x642DD0u)
+                             << " gate=0x" << std::hex << m_memory.read32(0x642DC0u)
+                             << " cdCb=0x" << ps2_stubs::cdEventCallbackAddress()
+                             << std::dec
+                             << " entries{armer=" << g_m5t9ArmerEntries
+                             << ",stage=" << g_m5t9StageEntries
+                             << ",pump=" << g_m5t9PumpEntries
+                             << ",cdcb=" << g_m5t9CdHandlerEntries
+                             << ",cdread=" << g_m5t9CdReadEntries << "}";
+                        for (const auto &t : eeSnapshot.threads)
+                        {
+                            if (t.entry == 0x33df70u)
+                            {
+                                m5t9 << std::dec << " worker{id=" << t.id
+                                     << " pc=0x" << std::hex << t.pc
+                                     << " st=" << std::dec << static_cast<int>(t.status)
+                                     << " wait=" << static_cast<int>(t.waitReason)
+                                     << " waitId=" << t.waitId << "}";
+                            }
+                        }
+                        m5t9 << std::endl;
+                        RUNTIME_LOG(m5t9.str());
                     }
                 }
 

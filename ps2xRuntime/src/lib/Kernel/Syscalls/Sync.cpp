@@ -2,6 +2,10 @@
 #include "Sync.h"
 #include "runtime/ee_scheduler.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
+
 namespace ps2_syscalls
 {
     namespace
@@ -11,6 +15,51 @@ namespace ps2_syscalls
         constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
         constexpr uint32_t WEF_MODE_MASK = WEF_OR | WEF_CLEAR | WEF_CLEAR_ALL;
         constexpr uint32_t EA_MULTI = 0x02u;
+
+        // M5-T9 probe (runtime-only, opt-in PS2X_ENABLE_M5T9=1): semaphore-60
+        // is the Vanguard JOBS-queue semaphore. T9 measured the paradox
+        // qCnt(0x642DD0)=2 with the worker parked in WaitSema(60) forever —
+        // either the signals never arrive or the wake is lost. This watch
+        // logs every Signal/Wait/Poll against id 60 with the object state
+        // around the call and the caller's ra, so the enqueue protocol
+        // becomes measurable instead of inferred.
+        bool m5t9Enabled()
+        {
+            static const bool enabled = []()
+            {
+                const char *env = std::getenv("PS2X_ENABLE_M5T9");
+                return env != nullptr && env[0] == '1';
+            }();
+            return enabled;
+        }
+
+        const EeSemaphore *m5t9Sema(EeScheduler &ee, int id)
+        {
+            return id == 60 ? ee.semaphore(id) : nullptr;
+        }
+
+        void m5t9LogOp(const char *op, EeScheduler &ee, int id, uint32_t ra, int result, bool pre)
+        {
+            const EeSemaphore *object = m5t9Sema(ee, id);
+            if (object == nullptr)
+            {
+                return;
+            }
+            static std::atomic<uint32_t> ops{0u};
+            const uint32_t n = ops.fetch_add(1u) + 1u;
+            if (n > 96u && (n % 256u) != 0u)
+            {
+                return; // keep the first windows plus a periodic sample
+            }
+            std::cout << "[m5t9-sema] " << op << (pre ? "-pre " : "-post ")
+                      << "#" << n
+                      << " cnt=" << object->count
+                      << " max=" << object->maxCount
+                      << " wt=" << object->waiters.size()
+                      << " result=" << result
+                      << " ra=0x" << std::hex << ra << std::dec
+                      << std::endl;
+        }
 
         EeScheduler &scheduler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
@@ -36,7 +85,16 @@ namespace ps2_syscalls
                                  bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const int result = ee.signalSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            const int semaId = static_cast<int>(getRegU32(ctx, 4));
+            if (m5t9Enabled())
+            {
+                m5t9LogOp("signal", ee, semaId, getRegU32(ctx, 31), 0, true);
+            }
+            const int result = ee.signalSemaphore(semaId, interruptSafe);
+            if (m5t9Enabled())
+            {
+                m5t9LogOp("signal", ee, semaId, getRegU32(ctx, 31), result, false);
+            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -108,13 +166,25 @@ namespace ps2_syscalls
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(getRegU32(ctx, 4)));
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        const int semaId = static_cast<int>(getRegU32(ctx, 4));
+        if (m5t9Enabled())
+        {
+            m5t9LogOp("wait", ee, semaId, getRegU32(ctx, 31), 0, true);
+        }
+        ee.waitSemaphore(semaId);
     }
 
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx,
-                     scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(getRegU32(ctx, 4))));
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        const int semaId = static_cast<int>(getRegU32(ctx, 4));
+        const int result = ee.pollSemaphore(semaId);
+        if (m5t9Enabled())
+        {
+            m5t9LogOp("poll", ee, semaId, getRegU32(ctx, 31), result, false);
+        }
+        setReturnS32(ctx, result);
     }
 
     void iPollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
