@@ -1031,7 +1031,7 @@ namespace ps2_syscalls
         }
 
         static int logCount = 0;
-        if (logCount < 5)
+        if (logCount < 400)
         {
             RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
                                                  << " packet=0x" << packetAddr

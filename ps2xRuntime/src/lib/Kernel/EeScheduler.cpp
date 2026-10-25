@@ -2725,6 +2725,20 @@ void EeScheduler::processEvent(const EeEvent &event)
                 {
                     SET_GPR_U32(&invocation.context, 29, carveInvocationSp());
                 }
+                {
+                    // M5-T16 diagnostic: the reply promotion beat - which
+                    // vsync delivered which reply packet.
+                    static uint32_t s_promoteLogs = 0;
+                    if (s_promoteLogs < 400u)
+                    {
+                        ++s_promoteLogs;
+                        std::ostringstream line;
+                        line << "[m5t16-promote] vsync=" << std::dec << m_vsyncTick
+                             << " pkt=0x" << std::hex << getRegU32(&invocation.context, 4)
+                             << std::dec << std::endl;
+                        RUNTIME_LOG(line.str());
+                    }
+                }
                 queueInvocation(std::move(invocation));
             }
         }

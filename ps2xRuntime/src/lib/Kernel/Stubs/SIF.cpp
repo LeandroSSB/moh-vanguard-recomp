@@ -313,6 +313,17 @@ namespace ps2_stubs
             // turnaround orders the filename-builder fill BEFORE the wake.
             if (deferVsyncs != 0u)
             {
+                static uint32_t s_deferLogs = 0;
+                if (s_deferLogs < 400u)
+                {
+                    ++s_deferLogs;
+                    std::ostringstream line;
+                    line << "[m5t16-defer] cid=0x" << std::hex << commandId
+                         << " vsyncs=" << std::dec << deferVsyncs
+                         << " pkt=0x" << std::hex << packetAddress
+                         << std::dec << std::endl;
+                    RUNTIME_LOG(line.str());
+                }
                 runtime->eeScheduler().queueDeferredInvocation(std::move(invocation), deferVsyncs);
             }
             else
