@@ -258,7 +258,8 @@ namespace ps2_stubs
                             PS2Runtime *runtime,
                             uint32_t commandId,
                             const void *packet,
-                            size_t packetSize) noexcept
+                            size_t packetSize,
+                            uint64_t deferVsyncs) noexcept
     {
         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
             return false;
@@ -307,7 +308,17 @@ namespace ps2_stubs
             {
                 runtime->guestFree(packetAddress);
             };
-            runtime->eeScheduler().queueInvocation(std::move(invocation));
+            // M5-T16: the synthesized loader-completion replies ride the
+            // vsync tick (never inline at post time) - hardware's IOP
+            // turnaround orders the filename-builder fill BEFORE the wake.
+            if (deferVsyncs != 0u)
+            {
+                runtime->eeScheduler().queueDeferredInvocation(std::move(invocation), deferVsyncs);
+            }
+            else
+            {
+                runtime->eeScheduler().queueInvocation(std::move(invocation));
+            }
             return true;
         }
         catch (...)

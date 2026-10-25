@@ -1068,7 +1068,9 @@ namespace ps2_syscalls
                 reply[0x0Eu] = static_cast<uint8_t>((requestHandle >> 16) & 0xFFu);
                 reply[0x0Fu] = static_cast<uint8_t>((requestHandle >> 24) & 0xFFu);
                 reply[0x10u] = 2u;
-                ps2_stubs::dispatchSifCommand(rdram, runtime, 1u, reply.data(), reply.size());
+                // M5-T16: one full vsync of IOP-turnaround shaping - the reply
+                // may not wake the loader inside the builder's fill window.
+                ps2_stubs::dispatchSifCommand(rdram, runtime, 1u, reply.data(), reply.size(), 1u);
             }
         }
 

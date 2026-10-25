@@ -256,6 +256,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
         m_events.clear();
         m_deadlines.clear();
         m_pendingInvocations.clear();
+        m_deferredInvocations.clear();
     }
     m_eventSequence = 0;
     m_invocationSequence = 0;
@@ -1441,6 +1442,22 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     invocation.sequence = ++m_invocationSequence;
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
+}
+
+// M5-T16: the async-invocation hold-for-vsync queue. The executor posts
+// here from the SIF-cmd synthesis (sceSifSendCmd); processEvent drains it
+// on VBlankStart, so a deferred reply can never beat the next vsync
+// boundary - the builder's fill window always closes first.
+void EeScheduler::queueDeferredInvocation(GuestInvocation invocation, uint64_t vsyncsToWait)
+{
+    assertExecutor();
+    if (vsyncsToWait == 0u)
+    {
+        vsyncsToWait = 1u;
+    }
+    std::lock_guard lock(m_eventMutex);
+    m_deferredInvocations.push_back(
+        DeferredInvocation{std::move(invocation), m_vsyncTick + vsyncsToWait});
 }
 
 [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
@@ -2639,6 +2656,42 @@ void EeScheduler::processEvent(const EeEvent &event)
         else
         {
             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
+        }
+        // M5-T16: promote the async invocations held for this boundary
+        // (the synthesized SIF-cmd completions). Delivery now rides the
+        // vsync tick - hardware's IOP turnaround guarantees the loader's
+        // filename-builder fill completes before the completion wakes
+        // main; the inline delivery was the movie-end ordering divergence.
+        {
+            std::deque<GuestInvocation> due;
+            {
+                std::lock_guard lock(m_eventMutex);
+                while (!m_deferredInvocations.empty() &&
+                       m_deferredInvocations.front().readyVsync <= m_vsyncTick)
+                {
+                    due.push_back(std::move(m_deferredInvocations.front().invocation));
+                    m_deferredInvocations.pop_front();
+                }
+            }
+            while (!due.empty())
+            {
+                GuestInvocation invocation = std::move(due.front());
+                due.pop_front();
+                // M5-T16: the reply is main-owned traffic (the loader
+                // completion channel). Delivered while main is PARKED, the
+                // idle path would hand it to a stackless dispatcher thread
+                // and the T11/T12 fallback would bind it AT main's
+                // suspended sp - the exact bind geometry the T15 carve
+                // replaced (the handler's frames descend into the below-sp
+                // band the filename builder fills; the freeze stops main,
+                // never the builder). Pre-bind the explicit sp on the
+                // carve; bindInvocationStack honors it byte-for-byte.
+                if (getRegU32(&invocation.context, 29) == 0u)
+                {
+                    SET_GPR_U32(&invocation.context, 29, carveInvocationSp());
+                }
+                queueInvocation(std::move(invocation));
+            }
         }
         t10TagWrite("vsync-flag", m_vsyncFlagAddress, 1u, 0u);
         writeGuestU32(m_vsyncFlagAddress, 1u);

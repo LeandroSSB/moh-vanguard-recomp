@@ -2052,6 +2052,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                      << " from=0x" << t10A1
                      << " n=0x" << t10A2
                      << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                     // M5-T16: the executing thread's $sp at the memcpy call -
+                     // the stack band names the thread (main 0x1FFFxxx /
+                     // tid3 0x1BF2xxx / tid6 0x667xxx), the missing writer
+                     // attribution of the T13/T14 captures.
+                     << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
                      << std::dec << std::endl;
                 RUNTIME_LOG(line.str());
             }

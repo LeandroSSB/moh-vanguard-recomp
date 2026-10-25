@@ -346,6 +346,13 @@ public:
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
     void queueInvocation(GuestInvocation invocation);
+    // M5-T16: hold an async invocation until a later vsync boundary. The
+    // synthesized SIF-cmd completions (the T2 loader handshake) posted
+    // INLINE at request time let main's loader/pump wake inside the
+    // filename-builder's fill window - the movie-end pc=ra=0x100 ordering
+    // death. Hardware's IOP turnaround puts the reply at least a frame
+    // after the request; this queue rides the vsync tick.
+    void queueDeferredInvocation(GuestInvocation invocation, uint64_t vsyncsToWait = 1u);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
@@ -533,6 +540,15 @@ private:
     std::deque<EeEvent> m_events;
     std::vector<ScheduledEvent> m_deadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
+
+    // M5-T16: async invocations held until a vsync boundary (guarded by
+    // m_eventMutex, drained on the executor from processEvent).
+    struct DeferredInvocation
+    {
+        GuestInvocation invocation;
+        uint64_t readyVsync = 0;
+    };
+    std::deque<DeferredInvocation> m_deferredInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;

@@ -167,6 +167,10 @@ namespace
     uint32_t g_m5t2ReplyStatus = 0;
     uint32_t g_m5t2HandlerArg = 0;
     uint32_t g_m5t2HandlerRuns = 0;
+    // M5-T16: the vsync tick the completion handler observed at delivery -
+    // the inline-vs-deferred discriminator (the T2 reply must ride the
+    // vsync tick, never the post-time checkpoint).
+    uint32_t g_m5t2HandlerVsyncTick = 0;
 
     void m5t2WaitMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -193,6 +197,8 @@ namespace
         }
         writeGuestU32(rdram, K_M5T2_REPLY_CAPTURE, g_m5t2ReplyHandle);
         ++g_m5t2HandlerRuns;
+        g_m5t2HandlerVsyncTick = static_cast<uint32_t>(
+            runtime->memory().gs().vsyncTick.load(std::memory_order_acquire));
         ctx->pc = 0u;
         runtime->eeScheduler().signalSemaphore(g_m5t2SemaphoreId, true);
     }
@@ -1191,6 +1197,65 @@ void register_ps2_sif_rpc_tests()
             t.Equals(g_m5t2HandlerArg, kHandlerArg, "the completion handler should receive its registered argument");
             t.Equals(g_m5t2ReplyHandle, kRequestHandle, "the reply must carry the request handle at +0xC");
             t.Equals(g_m5t2ReplyStatus, 2u, "the reply status at +0x10 must be 2 (complete the bucket record)");
+        });
+
+        // M5-T16: the synthesized reply must NOT be delivered inline at post
+        // time. On hardware the IOP turnaround (request -> read -> reply)
+        // takes real time - the loader's filename-builder fill completes
+        // long before the completion comes back. The runtime queued the
+        // synthesized cid-1 reply on the very next scheduler checkpoint, so
+        // main's loader/pump woke INSIDE the builder's fill window - the
+        // measured movie-end ordering divergence (pc=ra=0x100, eeCycle
+        // 0x4614dd39, vsync 239; the T15 carve exonerated the delivery
+        // SITE, the TIMING stayed wrong). The reply must ride the vsync
+        // tick: the handler may only observe it after at least one full
+        // VBlank boundary past the post.
+        tc.Run("MOH Vanguard loader queue: the synthesized cid-1 reply is delivered on a vsync boundary, never inline", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kPktAddr = 0x656660u;         // the game's request-packet block
+            constexpr uint32_t kRequestHandle = 0x00000001u; // seq 1, bucket slot = handle>>24 = 0
+            constexpr uint32_t kHandlerArg = 0x64D780u;      // the argument sub_0036C7E0 registers
+
+            writeGuestU32(env.rdram.data(), kPktAddr + 0x14u, kRequestHandle);
+
+            env.runtime.registerFunction(K_M5T2_WAIT_PC, m5t2WaitMain);
+            env.runtime.registerFunction(K_M5T2_RESUME_PC, m5t2ResumeMain);
+            env.runtime.registerFunction(K_M5T2_HANDLER_PC, m5t2FakeCompletionHandler);
+            setRegU32(env.ctx, 4, 1u);
+            setRegU32(env.ctx, 5, K_M5T2_HANDLER_PC);
+            setRegU32(env.ctx, 6, kHandlerArg);
+            ps2_stubs::sceSifAddCmdHandler(env.rdram.data(), &env.ctx, &env.runtime);
+
+            g_m5t2SemaphoreId = 0;
+            g_m5t2ReplyHandle = 0u;
+            g_m5t2ReplyStatus = 0u;
+            g_m5t2HandlerArg = 0u;
+            g_m5t2HandlerRuns = 0u;
+            g_m5t2HandlerVsyncTick = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T2_WAIT_PC;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            setRegU32(env.ctx, 4, 0u);        // cid 0
+            setRegU32(env.ctx, 5, kPktAddr);
+            setRegU32(env.ctx, 6, 0x30u);
+            setRegU32(env.ctx, 7, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
+            sceSifSendCmd(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 1, "SifSendCmd should still report success");
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "the scheduler must unblock: the deferred completion must still reach the handler");
+            t.Equals(g_m5t2HandlerRuns, 1u, "the deferred cid-1 completion handler should run exactly once");
+            t.Equals(g_m5t2ReplyHandle, kRequestHandle, "the deferred reply must carry the request handle at +0xC");
+            t.Equals(g_m5t2ReplyStatus, 2u, "the deferred reply status at +0x10 must be 2");
+            t.IsTrue(g_m5t2HandlerVsyncTick >= 1u,
+                     "the synthesized completion arrived INLINE (the handler ran before the first VBlank "
+                     "after the post) - the ordering divergence that wakes main's pump inside the "
+                     "filename-builder's fill window (the movie-end pc=ra=0x100 death)");
         });
 
         // M5-T11: hardware runs interrupt/SIF/RPC callbacks on the interrupted
