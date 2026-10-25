@@ -596,6 +596,126 @@ namespace
         ctx->pc = 0u; // the callback completed (ra=0 return convention)
     }
 
+    // M5-T16: the epilogue-pop wedge harness. Geometry: main (prio dropped
+    // to 100) is the RUNNING thread when the loader completion binds onto
+    // its record; the handler completes (pc=0) and wakes a HIGHER-priority
+    // (6) spinning worker - the exact preemption point that left main
+    // parked Ready with a completed carve invocation on its record for the
+    // rest of the T16 verification run (reads frozen at 226, main
+    // pc=0 sp=0x1fdfff0 in 107 of 114 samples, uploads stopped at idx 81
+    // vsync 261): the workers never block again once the loader (main)
+    // stops feeding them, so the pop that only runs in the dispatch of the
+    // owner thread never happens. The worker spins watching for the
+    // onComplete flag - post-fix the pop is the interrupt epilogue (it
+    // runs BEFORE the preemption), so the worker must never observe a
+    // missed pop.
+    constexpr uint32_t K_M5T16_MAIN_PC = 0x00160900u;
+    constexpr uint32_t K_M5T16_MAIN_PARK_PC = 0x00160910u;
+    constexpr uint32_t K_M5T16_MAIN_RESUME_PC = 0x00160920u;
+    constexpr uint32_t K_M5T16_HANDLER_PC = 0x00160930u;
+    constexpr uint32_t K_M5T16_WORKER_PC = 0x00160940u;
+    constexpr uint32_t K_M5T16_WORKER_SPIN_PC = 0x00160950u;
+    constexpr uint32_t K_M5T16_WORKER_PARK_PC = 0x00160960u;
+    constexpr uint32_t K_M5T16_MAIN_SP = 0x01FFF000u;
+    PS2Runtime *g_m5t16Runtime = nullptr;
+    int g_m5t16SemaGate = 0;
+    int g_m5t16SemaPark = 0;
+    int g_m5t16SemaResume = 0;
+    uint32_t g_m5t16HandlerRuns = 0;
+    uint32_t g_m5t16SifSp = 0;
+    bool g_m5t16Armed = false;
+    bool g_m5t16PopFlag = false;      // set by the invocation onComplete (the pop moment)
+    bool g_m5t16WorkerGaveUp = false; // the worker exhausted its spin before the pop
+
+    void m5t16Handler(uint8_t * /*rdram*/, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++g_m5t16HandlerRuns;
+        g_m5t16SifSp = ::getRegU32(ctx, 29);
+        // The worker is started HERE, inside the handler's dispatch: the
+        // higher-priority wake is what requests the preemption at the
+        // post-dispatch checkpoint - while main still holds the completed
+        // (pc=0) invocation unpopped. Starting it from the pump would
+        // preempt main BEFORE the pending drain ever binds the invocation.
+        EeScheduler &scheduler = runtime->eeScheduler();
+        EeThreadCreateParams params{};
+        params.entry = K_M5T16_WORKER_PC;
+        params.priority = 6; // HIGHER than main demoted to 100
+        params.stack = runtime->guestMalloc(0x8000u, 16u);
+        params.stackSize = 0x8000u;
+        params.gp = ::getRegU32(ctx, 28);
+        const int workerId = scheduler.createThread(params);
+        scheduler.startThread(workerId, 0u, *ctx, false);
+        ctx->pc = 0u; // the handler completed (ra=0 return convention)
+    }
+
+    void m5t16Worker(uint8_t * /*rdram*/, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (ctx->pc == K_M5T16_WORKER_PC || ctx->pc == K_M5T16_WORKER_SPIN_PC)
+        {
+            // A bounded non-blocking spin FIRST: the real tid5 idle loop
+            // shape (polls its queue and never blocks while there is no
+            // work). If the epilogue pop did not run before this thread was
+            // scheduled, the flag is still unset and the spin runs out.
+            for (volatile uint32_t i = 0; i < 40000000u && !g_m5t16PopFlag; ++i)
+            {
+            }
+            if (!g_m5t16PopFlag)
+            {
+                g_m5t16WorkerGaveUp = true;
+            }
+            ctx->pc = K_M5T16_WORKER_PARK_PC;
+            scheduler.waitSemaphore(g_m5t16SemaPark); // park forever
+            ctx->pc = 0u;
+            return;
+        }
+        ctx->pc = 0u;
+    }
+
+    void m5t16MainPump(uint8_t * /*rdram*/, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (!g_m5t16Armed)
+        {
+            g_m5t16Armed = true;
+            g_m5t16Runtime = runtime;
+            g_m5t16SemaGate = scheduler.createSemaphore(0, 1, 0u, 0u);
+            g_m5t16SemaPark = scheduler.createSemaphore(0, 1, 0u, 0u);
+            g_m5t16SemaResume = scheduler.createSemaphore(0, 1, 0u, 0u);
+
+            int oldPriority = 0;
+            scheduler.changePriority(1, 100, false, oldPriority);
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::SifCommand;
+            invocation.tag = 1u;
+            invocation.context.pc = K_M5T16_HANDLER_PC;
+            setRegU32(invocation.context, 31, 0u);
+            invocation.onComplete = [](const R5900Context &, R5900Context &)
+            {
+                g_m5t16PopFlag = true; // THE POP MOMENT
+                g_m5t16Runtime->eeScheduler().signalSemaphore(g_m5t16SemaResume, true);
+            };
+            // Queued while main is the RUNNING thread: the pending drain
+            // binds it onto the MAIN thread record (owner=1) mid-slice.
+            scheduler.queueInvocation(std::move(invocation));
+
+            ctx->pc = K_M5T16_MAIN_PARK_PC;
+            return; // main keeps running; the park function takes over
+        }
+        if (ctx->pc == K_M5T16_MAIN_PARK_PC)
+        {
+            // main was dispatched after the epilogue: consume the resume
+            // signal (or block until it arrives) and re-enter at RESUME.
+            ctx->pc = K_M5T16_MAIN_RESUME_PC;
+            scheduler.waitSemaphore(g_m5t16SemaResume);
+            return;
+        }
+        // K_M5T16_MAIN_RESUME_PC: the epilogue completed and main woke.
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     // Runs the scheduler on a worker thread with a hard watchdog so a missing
     // completion fails the test instead of hanging the suite.
     bool m5t2RunSchedulerWithWatchdog(TestEnv &env)
@@ -1256,6 +1376,49 @@ void register_ps2_sif_rpc_tests()
                      "the synthesized completion arrived INLINE (the handler ran before the first VBlank "
                      "after the post) - the ordering divergence that wakes main's pump inside the "
                      "filename-builder's fill window (the movie-end pc=ra=0x100 death)");
+        });
+
+        // M5-T16: a completed invocation pop is the interrupt epilogue -
+        // it must run BEFORE the owner can lose the CPU. Pre-fix, the
+        // preemption after the dispatch left main parked Ready with a
+        // completed (pc=0) invocation on its record forever: the
+        // higher-priority workers never block again once the loader (main)
+        // stops feeding them - the terminal pipeline stall measured in the
+        // T16 verification run.
+        tc.Run("a completed invocation pops in the dispatch epilogue, before the owner yields the cpu", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(K_M5T16_MAIN_PC, m5t16MainPump);
+            env.runtime.registerFunction(K_M5T16_MAIN_PARK_PC, m5t16MainPump);
+            env.runtime.registerFunction(K_M5T16_MAIN_RESUME_PC, m5t16MainPump);
+            env.runtime.registerFunction(K_M5T16_HANDLER_PC, m5t16Handler);
+            env.runtime.registerFunction(K_M5T16_WORKER_PC, m5t16Worker);
+            env.runtime.registerFunction(K_M5T16_WORKER_SPIN_PC, m5t16Worker);
+            env.runtime.registerFunction(K_M5T16_WORKER_PARK_PC, m5t16Worker);
+
+            g_m5t16Runtime = nullptr;
+            g_m5t16SemaGate = 0;
+            g_m5t16SemaPark = 0;
+            g_m5t16SemaResume = 0;
+            g_m5t16HandlerRuns = 0u;
+            g_m5t16SifSp = 0u;
+            g_m5t16Armed = false;
+            g_m5t16PopFlag = false;
+            g_m5t16WorkerGaveUp = false;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T16_MAIN_PC;
+            setRegU32(mainContext, 29, K_M5T16_MAIN_SP);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "the run must end on its own: the epilogue pop must release main");
+            t.Equals(g_m5t16HandlerRuns, 1u, "the handler must run exactly once");
+            t.IsTrue(g_m5t16PopFlag, "the completed invocation must pop (the onComplete must run)");
+            t.IsFalse(g_m5t16WorkerGaveUp,
+                      "the pop happened only after the spinning worker starved for it - main was "
+                      "preempted mid-epilogue holding a completed invocation (the T16 pipeline stall)");
+            t.Equals(g_m5t16SifSp, kMainInvocationCarveTop - 0x10u,
+                     "the main-owned completion must still bind on the dedicated carve");
         });
 
         // M5-T11: hardware runs interrupt/SIF/RPC callbacks on the interrupted

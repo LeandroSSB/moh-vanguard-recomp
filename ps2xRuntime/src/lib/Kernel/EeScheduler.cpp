@@ -621,6 +621,41 @@ void EeScheduler::run()
             throw;
         }
 
+        // M5-T16: the pop is the INTERRUPT EPILOGUE - it belongs to this
+        // dispatch, before the thread can lose the CPU. The preemption
+        // below used to catch a thread whose handler had just completed
+        // (active pc==0, invocation still stashed): main sat Ready with a
+        // completed carve invocation on its record while the higher-priority
+        // workers spun on without blocking - and the loader (main) they
+        // wait for never ran again. The T16 verification run measured the
+        // terminal stall (reads frozen at 226 from tick ~1680, main
+        // pc=0 sp=0x1fdfff0 in 107 of 114 samples, uploads stopped at
+        // idx 81 / vsync 261 of a 300 s run).
+        if (m_currentThreadId != 0u)
+        {
+            GuestThread *finishing = currentThread();
+            if (finishing != nullptr && !finishing->invocations.empty() &&
+                finishing->activeContext().pc == 0u)
+            {
+                GuestInvocation completed = std::move(finishing->invocations.back());
+                finishing->invocations.pop_back();
+                if (completed.usesMainStack && m_mainStackUsers > 0)
+                {
+                    --m_mainStackUsers;
+                }
+                if (completed.onComplete)
+                {
+                    try
+                    {
+                        completed.onComplete(completed.context, finishing->activeContext());
+                    }
+                    catch (const EeDispatcherTransfer &)
+                    {
+                    }
+                }
+            }
+        }
+
         processPendingEvents();
         if (m_rescheduleRequested && m_currentThreadId != 0)
         {
