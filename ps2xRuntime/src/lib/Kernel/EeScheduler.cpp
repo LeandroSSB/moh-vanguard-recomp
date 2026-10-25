@@ -1949,7 +1949,29 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 28, handler.gp);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
-        queueInvocation(std::move(invocation));
+        // M5-T18: the EE timer-counter callbacks (causes 9-12, the game's
+        // wheel dispatcher class - Vanguard's 0x355300 walks its timer
+        // wheel 0x5109F0 from here) must not ride the checkpoint that
+        // raised them. The T17 capture measured the unshaped delivery
+        // dying mid-movie: the dispatcher executed at an arbitrary
+        // checkpoint (mid-fill), and the game's own dispatcher runs due
+        // wheel continuations on the INTERRUPTED stack - the callback
+        // window interleaved the movie pipeline's fill window (main
+        // 0x6a0310 out of lastGood 0x355300 at vsync 197). Hardware gives
+        // these callbacks at least a frame of slack (the wheel's due
+        // windows are ms-scale); deliver them on the next VBlank boundary
+        // like the T16 SIF replies. The VBlankStart promote pre-binds the
+        // carve, so the frame never lands in main's below-sp band via the
+        // stackless fallback. VBlank causes (2/3) already fire ON the
+        // boundary - delivered inline, unchanged.
+        if (!dmac && cause >= 9u && cause <= 12u)
+        {
+            queueDeferredInvocation(std::move(invocation), 1u);
+        }
+        else
+        {
+            queueInvocation(std::move(invocation));
+        }
     }
 }
 
@@ -2807,7 +2829,12 @@ void EeScheduler::processEvent(const EeEvent &event)
         SET_GPR_U32(&invocation.context, 28, alarm.gp);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
-        queueInvocation(std::move(invocation));
+        // M5-T18: the alarm callback fires at an arbitrary checkpoint (a
+        // 64 us alarm lands between vsyncs); deliver it on the next VBlank
+        // boundary with the T16 carve pre-bind, not inline at the fire
+        // checkpoint (the same T17 interleave class as the timer IRQs
+        // above).
+        queueDeferredInvocation(std::move(invocation), 1u);
         break;
     }
     }
