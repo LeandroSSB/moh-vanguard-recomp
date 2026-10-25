@@ -321,10 +321,9 @@ void EeScheduler::run()
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
-                if (getRegU32(&invocation.context, 29) == 0u)
-                {
-                    bindInvocationStack(*owner, invocation);
-                }
+                // M5-T14: bindInvocationStack self-guards - explicit-sp
+                // invocations get their main-stack residency marked there.
+                bindInvocationStack(*owner, invocation);
                 owner->invocations.push_back(std::move(invocation));
             }
         }
@@ -445,10 +444,9 @@ void EeScheduler::run()
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
-            if (getRegU32(&invocation.context, 29) == 0u)
-            {
-                bindInvocationStack(*running, invocation);
-            }
+            // M5-T14: bindInvocationStack self-guards - explicit-sp
+            // invocations get their main-stack residency marked there.
+            bindInvocationStack(*running, invocation);
             running->invocations.push_back(std::move(invocation));
             continue;
         }
@@ -1448,10 +1446,9 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assertExecutor();
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
-    if (getRegU32(&invocation.context, 29) == 0u)
-    {
-        bindInvocationStack(*owner, invocation);
-    }
+    // M5-T14: bindInvocationStack self-guards - explicit-sp
+    // invocations get their main-stack residency marked there.
+    bindInvocationStack(*owner, invocation);
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
@@ -1466,7 +1463,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assert(!invocations.empty());
     for (auto it = invocations.rbegin(); it != invocations.rend(); ++it)
     {
-        if (getRegU32(&it->context, 29) == 0u)
+        // M5-T14: bindInvocationStack self-guards (explicit-sp residency).
         {
             bindInvocationStack(*owner, *it);
         }
@@ -1497,8 +1494,29 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
 // no guest stack at all (the internal dispatcher threads).
 void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invocation)
 {
-    if (getRegU32(&invocation.context, 29) != 0u)
+    const uint32_t explicitSp = getRegU32(&invocation.context, 29);
+    if (explicitSp != 0u)
     {
+        // M5-T14: an explicit sp INSIDE main's stack reserve is a
+        // MAIN-STACK-RESIDENT invocation - the measured shape is
+        // sceGsSyncVCallback, which binds the game's vsync callback at
+        // the caller's live $sp (GS.cpp records getRegU32(ctx,29) and the
+        // invocation enters with it). Without the residency flag the
+        // parked chain is invisible to the freeze and to every bind scan,
+        // so main gets scheduled onto the same region mid-chain and the
+        // two contexts overwrite each other's saved registers - the
+        // movie-end poison, decoded from the 2026-10-25 captures: the
+        // chain's filename-builder memcpy (0x47AB84/0x479F98) landed in
+        // the cid-1 handler's saved-ra slot (dst=0x1fff260 = entry sp
+        // 0x1fff280 - 0x20, the `sd ra,0x20(sp)` word of frame -0x40) and
+        // the handler restored that word as $ra (pc=ra=0x1fff450, the
+        // loader's level-record pointer; T13's capture held 0x100, the
+        // same class of stale word).
+        if (explicitSp >= PS2_RAM_SIZE - kAsyncCallbackStackMainReserve)
+        {
+            invocation.usesMainStack = true;
+            ++m_mainStackUsers;
+        }
         return; // the caller already bound an explicit stack
     }
     SET_GPR_U32(&invocation.context, 29, invocationEntrySp(owner, invocation.usesMainStack));
