@@ -337,97 +337,163 @@ namespace
         ctx->pc = 0u; // the callback completed (ra=0 return convention)
     }
 
-    // M5-T14: the measured MOH Vanguard poison (pc=0x100 / pc=0x1fff450 at
-    // the movie-end boundary). sceGsSyncVCallback registers the game's vsync
-    // callback AT THE CALLER'S $sp - the invocation enters with that EXPLICIT
-    // sp, bindInvocationStack early-returns on it, and the chain is never
-    // marked main-stack-resident: the freeze does not hold main, no bind scan
-    // sees the live frames, and a MAIN-owned cid-1 handler is bound at the
-    // same boundary OVER the parked chain. When the chain later resumes (the
-    // handler's own completion pumps its semaphore) its filename-builder
-    // memcpy lands in the handler's saved-ra slot (measured: dst=0x1fff260,
-    // the handler's `sd ra,0x20(sp)` word) and the handler restores the
-    // poisoned word as $ra.
-    constexpr uint32_t K_M5T14_WAIT_PC = 0x001607A0u;
-    constexpr uint32_t K_M5T14_RESUME_PC = 0x001607B0u;
-    constexpr uint32_t K_M5T14_CHAIN_PC = 0x001607C0u;
-    constexpr uint32_t K_M5T14_RELEASE_PC = 0x001607D0u;
-    constexpr uint32_t K_M5T14_SIF_PC = 0x001607E0u;
-    constexpr uint32_t K_M5T14_CHAIN_SP = 0x01FFF280u; // the explicit, main-resident bind sp
-    std::vector<std::string> g_m5t14Trace;
-    uint32_t g_m5t14ChainSp = 0;
-    uint32_t g_m5t14SifSp = 0;
-    int g_m5t14SemaWake = 0;
-    int g_m5t14SemaRelease = 0;
+    // M5-T14 fix round: the FOREIGN-OWNER delivery shape of the measured
+    // movie-end poison (pc=0x100 / pc=0x1fff450 at the movie-end boundary).
+    // The shipped T14 test could not discriminate the fix: its overlap
+    // assertion was satisfied by construction (the chain's explicit sp sat
+    // ABOVE main's suspended sp, so the fallback already bound below it),
+    // and its freeze engagement was foreign-owner-only while the chain rode
+    // delivery paths that never exercised it. This harness reproduces the
+    // CAPTURE GEOMETRY instead:
+    //   - main parks at 0x01FFF4A0 holding LIVE SCRATCH below its sp (the
+    //     canary band - the region the game's filename builder fills);
+    //   - the GS-chain invocation (the sceGsSyncVCallback registration
+    //     shape) enters with an EXPLICIT sp at 0x01FFF280 - INSIDE main's
+    //     below-sp band, exactly capture A's geometry (entry sp 0x1FFF280,
+    //     saved-ra slot 0x1FFF260) - and is delivered through the pending
+    //     queue onto a STACKLESS DISPATCHER thread's record, the non-main
+    //     owner the fix's mechanisms (foreign-owner freeze + bind-scan
+    //     nesting) actually engage for;
+    //   - while the chain is parked mid-frame, the loader's cid-1-shaped
+    //     SifCommand is queued and main is woken Ready with foreign frames
+    //     live in its stack. Pre-fix (cd3a432 reverted) main is scheduled
+    //     first and the SifCommand is delivered ON MAIN's record AT main's
+    //     suspended sp - inside the live-frame window: its sd ra,0x20(sp)
+    //     word lands on main's scratch (the scratch collision the T14
+    //     captures measured as the movie-end poison).
+    constexpr uint32_t K_M5T14B_WAIT_PC = 0x00160800u;
+    constexpr uint32_t K_M5T14B_RESUME_PC = 0x00160810u;
+    constexpr uint32_t K_M5T14B_CHAIN_PC = 0x00160820u;
+    constexpr uint32_t K_M5T14B_SIF_PC = 0x00160830u;
+    constexpr uint32_t K_M5T14B_RELEASE_PC = 0x00160840u;
+    constexpr uint32_t K_M5T14B_MAIN_SP = 0x01FFF4A0u;  // main parked mid-pump (capture B's death sp region)
+    constexpr uint32_t K_M5T14B_CHAIN_SP = 0x01FFF280u; // the explicit, main-resident bind sp (capture A)
+    constexpr uint32_t K_M5T14B_CHAIN_FRAME = 0x60u;    // the chain's pushed frame depth
+    constexpr uint32_t K_M5T14B_CHAIN_SP_PARKED = K_M5T14B_CHAIN_SP - K_M5T14B_CHAIN_FRAME;
+    // main's live-frame window: everything between the parked chain's
+    // deepest live frame and main's suspended sp - the below-sp scratch the
+    // game still owns (the filename-builder buffers - the T14 writer).
+    constexpr uint32_t K_M5T14B_WINDOW_BOTTOM = K_M5T14B_CHAIN_SP_PARKED;
+    constexpr uint32_t K_M5T14B_WINDOW_MARGIN = K_M5T14B_MAIN_SP - K_M5T14B_WINDOW_BOTTOM;
+    constexpr uint32_t K_M5T14B_POISON_SLOT = K_M5T14B_CHAIN_SP - 0x20u; // capture A's measured dst
+    constexpr uint32_t K_M5T14B_CANARY = 0x0BADCAFEu;
+    constexpr uint32_t K_M5T14B_RA_MARKER = 0xC0DEC0DEu; // the handler's saved-ra word
+    std::vector<std::string> g_m5t14bTrace;
+    uint32_t g_m5t14bChainSp = 0;
+    uint32_t g_m5t14bSifSp = 0;
+    uint32_t g_m5t14bSifRaSlot = 0;
+    uint32_t g_m5t14bCanaryClobberAddr = 0;
+    uint32_t g_m5t14bCanaryClobberValue = 0;
+    int g_m5t14bSemaWake = 0; // the chain wakes main: Ready while foreign frames are live
+    int g_m5t14bSemaChainRelease = 0;
+    int g_m5t14bSemaSifGo = 0;
 
-    void m5t14WaitMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    void m5t14bWaitMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &scheduler = runtime->eeScheduler();
-        g_m5t14SemaWake = scheduler.createSemaphore(0, 1, 0u, 0u);
-        g_m5t14SemaRelease = scheduler.createSemaphore(0, 1, 0u, 0u);
-        // The sceGsSyncVCallback shape: an invocation with an EXPLICIT sp on
-        // main's stack (the game binds its vsync callback at the caller's
-        // live $sp), drained by a stackless dispatcher thread.
+        g_m5t14bSemaWake = scheduler.createSemaphore(0, 1, 0u, 0u);
+        g_m5t14bSemaChainRelease = scheduler.createSemaphore(0, 1, 0u, 0u);
+        g_m5t14bSemaSifGo = scheduler.createSemaphore(0, 1, 0u, 0u);
+        // Main's below-sp live scratch (the canary band), including
+        // capture A's poisoned slot: the game keeps builder buffers here.
+        for (uint32_t addr = K_M5T14B_WINDOW_BOTTOM; addr < K_M5T14B_MAIN_SP; addr += 4u)
+        {
+            writeGuestU32(rdram, addr, K_M5T14B_CANARY);
+        }
+        // The sceGsSyncVCallback shape: an invocation with an EXPLICIT sp
+        // inside main's below-sp band (the game registers its vsync
+        // callback at the caller's live $sp), delivered through the pending
+        // queue onto a stackless dispatcher thread's record (non-main owner).
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::GsCallback;
-        invocation.context.pc = K_M5T14_CHAIN_PC;
-        setRegU32(invocation.context, 29, K_M5T14_CHAIN_SP);
+        invocation.context.pc = K_M5T14B_CHAIN_PC;
+        setRegU32(invocation.context, 29, K_M5T14B_CHAIN_SP);
         setRegU32(invocation.context, 31, 0u);
         invocation.onComplete = [](const R5900Context &, R5900Context &)
         {
-            g_m5t14Trace.push_back("chain-pop");
+            g_m5t14bTrace.push_back("chain-pop");
         };
         scheduler.queueInvocation(std::move(invocation));
-        ctx->pc = K_M5T14_RESUME_PC;
-        scheduler.waitSemaphore(g_m5t14SemaWake); // parks main
+        ctx->pc = K_M5T14B_RESUME_PC;
+        scheduler.waitSemaphore(g_m5t14bSemaWake); // parks main
     }
 
-    void m5t14ChainHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    void m5t14bChainHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &scheduler = runtime->eeScheduler();
-        g_m5t14Trace.push_back("chain");
-        g_m5t14ChainSp = ::getRegU32(ctx, 29);
-        // Simulate the chain's OWN guest frame (a real vsync-callback
-        // chain pushes frames below its bind sp before it parks).
-        setRegU32(*ctx, 29, K_M5T14_CHAIN_SP - 0x60u);
-        // Queue the MAIN-owned cid-1 handler (no explicit sp) WHILE this
-        // chain is live on main's stack, then park mid-frame - the loader
-        // pattern: the chain waits on the loader's semaphore after arming
-        // the next request.
+        g_m5t14bTrace.push_back("chain");
+        g_m5t14bChainSp = ::getRegU32(ctx, 29);
+        // The chain's own guest frame: push below the explicit bind sp
+        // before parking (a real vsync-callback chain holds live frames
+        // here - the bind scan must nest every later bind BELOW this sp).
+        setRegU32(*ctx, 29, K_M5T14B_CHAIN_SP_PARKED);
+        // The loader pattern: while this chain is live on main's stack,
+        // arm the next cid-1 request (a SifCommand with no explicit sp)
+        // and wake main - Ready while a foreign owner holds main's stack.
         GuestInvocation sif{};
         sif.kind = GuestInvocationKind::SifCommand;
-        sif.tag = 1u;
-        sif.context.pc = K_M5T14_SIF_PC;
+        sif.tag = 1u; // cid-1, the loader completion channel
+        sif.context.pc = K_M5T14B_SIF_PC;
         setRegU32(sif.context, 31, 0u);
         sif.onComplete = [](const R5900Context &, R5900Context &)
         {
-            g_m5t14Trace.push_back("sif-pop");
+            g_m5t14bTrace.push_back("sif-pop");
         };
         scheduler.queueInvocation(std::move(sif));
-        scheduler.signalSemaphore(g_m5t14SemaWake, true); // main becomes Ready
-        ctx->pc = 0u; // (not reached as completion: the park unwinds first)
-        scheduler.waitSemaphore(g_m5t14SemaRelease); // parks mid-frame
+        scheduler.signalSemaphore(g_m5t14bSemaWake, true); // main becomes Ready
+        ctx->pc = 0u; // completion when the parked frame unwinds
+        scheduler.waitSemaphore(g_m5t14bSemaChainRelease); // parks mid-frame
     }
 
-    void m5t14ReleaseHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    void m5t14bSifHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_m5t14Trace.push_back("release");
-        runtime->eeScheduler().signalSemaphore(g_m5t14SemaRelease, true);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_m5t14bTrace.push_back("sif");
+        g_m5t14bSifSp = ::getRegU32(ctx, 29); // the entry (bind) sp
+        // The handler's -0x40 frame with sd ra,0x20(sp): the exact slot
+        // the T14 captures measured the poison landing in.
+        setRegU32(*ctx, 29, g_m5t14bSifSp - 0x40u);
+        writeGuestU32(rdram, g_m5t14bSifSp - 0x20u, K_M5T14B_RA_MARKER);
+        // Release the parked chain and arm the async completion releaser,
+        // then park mid-frame (the loader's asynchronous cid-1 completion).
+        scheduler.signalSemaphore(g_m5t14bSemaChainRelease, true);
+        scheduler.setAlarm(16u, K_M5T14B_RELEASE_PC, 0u, 0u, 0u);
+        ctx->pc = 0u;
+        scheduler.waitSemaphore(g_m5t14bSemaSifGo); // parks mid-frame
+    }
+
+    void m5t14bReleaseHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_m5t14bTrace.push_back("release");
+        runtime->eeScheduler().signalSemaphore(g_m5t14bSemaSifGo, true);
         ctx->pc = 0u;
     }
 
-    void m5t14SifHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    void m5t14bMainResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_m5t14Trace.push_back("sif");
-        g_m5t14SifSp = ::getRegU32(ctx, 29);
-        // Complete the chain so the run can end either way.
-        runtime->eeScheduler().signalSemaphore(g_m5t14SemaRelease, true);
-        ctx->pc = 0u;
-    }
-
-    void m5t14MainResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        g_m5t14Trace.push_back("main");
+        g_m5t14bTrace.push_back("main");
+        g_m5t14bSifRaSlot = 0u;
+        if (g_m5t14bSifSp != 0u)
+        {
+            std::memcpy(&g_m5t14bSifRaSlot, rdram + g_m5t14bSifSp - 0x20u, sizeof(uint32_t));
+        }
+        // The poisoned-word probe: main's below-sp scratch must be exactly
+        // as it left it - no callback frame may have landed inside the
+        // live-frame window (pre-fix the SifCommand binds AT main's sp and
+        // its saved-ra word lands on the canary).
+        g_m5t14bCanaryClobberAddr = 0u;
+        g_m5t14bCanaryClobberValue = 0u;
+        for (uint32_t addr = K_M5T14B_WINDOW_BOTTOM; addr < K_M5T14B_MAIN_SP; addr += 4u)
+        {
+            uint32_t word = 0u;
+            std::memcpy(&word, rdram + addr, sizeof(uint32_t));
+            if (word != K_M5T14B_CANARY)
+            {
+                g_m5t14bCanaryClobberAddr = addr;
+                g_m5t14bCanaryClobberValue = word;
+                break;
+            }
+        }
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -1192,61 +1258,85 @@ void register_ps2_sif_rpc_tests()
                      "main's pump must resume only after the callback pops (the freeze still orders them)");
         });
 
-        // M5-T14: an EXPLICIT-sp invocation landing inside main's stack
-        // reserve (the sceGsSyncVCallback registration shape) is
-        // main-stack-resident. It must hold main out of the schedule while
-        // its frames are live - exactly like the fallback (usesMainStack)
-        // path - because main's pump and any MAIN-owned callback bound at
-        // the same boundary would descend straight into the parked chain's
-        // frames (the measured movie-end poison: the chain's filename
-        // builder memcpy into the cid-1 handler's saved-ra slot).
-        // RED before the fix: the explicit-sp early-return leaves the
-        // invocation unmarked, main runs while the chain is parked ("main"
-        // traced before "chain-pop"), and the MAIN-owned SifCommand binds
-        // AT the chain's parked sp.
-        tc.Run("a main-stack-resident explicit-sp callback must hold main until it pops", [](TestCase &t)
+        // M5-T14 fix round: the FOREIGN-OWNER delivery shape. The GS-chain
+        // invocation enters with an EXPLICIT sp INSIDE main's below-sp
+        // live-frame window (the sceGsSyncVCallback registration shape,
+        // capture-A geometry: entry 0x1FFF280, saved-ra slot 0x1FFF260,
+        // main parked at 0x1FFF4A0) and rides a STACKLESS DISPATCHER
+        // thread's record (queueInvocation -> pending drain). While it is
+        // parked mid-frame, main is woken Ready with foreign frames live in
+        // its stack and the loader's cid-1 SifCommand is queued. The fix's
+        // mechanisms must both engage: the foreign-owner freeze holds main
+        // out of the schedule (EeScheduler selectReady) and the bind scan
+        // nests the SifCommand BELOW the chain's deepest live frame
+        // (invocationEntrySp) - never inside main's live-frame window.
+        // RED pre-fix (cd3a432 reverted): the chain is unmarked, no freeze
+        // holds main, main is scheduled first and the SifCommand is
+        // delivered ON MAIN's record AT main's suspended sp - its saved-ra
+        // word lands on main's canary band (the scratch collision the T14
+        // captures measured as the movie-end poison).
+        tc.Run("a foreign-delivered main-stack chain must freeze main and nest the next bind below its live frames", [](TestCase &t)
         {
             TestEnv env;
-            constexpr uint32_t kMainSp = 0x01FFF000u; // main suspended mid-pump at this sp
+            static_assert(K_M5T14B_POISON_SLOT > K_M5T14B_WINDOW_BOTTOM &&
+                              K_M5T14B_POISON_SLOT < K_M5T14B_MAIN_SP,
+                          "capture A's poisoned slot must sit inside the canary band");
 
-            env.runtime.registerFunction(K_M5T14_WAIT_PC, m5t14WaitMain);
-            env.runtime.registerFunction(K_M5T14_RESUME_PC, m5t14MainResume);
-            env.runtime.registerFunction(K_M5T14_CHAIN_PC, m5t14ChainHandler);
-            env.runtime.registerFunction(K_M5T14_RELEASE_PC, m5t14ReleaseHandler);
-            env.runtime.registerFunction(K_M5T14_SIF_PC, m5t14SifHandler);
+            env.runtime.registerFunction(K_M5T14B_WAIT_PC, m5t14bWaitMain);
+            env.runtime.registerFunction(K_M5T14B_RESUME_PC, m5t14bMainResume);
+            env.runtime.registerFunction(K_M5T14B_CHAIN_PC, m5t14bChainHandler);
+            env.runtime.registerFunction(K_M5T14B_SIF_PC, m5t14bSifHandler);
+            env.runtime.registerFunction(K_M5T14B_RELEASE_PC, m5t14bReleaseHandler);
 
-            g_m5t14Trace.clear();
-            g_m5t14ChainSp = 0u;
-            g_m5t14SifSp = 0u;
-            g_m5t14SemaWake = 0;
-            g_m5t14SemaRelease = 0;
+            g_m5t14bTrace.clear();
+            g_m5t14bChainSp = 0u;
+            g_m5t14bSifSp = 0u;
+            g_m5t14bSifRaSlot = 0u;
+            g_m5t14bCanaryClobberAddr = 0u;
+            g_m5t14bCanaryClobberValue = 0u;
+            g_m5t14bSemaWake = 0;
+            g_m5t14bSemaChainRelease = 0;
+            g_m5t14bSemaSifGo = 0;
             R5900Context mainContext{};
-            mainContext.pc = K_M5T14_WAIT_PC;
-            setRegU32(mainContext, 29, kMainSp);
+            mainContext.pc = K_M5T14B_WAIT_PC;
+            setRegU32(mainContext, 29, K_M5T14B_MAIN_SP);
             env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
 
             const bool finished = m5t2RunSchedulerWithWatchdog(env);
             t.IsTrue(finished, "the run must end on its own: the parked chain drains and main resumes");
 
-            t.Equals(g_m5t14ChainSp, K_M5T14_CHAIN_SP,
-                     "the explicit sp must be honored (the sceGsSyncVCallback bind shape)");
-            const auto chainPop = std::find(g_m5t14Trace.begin(), g_m5t14Trace.end(), "chain-pop");
-            const auto main = std::find(g_m5t14Trace.begin(), g_m5t14Trace.end(), "main");
-            t.IsTrue(chainPop != g_m5t14Trace.end(), "the chain must complete (pop)");
-            t.IsTrue(main != g_m5t14Trace.end(), "main must run again after the drain");
-            // THE overlap assertion (the measured death): the MAIN-owned
-            // SifCommand must bind AT or BELOW the parked chain's deepest
-            // live $sp - never inside its live frames.
-            t.IsTrue(g_m5t14SifSp != 0u && g_m5t14SifSp <= K_M5T14_CHAIN_SP - 0x60u,
-                     "the MAIN-owned SifCommand bound OVER the parked main-stack-resident "
-                     "chain (its frames would overwrite the chain's saved registers - "
-                     "and the chain's resume would overwrite the handler's saved ra)");
-            if (chainPop != g_m5t14Trace.end() && main != g_m5t14Trace.end())
+            t.Equals(g_m5t14bChainSp, K_M5T14B_CHAIN_SP,
+                     "the explicit sp must be honored byte-for-byte (the sceGsSyncVCallback bind shape)");
+            const auto chainPop = std::find(g_m5t14bTrace.begin(), g_m5t14bTrace.end(), "chain-pop");
+            const auto sif = std::find(g_m5t14bTrace.begin(), g_m5t14bTrace.end(), "sif");
+            const auto main = std::find(g_m5t14bTrace.begin(), g_m5t14bTrace.end(), "main");
+            t.IsTrue(chainPop != g_m5t14bTrace.end(), "the foreign-delivered chain must complete (pop)");
+            t.IsTrue(sif != g_m5t14bTrace.end(), "the cid-1 SifCommand must be delivered");
+            t.IsTrue(main != g_m5t14bTrace.end(), "main must run again after the drain");
+            if (chainPop != g_m5t14bTrace.end() && main != g_m5t14bTrace.end())
             {
                 t.IsTrue(main > chainPop,
-                         "main's pump must not descend into the parked chain's frames "
-                         "(main is held until the resident chain pops)");
+                         "main's pump must stay out of the parked foreign chain's frames "
+                         "(the foreign-owner freeze holds main until the chain pops)");
             }
+            // (1) THE overlap assertion, capture geometry: the delivered
+            // cid-1 callback must bind at or BELOW the parked chain's
+            // deepest live frame - never inside main's live-frame window
+            // [window bottom, main sp). Pre-fix it rides main's own record
+            // and binds AT main's suspended sp.
+            t.IsTrue(g_m5t14bSifSp != 0u && g_m5t14bSifSp <= K_M5T14B_MAIN_SP - K_M5T14B_WINDOW_MARGIN,
+                     "the cid-1 SifCommand bound INSIDE main's live-frame window "
+                     "(its frames land on the below-sp scratch the filename builder fills "
+                     "- the measured T14 poison shape)");
+            // (2) the poisoned-word probe: main's canary band - which
+            // contains capture A's measured slot (entry sp - 0x20) - must
+            // be untouched, and the handler's own saved-ra word must still
+            // be the marker it wrote (no side overwrote the parked frame).
+            t.Equals(g_m5t14bCanaryClobberAddr, 0u,
+                     "main's below-sp live-frame window was clobbered by a callback frame");
+            t.Equals(g_m5t14bSifRaSlot, K_M5T14B_RA_MARKER,
+                     "the cid-1 handler's saved-ra slot was overwritten while it was parked "
+                     "(the exact slot the T14 captures measured the poison in)");
         });
 
         // The reply direction (cid=1) is the game's own completion traffic:
