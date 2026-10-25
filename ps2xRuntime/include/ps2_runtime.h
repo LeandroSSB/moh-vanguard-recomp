@@ -793,6 +793,12 @@ public:
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+    // M5-T11 fix: [base, top) covering EVERY async-callback-stack block
+    // reserved so far (the blocks are contiguous, marching down from
+    // PS2_RAM_SIZE - kAsyncCallbackStackMainReserve). Returns false when
+    // nothing has been reserved. The invalid-jump dump uses this to
+    // attribute a poisoned sp to the host block band (M5-T10 trample).
+    [[nodiscard]] bool asyncCallbackStackBand(uint32_t &base, uint32_t &top) const;
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 

@@ -2941,6 +2941,19 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return top - 0x10u;
 }
 
+bool PS2Runtime::asyncCallbackStackBand(uint32_t &base, uint32_t &top) const
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    const uint32_t bandTop = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
+    if (m_asyncCallbackStackTop >= bandTop)
+    {
+        return false; // nothing reserved yet
+    }
+    base = m_asyncCallbackStackTop;
+    top = bandTop;
+    return true;
+}
+
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try

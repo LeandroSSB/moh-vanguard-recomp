@@ -360,9 +360,27 @@ public:
     // M5-T11: binds invocation.context.$sp (owner stack / main-stack fallback);
     // sets invocation.usesMainStack when the fallback is taken.
     void bindInvocationStack(GuestThread &owner, GuestInvocation &invocation);
+    // Deep-callback bound: a guest-stack anchor is only used when it leaves
+    // >= 4 KiB (0x1000) of headroom below the anchor $sp; a callback nested
+    // deeper than that falls through to the main-stack fallback (and, if
+    // that too lacks headroom, the degenerate reserved block). HW-faithful
+    // overflow behavior: real hardware just pushes below $sp, clobbering
+    // whatever lives there.
     [[nodiscard]] uint32_t invocationEntrySp(const GuestThread &owner, bool &usedMainStack);
     // M5-T11: number of LIVE invocations bound to the main thread's stack.
     int m_mainStackUsers = 0;
+    // M5-T11 fix: release the main-stack freeze count for every live
+    // usesMainStack invocation a destruction path is about to drop
+    // (makeDormant clears invocations; deleteThread erases the record) -
+    // a leaked count wedges main forever, silent, no timeout.
+    void releaseMainStackUsers(const GuestThread &item);
+    // M5-T11 fix: rate-limited (2 s) diagnostic while the freeze is actively
+    // holding main out of schedule, so a wedged freeze is diagnosable.
+    void logMainStackFreeze();
+    std::chrono::steady_clock::time_point m_lastMainFreezeLog{};
+    // M5-T11 fix: one-shot gate for the degenerate reserved-block fallback
+    // log (see invocationEntrySp) - the T10 heap-trample risk must be loud.
+    bool m_degenerateInvocationStackLogged = false;
     [[nodiscard]] uint32_t invocationStackTop();
 
     int addIrqHandler(bool dmac,

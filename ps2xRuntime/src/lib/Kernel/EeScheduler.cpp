@@ -222,6 +222,11 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
     m_currentThreadId = 0;
+    // M5-T11 fix: the thread table (and every live main-stack invocation it
+    // held) is being cleared - the freeze count dies with it.
+    m_mainStackUsers = 0;
+    m_lastMainFreezeLog = {};
+    m_degenerateInvocationStackLogged = false;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
@@ -505,6 +510,31 @@ void EeScheduler::run()
                     // inside an async stack block (T7 allocator vs game data).
                     if (context.pc < 0x00100000u)
                     {
+                        // M5-T11 fix: attribute any sp inside the host
+                        // async-callback-stack band - a poisoned frame living
+                        // in a reserved block is the T10 heap-trample
+                        // signature (the degenerate fallback path).
+                        uint32_t bandBase = 0u;
+                        uint32_t bandTop = 0u;
+                        if (m_runtime.asyncCallbackStackBand(bandBase, bandTop))
+                        {
+                            const uint32_t spNow = static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0));
+                            const uint32_t lastGoodSp = running->lastGoodSp;
+                            for (const uint32_t probe : {spNow, lastGoodSp})
+                            {
+                                if (probe != spNow && lastGoodSp == spNow)
+                                {
+                                    break; // duplicate of the already-attributed sp
+                                }
+                                if (probe >= bandBase && probe < bandTop)
+                                {
+                                    oss << "[ee-run:invalid-jump] sp=0x" << std::hex << probe
+                                        << " inside host async-callback-stack band [0x" << bandBase
+                                        << ",0x" << bandTop << ") - heap-trample risk, see M5-T10"
+                                        << std::dec << "\n";
+                                }
+                            }
+                        }
                         ps2xM5T11FormatRing(oss, 64);
                         ps2xM5T11FormatAsyncBlocks(oss);
                         oss << "\n";
@@ -731,6 +761,9 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
     {
         ownedStack = it->second.stack;
     }
+    // M5-T11 fix: this path erases the record without makeDormant - release
+    // any live main-stack invocation it still holds.
+    releaseMainStackUsers(it->second);
     m_threads.erase(it);
     publishSnapshot();
     return KE_OK;
@@ -1500,7 +1533,21 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMain
             return base;
         }
     }
-    return invocationStackTop();
+    // Degenerate last resort (M5-T10): neither the owner's stack nor main's
+    // leaves the 4 KiB deep-callback headroom - the only binding left is a
+    // 16 KiB host-reserved block marching DOWN from 0x1FF8000 through the
+    // band the game's malloc arena fills (the exact T10 trample). Loud and
+    // one-shot so a resurrected trample is attributable in minutes.
+    const uint32_t degenerateTop = invocationStackTop();
+    if (!m_degenerateInvocationStackLogged)
+    {
+        m_degenerateInvocationStackLogged = true;
+        RUNTIME_LOG("[ee-sched:degenerate-invocation-stack] owner and main stack both exhausted: binding a 16 KiB async-stack block at [0x"
+                    << std::hex << (degenerateTop - 0x4000u) << ",0x" << (degenerateTop + 0x10u)
+                    << ") - this band is the game's live heap (heap-trample risk, see M5-T10)"
+                    << std::dec << std::endl);
+    }
+    return degenerateTop;
 }
 
 uint32_t EeScheduler::invocationStackTop()
@@ -2019,17 +2066,22 @@ GuestThread *EeScheduler::selectReady()
 {
     for (auto &queue : m_readyQueues)
     {
-        while (!queue.empty())
+        for (size_t i = 0; i < queue.size(); ++i)
         {
-            const int id = queue.front();
+            const int id = queue[i];
             // M5-T11: while a callback is live on the main thread's stack, the
             // main pump must not run - it would descend into the callback's
-            // frames (both contexts end up poisoned, pc=ra=0x100).
+            // frames (both contexts end up poisoned, pc=ra=0x100). Skip main
+            // and KEEP SCANNING the same queue: the thread that drains the
+            // callback (e.g. the loader consumer) may sit BEHIND main at the
+            // same priority - freezing the whole queue would starve it and
+            // wedge the freeze forever.
             if (m_mainStackUsers > 0 && id == kMainThreadId)
             {
-                break;
+                logMainStackFreeze();
+                continue;
             }
-            queue.pop_front();
+            queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(i));
             GuestThread *selected = thread(id);
             assert(selected != nullptr);
             assert(selected->status == EeThreadStatus::Ready);
@@ -2037,6 +2089,22 @@ GuestThread *EeScheduler::selectReady()
         }
     }
     return nullptr;
+}
+
+// M5-T11 fix: a wedged freeze must be diagnosable in minutes, not a silent
+// idle - rate-limited (once per 2 s) while the freeze actively skips main.
+void EeScheduler::logMainStackFreeze()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastMainFreezeLog != std::chrono::steady_clock::time_point{} &&
+        now - m_lastMainFreezeLog < std::chrono::seconds(2))
+    {
+        return;
+    }
+    m_lastMainFreezeLog = now;
+    RUNTIME_LOG("[ee-sched:main-frozen] " << m_mainStackUsers
+                                           << " live main-stack callback(s): main thread held out of schedule"
+                                           << std::endl);
 }
 
 void EeScheduler::makeRunning(GuestThread &item)
@@ -2048,8 +2116,28 @@ void EeScheduler::makeRunning(GuestThread &item)
     renewTimeSlice();
 }
 
+// M5-T11 fix: mirrors the guarded decrement of the completion pop - every
+// live usesMainStack invocation this record still holds releases one freeze
+// count. Called from every path that destroys the invocation records without
+// completing them: makeDormant (terminateThread / exitCurrent / invalid-jump
+// / pc==0 exit all land here) and deleteThread (direct record erase).
+void EeScheduler::releaseMainStackUsers(const GuestThread &item)
+{
+    for (const GuestInvocation &invocation : item.invocations)
+    {
+        if (invocation.usesMainStack && m_mainStackUsers > 0)
+        {
+            --m_mainStackUsers;
+        }
+    }
+}
+
 void EeScheduler::makeDormant(GuestThread &item)
 {
+    // M5-T11 fix: the invocations being cleared may still be live on the
+    // MAIN thread's stack - release their freeze count first or a thread
+    // destroyed mid-callback wedges main forever.
+    releaseMainStackUsers(item);
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;

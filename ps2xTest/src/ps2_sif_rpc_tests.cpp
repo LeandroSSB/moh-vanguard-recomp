@@ -6,6 +6,7 @@
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -205,6 +206,83 @@ namespace
         ++g_m5t2HandlerRuns;
         ctx->pc = 0u;
         runtime->eeScheduler().signalSemaphore(g_m5t2SemaphoreId, true);
+    }
+
+    // M5-T11 fix round: freeze-behavior capture area. Drives the fallback
+    // (usesMainStack) invocation path end to end: main parks on a semaphore,
+    // a stackless dispatcher-thread callback binds below main's suspended
+    // $sp, wakes main (Ready while the callback is live), parks mid-frame
+    // (the loader cid-1 pattern), and an alarm-borne releaser either
+    // releases the park or destroys the owning thread outright.
+    constexpr uint32_t K_M5T11FIX_WAIT_PC = 0x00160740u;
+    constexpr uint32_t K_M5T11FIX_RESUME_PC = 0x00160750u;
+    constexpr uint32_t K_M5T11FIX_HANDLER_PC = 0x00160760u;
+    constexpr uint32_t K_M5T11FIX_RELEASE_PC = 0x00160770u;
+    std::vector<std::string> g_m5t11FixTrace;
+    uint32_t g_m5t11FixHandlerSp = 0;
+    int g_m5t11FixParkedTid = 0;
+    int g_m5t11FixSemaWake = 0;
+    int g_m5t11FixSemaRelease = 0;
+    bool g_m5t11FixTerminateOwner = false;
+
+    void m5t11FixWaitMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_m5t11FixSemaWake = scheduler.createSemaphore(0, 1, 0u, 0u);
+        g_m5t11FixSemaRelease = scheduler.createSemaphore(0, 1, 0u, 0u);
+        // The FALLBACK invocation: no explicit stack, so it is drained by a
+        // stackless dispatcher thread and must bind below main's suspended
+        // $sp (GuestInvocation::usesMainStack).
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::HleCall;
+        invocation.context.pc = K_M5T11FIX_HANDLER_PC;
+        setRegU32(invocation.context, 31, 0u);
+        invocation.onComplete = [](const R5900Context &, R5900Context &)
+        {
+            g_m5t11FixTrace.push_back("pop");
+        };
+        scheduler.queueInvocation(std::move(invocation));
+        ctx->pc = K_M5T11FIX_RESUME_PC;
+        scheduler.waitSemaphore(g_m5t11FixSemaWake); // parks main
+    }
+
+    void m5t11FixFallbackHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_m5t11FixTrace.push_back("handler");
+        g_m5t11FixHandlerSp = ::getRegU32(ctx, 29);
+        g_m5t11FixParkedTid = scheduler.currentThreadId();
+        // Arm the releaser BEFORE waking main so it fires while this
+        // callback is parked mid-frame.
+        scheduler.setAlarm(16u, K_M5T11FIX_RELEASE_PC, 0u, 0u, 0u);
+        // Wake main: it becomes Ready WHILE this invocation is still live.
+        scheduler.signalSemaphore(g_m5t11FixSemaWake, true);
+        ctx->pc = 0u; // completion when the parked frame unwinds
+        scheduler.waitSemaphore(g_m5t11FixSemaRelease); // parks mid-frame
+    }
+
+    void m5t11FixReleaseHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_m5t11FixTrace.push_back("release");
+        if (g_m5t11FixTerminateOwner)
+        {
+            // Destroy the parked owner WITH its live main-stack invocation.
+            uint32_t ownedStack = 0u;
+            scheduler.terminateThread(g_m5t11FixParkedTid, ownedStack, true);
+        }
+        else
+        {
+            scheduler.signalSemaphore(g_m5t11FixSemaRelease, true);
+        }
+        ctx->pc = 0u;
+    }
+
+    void m5t11FixMainResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_m5t11FixTrace.push_back("main");
+        ctx->pc = 0u;
+        runtime->requestStop();
     }
 
     // Runs the scheduler on a worker thread with a hard watchdog so a missing
@@ -852,6 +930,77 @@ void register_ps2_sif_rpc_tests()
             t.Equals(g_m5t11HandlerSp, kMainSp,
                      "the invocation must be bound to the owner's suspended sp (the T7 block "
                      "stacks march down through the game's malloc arena)");
+        });
+
+        // M5-T11 fix: the freeze must hold main out of schedule while a
+        // fallback (usesMainStack) callback is parked mid-frame, release it
+        // the moment the callback pops, and still let the draining thread run
+        // when it shares main's priority queue (the loader consumer pattern).
+        // RED with the freeze disabled: main is selected while the callback
+        // is live ("main" traced before "pop").
+        tc.Run("main stays frozen while a live main-stack callback is parked mid-frame", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kMainSp = 0x01FFF000u; // live main-thread sp (top-of-RAM 32 KiB stack)
+
+            env.runtime.registerFunction(K_M5T11FIX_WAIT_PC, m5t11FixWaitMain);
+            env.runtime.registerFunction(K_M5T11FIX_RESUME_PC, m5t11FixMainResume);
+            env.runtime.registerFunction(K_M5T11FIX_HANDLER_PC, m5t11FixFallbackHandler);
+            env.runtime.registerFunction(K_M5T11FIX_RELEASE_PC, m5t11FixReleaseHandler);
+
+            g_m5t11FixTrace.clear();
+            g_m5t11FixHandlerSp = 0u;
+            g_m5t11FixParkedTid = 0;
+            g_m5t11FixTerminateOwner = false;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T11FIX_WAIT_PC;
+            setRegU32(mainContext, 29, kMainSp); // main suspended mid-pump at this sp
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "the run must end on its own: the parked callback drains and main resumes");
+
+            t.Equals(g_m5t11FixHandlerSp, kMainSp,
+                     "the stackless-owner invocation must bind below main's suspended sp (the fallback path)");
+            const auto mainAt = std::find(g_m5t11FixTrace.begin(), g_m5t11FixTrace.end(), "main");
+            const auto popAt = std::find(g_m5t11FixTrace.begin(), g_m5t11FixTrace.end(), "pop");
+            t.IsTrue(mainAt != g_m5t11FixTrace.end(), "main must run again after the callback completes");
+            t.IsTrue(popAt != g_m5t11FixTrace.end(), "the main-stack invocation must complete (pop)");
+            t.IsTrue(mainAt != g_m5t11FixTrace.end() && popAt != g_m5t11FixTrace.end() && mainAt > popAt,
+                     "main must be scheduled only AFTER the main-stack invocation pops "
+                     "(it was Ready and frozen the whole time the callback was parked)");
+        });
+
+        // M5-T11 fix: the freeze count must be accounted on EVERY destruction
+        // path. A thread destroyed while holding a live usesMainStack
+        // invocation (terminateThread -> makeDormant clears invocations
+        // without completing them) must release the count, or main is wedged
+        // forever - silent, no timeout. RED with the accounting missing: the
+        // watchdog has to stop the run.
+        tc.Run("main-stack freeze count is released when the owning thread is destroyed mid-callback", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kMainSp = 0x01FFF000u;
+
+            env.runtime.registerFunction(K_M5T11FIX_WAIT_PC, m5t11FixWaitMain);
+            env.runtime.registerFunction(K_M5T11FIX_RESUME_PC, m5t11FixMainResume);
+            env.runtime.registerFunction(K_M5T11FIX_HANDLER_PC, m5t11FixFallbackHandler);
+            env.runtime.registerFunction(K_M5T11FIX_RELEASE_PC, m5t11FixReleaseHandler);
+
+            g_m5t11FixTrace.clear();
+            g_m5t11FixHandlerSp = 0u;
+            g_m5t11FixParkedTid = 0;
+            g_m5t11FixTerminateOwner = true;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T11FIX_WAIT_PC;
+            setRegU32(mainContext, 29, kMainSp);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "destroying the parked owner must unfreeze main (no leaked m_mainStackUsers)");
+
+            const auto mainAt = std::find(g_m5t11FixTrace.begin(), g_m5t11FixTrace.end(), "main");
+            t.IsTrue(mainAt != g_m5t11FixTrace.end(), "main must run again after the owner is destroyed");
         });
 
         // The reply direction (cid=1) is the game's own completion traffic:
