@@ -49,8 +49,7 @@ namespace
     };
 
     std::atomic<uint32_t> g_lastIntcArg{0u};
-    constexpr uint32_t kIdleVSyncWaitPc = 0x00160000u;
-    constexpr uint32_t kVSyncWaitPc = 0x00160100u;
+    constexpr uint32_t kIdleVSyncWaitPc = 0x00160000u;    constexpr uint32_t kVSyncWaitPc = 0x00160100u;
     constexpr uint32_t kVSyncResumePc = 0x00160110u;
     constexpr uint32_t kIrqWaitPc = 0x00160200u;
     constexpr uint32_t kIrqResumePc = 0x00160210u;
@@ -80,6 +79,31 @@ namespace
     constexpr uint32_t kVif1ChannelChcr = 0x10009000u;
     constexpr uint32_t kVif1ChannelMadr = 0x10009010u;
     constexpr uint32_t kVif1ChannelQwc = 0x10009020u;
+
+    // M5-T18: timer/alarm delivery shaping harness. The T17 capture (main
+    // 0x6A0310 out of lastGood 0x355300 = the INTC cause-10 dispatch, mid-
+    // movie) showed the timer wheel callbacks riding the very checkpoint
+    // that raised them - mid-fill, on the interrupted stack. These entries
+    // let the tests post a timer IRQ / SetAlarm from main and observe the
+    // vsync tick + bind sp the callback actually ran at.
+    constexpr uint32_t kT18TimerPostPc = 0x00160700u;
+    constexpr uint32_t kT18TimerResumePc = 0x00160710u;
+    constexpr uint32_t kT18TimerHandlerPc = 0x00160720u;
+    constexpr uint32_t kT18AlarmPostPc = 0x00160730u;
+    constexpr uint32_t kT18AlarmResumePc = 0x00160740u;
+    constexpr uint32_t kT18AlarmHandlerPc = 0x00160750u;
+    // Main parks shallow-but-deep enough that the pre-fix stackless
+    // fallback finds headroom and binds AT this sp (inside main's below-sp
+    // band - the T13/T14/T17 poison band), so the carve assertion
+    // discriminates the bind shape too.
+    constexpr uint32_t kT18MainSp = 0x1FFFE000u;
+
+    std::atomic<bool> g_t18Resumed{false};
+    uint32_t g_t18PostVsync = 0u;
+    uint32_t g_t18HandlerVsync = 0u;
+    uint32_t g_t18HandlerSp = 0u;
+    uint32_t g_t18HandlerArg = 0u;
+    int g_t18SemaId = 0;
 
     std::atomic<uint32_t> g_vifDmaDmacCause{0u};
     std::atomic<uint32_t> g_vifDmaDmacArg{0u};
@@ -384,6 +408,57 @@ namespace
         g_dispatchTrace.push_back(3);
         g_resumedResult = getRegS32(*ctx, 2);
         g_timer2Resumed.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // M5-T18: the timer/alarm callback under observation - it records the
+    // vsync tick and the bound sp it ran at, then releases the waiter.
+    void t18TimerHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_t18HandlerVsync = static_cast<uint32_t>(scheduler.currentVSyncTick());
+        g_t18HandlerSp = getRegU32(ctx, 29);
+        scheduler.signalSemaphore(g_t18SemaId, true);
+        ctx->pc = 0u;
+    }
+
+    void t18AlarmHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_t18HandlerVsync = static_cast<uint32_t>(scheduler.currentVSyncTick());
+        g_t18HandlerSp = getRegU32(ctx, 29);
+        g_t18HandlerArg = getRegU32(ctx, 6);
+        scheduler.signalSemaphore(g_t18SemaId, true);
+        ctx->pc = 0u;
+    }
+
+    void t18TimerPost(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_t18SemaId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        scheduler.addIrqHandler(false, 10u, kT18TimerHandlerPc, true, 0u, 0u, 0u);
+        g_t18PostVsync = static_cast<uint32_t>(scheduler.currentVSyncTick());
+        // The same delivery site processPendingEvents uses for the EE timer
+        // counters (dispatchIrq(false, 9u + timer)).
+        scheduler.dispatchIrq(false, 10u);
+        ctx->pc = kT18TimerResumePc;
+        scheduler.waitSemaphore(g_t18SemaId);
+    }
+
+    void t18AlarmPost(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_t18SemaId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        (void)scheduler.setAlarm(1u, kT18AlarmHandlerPc, 0xBEEFu, 0u, 0u);
+        g_t18PostVsync = static_cast<uint32_t>(scheduler.currentVSyncTick());
+        ctx->pc = kT18AlarmResumePc;
+        scheduler.waitSemaphore(g_t18SemaId);
+    }
+
+    void t18Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_t18Resumed.store(true, std::memory_order_release);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -787,6 +862,126 @@ void register_ps2_runtime_interrupt_tests()
                      "Timer2 flow should run wait, interrupt handler, then the resumed thread");
             t.Equals(g_resumedResult, g_testSemaphoreId,
                      "the Timer2 handler should hand the semaphore directly to the waiter");
+        });
+
+        // M5-T18: the timer INTC callback (the 0x355300 class - the game's
+        // wheel dispatcher, walk of 0x5109F0) must ride the vsync boundary,
+        // never the checkpoint that raised it. The T17 capture measured the
+        // unshaped delivery dying mid-movie: main 0x6A0310 out of lastGood
+        // 0x355300 at vsync 197 - the dispatcher executed mid-fill at an
+        // arbitrary checkpoint and the game's own dispatcher runs due wheel
+        // continuations on the interrupted stack, so the callback window
+        // interleaved the movie pipeline's fill window (the same ordering
+        // class the T16 SIF-reply defer closed). Shaped delivery = promote
+        // on the next VBlankStart, with the T16 carve pre-bind so the frame
+        // never lands in main's below-poison band via the stackless
+        // fallback.
+        tc.Run("a timer INTC handler invocation is delivered on a vsync boundary, never inline", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kT18TimerPostPc, t18TimerPost);
+            env.runtime.registerFunction(kT18TimerResumePc, t18Resume);
+            env.runtime.registerFunction(kT18TimerHandlerPc, t18TimerHandler);
+
+            g_t18Resumed.store(false, std::memory_order_release);
+            g_t18PostVsync = 0u;
+            g_t18HandlerVsync = 0u;
+            g_t18HandlerSp = 0u;
+            g_t18SemaId = 0;
+            R5900Context mainContext{};
+            mainContext.pc = kT18TimerPostPc;
+            setRegU32(mainContext, 29, kT18MainSp);
+            std::atomic<bool> schedulerThrew{false};
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+            });
+
+            const bool resumed = waitUntil([]()
+            {
+                return g_t18Resumed.load(std::memory_order_acquire);
+            }, std::chrono::milliseconds(300));
+            if (!resumed)
+            {
+                env.runtime.requestStop();
+            }
+            gameThread.join();
+
+            t.IsTrue(resumed, "the shaped timer delivery must still wake the waiter");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "the timer delivery path should not throw");
+            t.Equals(g_t18HandlerVsync, g_t18PostVsync + 1u,
+                     "the timer INTC callback ran INLINE at the post checkpoint - the wheel "
+                     "dispatcher executes mid-fill on the interrupted stack (the T17 capture: "
+                     "main 0x6A0310 out of 0x355300 at vsync 197) instead of on the vsync boundary");
+            t.Equals(g_t18HandlerSp, kMainInvocationCarveTop - 0x10u,
+                     "the timer callback must bind on the dedicated carve, not (via the "
+                     "stackless fallback) inside main's below-sp band - the T13/T14/T17 "
+                     "poison band");
+        });
+
+        // M5-T18: the same shape for SetAlarm callbacks (the kernel alarm
+        // wheel): the fire may happen at any checkpoint, but the callback
+        // must be delivered on the next vsync boundary with the carve
+        // pre-bind - Vanguard runs 4k+ alarm callbacks per session and the
+        // T3 decode named "alarm/timer invocations unshaped".
+        tc.Run("a SetAlarm callback is delivered on a vsync boundary, never inline", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kT18AlarmPostPc, t18AlarmPost);
+            env.runtime.registerFunction(kT18AlarmResumePc, t18Resume);
+            env.runtime.registerFunction(kT18AlarmHandlerPc, t18AlarmHandler);
+
+            g_t18Resumed.store(false, std::memory_order_release);
+            g_t18PostVsync = 0u;
+            g_t18HandlerVsync = 0u;
+            g_t18HandlerSp = 0u;
+            g_t18HandlerArg = 0u;
+            g_t18SemaId = 0;
+            R5900Context mainContext{};
+            mainContext.pc = kT18AlarmPostPc;
+            setRegU32(mainContext, 29, kT18MainSp);
+            std::atomic<bool> schedulerThrew{false};
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+            });
+
+            const bool resumed = waitUntil([]()
+            {
+                return g_t18Resumed.load(std::memory_order_acquire);
+            }, std::chrono::milliseconds(300));
+            if (!resumed)
+            {
+                env.runtime.requestStop();
+            }
+            gameThread.join();
+
+            t.IsTrue(resumed, "the shaped alarm delivery must still wake the waiter");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "the alarm delivery path should not throw");
+            t.Equals(g_t18HandlerArg, 0xBEEFu, "the alarm callback must still receive its argument");
+            t.Equals(g_t18HandlerVsync, g_t18PostVsync + 1u,
+                     "the SetAlarm callback ran INLINE at the fire checkpoint (vsync 0: the "
+                     "64 us alarm fired long before the first VBlank) - the unshaped alarm "
+                     "delivery the T17 capture implicated");
+            t.Equals(g_t18HandlerSp, kMainInvocationCarveTop - 0x10u,
+                     "the alarm callback must bind on the dedicated carve, not inside main's "
+                     "below-sp band");
         });
 
         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
