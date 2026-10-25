@@ -51,6 +51,11 @@ namespace
     }
 } // namespace
 
+// Vanguard M5-T13 probe gate (defined below, next to ps2xM5T11Enabled;
+// file-local forward declaration so ps2_runtime.h stays untouched - no
+// gen unity rebuild).
+bool ps2xM5T13Enabled();
+
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
 #define EM_MIPS 8            // MIPS architecture
@@ -1465,6 +1470,71 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         else
         {
             ps2xM5T11VerifyDispatcherSlot(rdram, sourcePc);
+        }
+    }
+
+    // Vanguard M5-T13 probe: sub_00310CC0 (the loader's sema-veneer
+    // dispatcher) died at its epilogue (0x310D30: ld ra,0(sp); jr ra) with
+    // $sp 0x80 ABOVE its entry frame - the wild ra was a caller-frame word
+    // read at the wrong sp. Pair every entry into 0x310CC0 with (a) any
+    // return INTO the epilogue 0x310D30 (the jalr'd veneer/callback
+    // returned) and (b) the frame's own Return from 0x310D40 (the jr ra;
+    // sp is recorded post-delay-slot, so OK means back at the caller's
+    // entry sp). The point where sp stops matching entry-0x30 names the
+    // stack mover. Opt-in PS2X_ENABLE_M5T13=1, zero cost when off.
+    if (ps2xM5T13Enabled())
+    {
+        static uint32_t s_m5t13EntrySp[8] = {};
+        static int32_t s_m5t13Depth = 0;
+        static uint32_t s_m5t13Entries = 0;
+        static uint32_t s_m5t13Logged = 0;
+        const uint32_t sp13 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
+        const bool isCall13 = kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall;
+        const bool anomaly13 = targetPc == 0x310D30u || (kind == GuestBranchKind::Return && sourcePc == 0x310D40u);
+        if (s_m5t13Logged < 512u && (s_m5t13Entries < 64u || anomaly13))
+        {
+            if (isCall13 && targetPc == 0x310CC0u)
+            {
+                const int32_t depth = s_m5t13Depth < 8 ? s_m5t13Depth : 7;
+                s_m5t13EntrySp[depth] = sp13;
+                if (s_m5t13Depth < 8)
+                {
+                    ++s_m5t13Depth;
+                }
+                ++s_m5t13Entries;
+                ++s_m5t13Logged;
+                RUNTIME_LOG("[m5t13-cc0] entry #" << std::dec << s_m5t13Entries
+                            << " depth=" << depth
+                            << " sp=0x" << std::hex << sp13
+                            << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+                            << std::dec << std::endl);
+            }
+            else if (!isCall13 && targetPc == 0x310D30u)
+            {
+                const int32_t depth = (s_m5t13Depth > 0 ? s_m5t13Depth : 1) - 1;
+                const uint32_t frameSp = s_m5t13EntrySp[depth] - 0x30u;
+                ++s_m5t13Logged;
+                RUNTIME_LOG("[m5t13-cc0] veneer-ret depth=" << std::dec << depth
+                            << " sp=0x" << std::hex << sp13
+                            << " frameSp=0x" << frameSp
+                            << (sp13 == frameSp ? " OK" : " SP-MOVED")
+                            << std::dec << std::endl);
+            }
+            else if (kind == GuestBranchKind::Return && sourcePc == 0x310D40u)
+            {
+                const int32_t depth = (s_m5t13Depth > 0 ? s_m5t13Depth : 1) - 1;
+                const uint32_t callerSp = s_m5t13EntrySp[depth];
+                if (s_m5t13Depth > 0)
+                {
+                    --s_m5t13Depth;
+                }
+                ++s_m5t13Logged;
+                RUNTIME_LOG("[m5t13-cc0] epilogue-ret depth=" << std::dec << depth
+                            << " sp=0x" << std::hex << sp13
+                            << " callerSp=0x" << callerSp
+                            << (sp13 == callerSp ? " OK" : " SP-MOVED")
+                            << std::dec << std::endl);
+            }
         }
     }
 
@@ -3201,6 +3271,16 @@ bool ps2xM5T11Enabled()
     static const bool s_enabled = []()
     {
         const char *env = std::getenv("PS2X_ENABLE_M5T11");
+        return env != nullptr && env[0] == '1';
+    }();
+    return s_enabled;
+}
+
+bool ps2xM5T13Enabled()
+{
+    static const bool s_enabled = []()
+    {
+        const char *env = std::getenv("PS2X_ENABLE_M5T13");
         return env != nullptr && env[0] == '1';
     }();
     return s_enabled;
