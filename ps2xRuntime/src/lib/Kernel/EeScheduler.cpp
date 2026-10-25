@@ -305,7 +305,7 @@ void EeScheduler::run()
                 renewTimeSlice();
                 if (getRegU32(&invocation.context, 29) == 0u)
                 {
-                    SET_GPR_U32(&invocation.context, 29, invocationEntrySp(*owner));
+                    bindInvocationStack(*owner, invocation);
                 }
                 owner->invocations.push_back(std::move(invocation));
             }
@@ -383,6 +383,10 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                if (completed.usesMainStack && m_mainStackUsers > 0)
+                {
+                    --m_mainStackUsers;
+                }
                 if (completed.onComplete)
                 {
                     try
@@ -409,7 +413,7 @@ void EeScheduler::run()
             m_pendingInvocations.pop_front();
             if (getRegU32(&invocation.context, 29) == 0u)
             {
-                SET_GPR_U32(&invocation.context, 29, invocationEntrySp(*running));
+                bindInvocationStack(*running, invocation);
             }
             running->invocations.push_back(std::move(invocation));
             continue;
@@ -1384,7 +1388,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assert(owner != nullptr);
     if (getRegU32(&invocation.context, 29) == 0u)
     {
-        SET_GPR_U32(&invocation.context, 29, invocationEntrySp(*owner));
+        bindInvocationStack(*owner, invocation);
     }
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
@@ -1402,7 +1406,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     {
         if (getRegU32(&it->context, 29) == 0u)
         {
-            SET_GPR_U32(&it->context, 29, invocationEntrySp(*owner));
+            bindInvocationStack(*owner, *it);
         }
         it->sequence = ++m_invocationSequence;
         owner->invocations.push_back(std::move(*it));
@@ -1429,7 +1433,16 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
 // suspended $sp is the base every interrupt callback would use on real
 // hardware; the reserved-block path survives only for threads that have
 // no guest stack at all (the internal dispatcher threads).
-uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner)
+void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invocation)
+{
+    if (getRegU32(&invocation.context, 29) != 0u)
+    {
+        return; // the caller already bound an explicit stack
+    }
+    SET_GPR_U32(&invocation.context, 29, invocationEntrySp(owner, invocation.usesMainStack));
+}
+
+uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMainStack)
 {
     assertExecutor();
     // The ACTIVE context: the thread's own suspended $sp, or, while an
@@ -1437,6 +1450,7 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner)
     // $sp - a nested callback must push below it, exactly like a second
     // interrupt taken inside a handler on real hardware.
     const uint32_t ownSp = getRegU32(&owner.activeContext(), 29);
+    usedMainStack = false;
     if (ownSp != 0u)
     {
         uint32_t floor = 0x00100000u;
@@ -1455,17 +1469,35 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner)
         }
     }
     // Stackless owner (internal dispatcher thread): the callback still
-    // interrupted a real guest context on hardware. Run it below the MAIN
-    // thread's suspended $sp so no host block is ever carved out of the
-    // band the game's malloc arena lives in. The reserved block survives
-    // only as a degenerate last resort.
+    // interrupted a real guest context on hardware - main's, per the
+    // published snapshot. Run it below the MAIN thread's suspended $sp AND
+    // below every other live main-stack callback frame, so no host block
+    // is carved out of the band the game's malloc arena lives in. The
+    // reserved block survives only as a degenerate last resort.
     if (const GuestThread *mainThread = thread(kMainThreadId))
     {
-        const uint32_t mainSp = getRegU32(&mainThread->activeContext(), 29);
-        const uint32_t mainFloor = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
-        if (mainSp != 0u && mainSp > mainFloor && (mainSp - mainFloor) >= 0x1000u)
+        uint32_t base = getRegU32(&mainThread->activeContext(), 29);
+        for (auto &[id, candidate] : m_threads)
         {
-            return mainSp;
+            for (const GuestInvocation &live : candidate.invocations)
+            {
+                if (!live.usesMainStack)
+                {
+                    continue;
+                }
+                const uint32_t liveSp = getRegU32(&live.context, 29);
+                if (liveSp != 0u && (base == 0u || liveSp < base))
+                {
+                    base = liveSp;
+                }
+            }
+        }
+        const uint32_t mainFloor = PS2_RAM_SIZE - kAsyncCallbackStackMainReserve;
+        if (base != 0u && base > mainFloor && (base - mainFloor) >= 0x1000u)
+        {
+            usedMainStack = true;
+            ++m_mainStackUsers;
+            return base;
         }
     }
     return invocationStackTop();
@@ -1987,16 +2019,22 @@ GuestThread *EeScheduler::selectReady()
 {
     for (auto &queue : m_readyQueues)
     {
-        if (queue.empty())
+        while (!queue.empty())
         {
-            continue;
+            const int id = queue.front();
+            // M5-T11: while a callback is live on the main thread's stack, the
+            // main pump must not run - it would descend into the callback's
+            // frames (both contexts end up poisoned, pc=ra=0x100).
+            if (m_mainStackUsers > 0 && id == kMainThreadId)
+            {
+                break;
+            }
+            queue.pop_front();
+            GuestThread *selected = thread(id);
+            assert(selected != nullptr);
+            assert(selected->status == EeThreadStatus::Ready);
+            return selected;
         }
-        const int id = queue.front();
-        queue.pop_front();
-        GuestThread *selected = thread(id);
-        assert(selected != nullptr);
-        assert(selected->status == EeThreadStatus::Ready);
-        return selected;
     }
     return nullptr;
 }

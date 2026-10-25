@@ -100,6 +100,11 @@ struct GuestInvocation
     uint64_t tag = 0;
     R5900Context context{};
     std::function<void(const R5900Context &, R5900Context &)> onComplete;
+    // M5-T11: this invocation was bound below the MAIN thread's suspended
+    // $sp (stackless internal dispatcher thread). While it is live the main
+    // thread must stay unscheduled - its pump would descend straight into
+    // the callback's frames (the script-path pc=0x100 death).
+    bool usesMainStack = false;
 };
 
 struct GuestThread
@@ -352,7 +357,12 @@ public:
     // tid=1 pc=0x100 invalid-jump death). Bind guest-backed invocations to
     // the owner's suspended $sp; only threads without a guest stack (the
     // internal dispatcher threads) still use a reserved block.
-    [[nodiscard]] uint32_t invocationEntrySp(const GuestThread &owner);
+    // M5-T11: binds invocation.context.$sp (owner stack / main-stack fallback);
+    // sets invocation.usesMainStack when the fallback is taken.
+    void bindInvocationStack(GuestThread &owner, GuestInvocation &invocation);
+    [[nodiscard]] uint32_t invocationEntrySp(const GuestThread &owner, bool &usedMainStack);
+    // M5-T11: number of LIVE invocations bound to the main thread's stack.
+    int m_mainStackUsers = 0;
     [[nodiscard]] uint32_t invocationStackTop();
 
     int addIrqHandler(bool dmac,
