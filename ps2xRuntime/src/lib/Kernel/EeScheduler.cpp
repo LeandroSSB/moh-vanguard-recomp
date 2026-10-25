@@ -1473,6 +1473,34 @@ void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invoc
         return; // the caller already bound an explicit stack
     }
     SET_GPR_U32(&invocation.context, 29, invocationEntrySp(owner, invocation.usesMainStack));
+    // M5-T12: opt-in bind trace - which path bound which callback where.
+    // The tid=1 usesMainStack=true record seen frozen at pc=0 must be
+    // attributable to a bind site, not reconstructed.
+    static const bool s_m5t12Bind = []()
+    {
+        const char *env = std::getenv("PS2X_ENABLE_M5T12");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (s_m5t12Bind)
+    {
+        static const char *kBindKinds[] = {
+            "Interrupt", "Alarm", "GsCallback", "RpcCallback",
+            "SyscallOverride", "ExitHandler", "HleCall", "SifCommand",
+        };
+        const size_t kindIndex = static_cast<size_t>(invocation.kind);
+        uint32_t bandBase = 0u;
+        uint32_t bandTop = 0u;
+        const bool inBand = m_runtime.asyncCallbackStackBand(bandBase, bandTop);
+        RUNTIME_LOG("[m5t12-bind] owner=" << owner.id
+                   << " kind=" << (kindIndex < sizeof(kBindKinds) / sizeof(kBindKinds[0]) ? kBindKinds[kindIndex] : "?")
+                   << " seq=" << std::dec << invocation.sequence
+                   << " entry=0x" << std::hex << invocation.context.pc
+                   << " sp=0x" << getRegU32(&invocation.context, 29)
+                   << " ownSp=0x" << getRegU32(&owner.activeContext(), 29)
+                   << " mainStack=" << invocation.usesMainStack
+                   << " band=" << (inBand ? "1" : "0")
+                   << std::dec << std::endl);
+    }
 }
 
 uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMainStack)
@@ -1486,6 +1514,20 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMain
     usedMainStack = false;
     if (ownSp != 0u)
     {
+        // M5-T12: MAIN's own stack IS the callback stack - hardware runs the
+        // interrupt frame below the interrupted $sp on the SAME stack.
+        // main.stack records the initial $sp (SetupThread's kernel-pick
+        // lands on the stack TOP, e.g. 0x1FFFFF0), not a base, so the
+        // owner.stack floor below declines every real main $sp and routes
+        // main's OWN callbacks through the main-stack fallback - inflating
+        // m_mainStackUsers with main's own frames and wedging the freeze the
+        // first time a completed callback waits for its pop (the measured
+        // MOH Vanguard seq-509/524 post-movie stall: main Ready the whole
+        // run, reads parked at 157).
+        if (owner.id == kMainThreadId)
+        {
+            return ownSp;
+        }
         uint32_t floor = 0x00100000u;
         if (owner.stack != 0u && owner.stackSize != 0u)
         {
@@ -2076,7 +2118,14 @@ GuestThread *EeScheduler::selectReady()
             // callback (e.g. the loader consumer) may sit BEHIND main at the
             // same priority - freezing the whole queue would starve it and
             // wedge the freeze forever.
-            if (m_mainStackUsers > 0 && id == kMainThreadId)
+            // M5-T12: only a FOREIGN owner holds main out of the schedule. A
+            // MAIN-owned main-stack invocation (bound on main's own stack) is
+            // exactly the hardware interrupt frame: main must be scheduled to
+            // run/complete it (activeContext() is the invocation, so the pump
+            // is unreachable until it pops), and the completed pc=0 pop is
+            // the only thing that releases the count - freezing main on its
+            // own callback wedged the whole post-movie session.
+            if (m_mainStackUsers > 0 && id == kMainThreadId && mainStackHeldByForeignOwner())
             {
                 logMainStackFreeze();
                 continue;
@@ -2089,6 +2138,30 @@ GuestThread *EeScheduler::selectReady()
         }
     }
     return nullptr;
+}
+
+// M5-T12: the freeze must only hold main out of the schedule while a
+// FOREIGN thread's invocation lives on main's stack (a stackless dispatcher
+// thread's fallback bind - scheduling main would run the pump down into
+// those foreign frames). Main-owned invocations never qualify: main's
+// dispatch is what runs and completes them.
+bool EeScheduler::mainStackHeldByForeignOwner() const
+{
+    for (const auto &entry : m_threads)
+    {
+        if (entry.first == kMainThreadId)
+        {
+            continue;
+        }
+        for (const GuestInvocation &invocation : entry.second.invocations)
+        {
+            if (invocation.usesMainStack)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // M5-T11 fix: a wedged freeze must be diagnosable in minutes, not a silent
@@ -2105,6 +2178,36 @@ void EeScheduler::logMainStackFreeze()
     RUNTIME_LOG("[ee-sched:main-frozen] " << m_mainStackUsers
                                            << " live main-stack callback(s): main thread held out of schedule"
                                            << std::endl);
+    // M5-T12: name the parked callback(s) - kind, owning thread, and the
+    // guest pc the invocation sits at - so one log names the exact function
+    // holding main.
+    for (const auto &entry : m_threads)
+    {
+        for (const GuestInvocation &invocation : entry.second.invocations)
+        {
+            if (!invocation.usesMainStack)
+            {
+                continue;
+            }
+            static const char *kKindNames[] = {
+                "Interrupt", "Alarm", "GsCallback", "RpcCallback",
+                "SyscallOverride", "ExitHandler", "HleCall", "SifCommand",
+            };
+            const size_t kindIndex = static_cast<size_t>(invocation.kind);
+            const char *kindName = kindIndex < sizeof(kKindNames) / sizeof(kKindNames[0])
+                                       ? kKindNames[kindIndex]
+                                       : "?";
+            RUNTIME_LOG("[ee-sched:main-frozen]   parked callback tid="
+                        << entry.first << " kind=" << kindName
+                        << " seq=" << std::dec << invocation.sequence
+                        << " tag=0x" << std::hex << invocation.tag
+                        << " pc=0x" << std::hex << invocation.context.pc
+                        << " ra=0x" << getRegU32(&invocation.context, 31)
+                        << " sp=0x" << getRegU32(&invocation.context, 29)
+                        << " a0=0x" << getRegU32(&invocation.context, 4)
+                        << std::dec << std::endl);
+        }
+    }
 }
 
 void EeScheduler::makeRunning(GuestThread &item)

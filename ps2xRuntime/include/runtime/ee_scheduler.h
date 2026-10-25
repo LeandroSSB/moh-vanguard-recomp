@@ -374,6 +374,12 @@ public:
     // (makeDormant clears invocations; deleteThread erases the record) -
     // a leaked count wedges main forever, silent, no timeout.
     void releaseMainStackUsers(const GuestThread &item);
+    // M5-T12: true only when a thread OTHER than main holds a live
+    // main-stack invocation. The freeze skips main only for foreign owners -
+    // a main-owned main-stack callback must never hold main out of the
+    // schedule (main's dispatch runs and completes it; the completed pc=0
+    // pop is what releases the freeze count).
+    [[nodiscard]] bool mainStackHeldByForeignOwner() const;
     // M5-T11 fix: rate-limited (2 s) diagnostic while the freeze is actively
     // holding main out of schedule, so a wedged freeze is diagnosable.
     void logMainStackFreeze();

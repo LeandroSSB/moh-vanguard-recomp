@@ -285,6 +285,58 @@ namespace
         runtime->requestStop();
     }
 
+    // M5-T12: the measured post-movie wedge (MOH Vanguard seq-509/524). The
+    // game's SetupThread(stack=0xFFFFFFFF) call makes the runtime record the
+    // stack TOP (0x1FFFFF0) as main's stack, so invocationEntrySp's floor
+    // check (ownSp > owner.stack) declines every real main $sp and routes
+    // MAIN'S OWN callback binds through the main-stack fallback
+    // (usesMainStack=true, ++m_mainStackUsers) even though they run on
+    // main's own stack. The first main-owned callback that COMPLETES
+    // (pc=0, the ra=0 return convention) while a timer reschedule puts main
+    // back in the ready queue then wedges the T11 freeze forever: only
+    // main's dispatch can pop the completed invocation, and selectReady
+    // refuses to schedule main while the count is up. On hardware the
+    // interrupted thread resumes INSIDE its interrupt frame - a callback on
+    // main's own stack must never hold main out of the schedule.
+    constexpr uint32_t K_M5T12_PUMP_PC = 0x00160780u;
+    constexpr uint32_t K_M5T12_HANDLER_PC = 0x00160790u;
+    std::vector<std::string> g_m5t12Trace;
+    bool g_m5t12Armed = false;
+
+    void m5t12Pump(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (!g_m5t12Armed)
+        {
+            g_m5t12Armed = true;
+            g_m5t12Trace.push_back("pump");
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::SifCommand;
+            invocation.tag = 1u; // cid-1, the loader completion channel
+            invocation.context.pc = K_M5T12_HANDLER_PC;
+            setRegU32(invocation.context, 31, 0u); // creator's ra=0 return convention
+            invocation.onComplete = [](const R5900Context &, R5900Context &)
+            {
+                g_m5t12Trace.push_back("pop");
+            };
+            scheduler.queueInvocation(std::move(invocation));
+            ctx->pc = K_M5T12_PUMP_PC; // the real pump loops here
+            return;
+        }
+        g_m5t12Trace.push_back("main");
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void m5t12Handler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_m5t12Trace.push_back("handler");
+        // The timer-driven reschedule the game hit: main goes back to the
+        // ready queue while this callback is live on its stack.
+        runtime->eeScheduler().rotateReadyQueue(0, false);
+        ctx->pc = 0u; // the callback completed (ra=0 return convention)
+    }
+
     // Runs the scheduler on a worker thread with a hard watchdog so a missing
     // completion fails the test instead of hanging the suite.
     bool m5t2RunSchedulerWithWatchdog(TestEnv &env)
@@ -1001,6 +1053,48 @@ void register_ps2_sif_rpc_tests()
 
             const auto mainAt = std::find(g_m5t11FixTrace.begin(), g_m5t11FixTrace.end(), "main");
             t.IsTrue(mainAt != g_m5t11FixTrace.end(), "main must run again after the owner is destroyed");
+        });
+
+        // M5-T12: a main-OWNED callback (bound on main's own stack after the
+        // game's SetupThread(stack=0xFFFFFFFF) records the stack top as
+        // main's stack) must never hold main out of the schedule - the
+        // completed invocation's pop lives under main's dispatch, so the
+        // freeze would wait on main forever (the measured seq-509/524
+        // post-movie stall: reads parked at 157, main Ready the whole run).
+        tc.Run("a completed main-owned main-stack callback must not wedge main (SetupThread floor)", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kMainSp = 0x01FFF000u; // live main-thread sp
+
+            env.runtime.registerFunction(K_M5T12_PUMP_PC, m5t12Pump);
+            env.runtime.registerFunction(K_M5T12_HANDLER_PC, m5t12Handler);
+
+            g_m5t12Trace.clear();
+            g_m5t12Armed = false;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T12_PUMP_PC;
+            setRegU32(mainContext, 29, kMainSp);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            // The game's own SetupThread call (System.cpp log:
+            // "stack=0xffffffff stackSize=0x28000 -> sp=0x1fffff0") - it
+            // records the stack TOP as main.stack, poisoning the floor the
+            // bind uses for main.
+            setRegU32(env.ctx, 4, 0x5BA670u);   // gp
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu); // stack: kernel-pick
+            setRegU32(env.ctx, 6, 0x28000u);    // stack size
+            setRegU32(env.ctx, 29, kMainSp);
+            SetupThread(env.rdram.data(), &env.ctx, &env.runtime);
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "the run must end on its own: the completed main-owned callback pops and main resumes");
+
+            const auto popAt = std::find(g_m5t12Trace.begin(), g_m5t12Trace.end(), "pop");
+            const auto mainAt = std::find(g_m5t12Trace.begin(), g_m5t12Trace.end(), "main");
+            t.IsTrue(popAt != g_m5t12Trace.end(), "the main-owned invocation must complete (pop)");
+            t.IsTrue(mainAt != g_m5t12Trace.end(), "main must run again after the callback completes");
+            t.IsTrue(popAt != g_m5t12Trace.end() && mainAt != g_m5t12Trace.end() && popAt < mainAt,
+                     "main's pump must resume only after the callback pops (the freeze still orders them)");
         });
 
         // The reply direction (cid=1) is the game's own completion traffic:

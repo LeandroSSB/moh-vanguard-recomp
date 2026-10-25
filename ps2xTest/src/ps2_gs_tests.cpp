@@ -4146,7 +4146,7 @@ void register_ps2_gs_tests()
                      "second interlaced VBlank should report odd field");
         });
 
-        tc.Run("sceGsSyncVCallback runs as a scheduler invocation on its callback stack", [](TestCase &t)
+        tc.Run("sceGsSyncVCallback runs as a scheduler invocation on the owner's own stack", [](TestCase &t)
         {
             g_gsSyncCallbackHits.store(0u, std::memory_order_relaxed);
             g_gsSyncCallbackLastTick.store(0u, std::memory_order_relaxed);
@@ -4175,10 +4175,14 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
-                     "callback invocation should use the reserved async stack pool");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
-                     "callback invocation must not reuse the caller stack");
+            // M5-T12: the invocation binds on the OWNING thread's own stack -
+            // hardware runs the VBlank interrupt frame just below the
+            // interrupted $sp (the T7 reserved-pool doctrine was replaced by
+            // the owner-stack binding in T11 and completed by the main-owned
+            // case in T12: main's own callbacks must never route through the
+            // fallback, whose freeze count wedged the post-movie session).
+            t.Equals(g_gsSyncCallbackSp.load(std::memory_order_acquire), kGsCallbackCallerSp,
+                     "callback invocation should bind at the interrupted owner's own $sp");
         });
 
         tc.Run("GS T4HL/T4HH shared-plane upload preserves both index planes via RMW", [](TestCase &t)
