@@ -15,6 +15,19 @@
 
 namespace
 {
+    // M5-T12: opt-in trace (PS2X_ENABLE_M5T12=1) for the main-stack callback
+    // lifecycle - binds, pops, and the freeze - so a poisoned return can be
+    // matched against the callback that owned the stack region.
+    bool ps2xM5T12Enabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *env = std::getenv("PS2X_ENABLE_M5T12");
+            return env != nullptr && env[0] == '1';
+        }();
+        return s_enabled;
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -391,6 +404,22 @@ void EeScheduler::run()
                 if (completed.usesMainStack && m_mainStackUsers > 0)
                 {
                     --m_mainStackUsers;
+                }
+                // M5-T12: the pop is the exact moment a main-stack callback's
+                // frames stop being live - and the moment the pump may
+                // descend back onto that stack region. The trace names every
+                // pop so a poisoned return (pc=ra=0x100 in a frame below the
+                // pump sp) can be matched against the callback that owned
+                // the region.
+                if (ps2xM5T12Enabled() && (completed.usesMainStack || running->id == kMainThreadId))
+                {
+                    RUNTIME_LOG("[m5t12-pop] tid=" << running->id
+                               << " kind=" << static_cast<int>(completed.kind)
+                               << " seq=" << std::dec << completed.sequence
+                               << " pc=0x" << std::hex << completed.context.pc
+                               << " sp=0x" << getRegU32(&completed.context, 29)
+                               << " mainStack=" << completed.usesMainStack
+                               << std::dec << std::endl);
                 }
                 if (completed.onComplete)
                 {
@@ -1476,12 +1505,7 @@ void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invoc
     // M5-T12: opt-in bind trace - which path bound which callback where.
     // The tid=1 usesMainStack=true record seen frozen at pc=0 must be
     // attributable to a bind site, not reconstructed.
-    static const bool s_m5t12Bind = []()
-    {
-        const char *env = std::getenv("PS2X_ENABLE_M5T12");
-        return env != nullptr && env[0] == '1';
-    }();
-    if (s_m5t12Bind)
+    if (ps2xM5T12Enabled())
     {
         static const char *kBindKinds[] = {
             "Interrupt", "Alarm", "GsCallback", "RpcCallback",
