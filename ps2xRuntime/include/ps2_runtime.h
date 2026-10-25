@@ -233,12 +233,15 @@ inline constexpr uint32_t kAsyncCallbackStackMainReserve = 0x8000u;
 // a fixed band INSIDE main's declared stack (SetupThread stack=-1,
 // size=0x28000 -> [0x1FD7FF0, 0x1FFFFF0]) that sits above the game's
 // static arena top (0x1FD81C0, the M2 memory-map decode) and below main's
-// observed live sp floor (0x1FFB840 across every m5 run log): the game's
-// below-sp scratch writes (the T14 filename builder on tid3, measured dsts
-// 0x1FFF260/0x1FFF4A0) provably never reach it (0 measured [t11-copy] dsts
-// below 0x1FFB900).
-inline constexpr uint32_t kMainInvocationCarveBase = 0x01FE0000u;
-inline constexpr uint32_t kMainInvocationCarveTop = 0x01FF8000u;
+// measured parks: steady-state floor 0x1FFB840 across every m5 run log,
+// plus the movie-end deep park 0x1FEF120/0x1FEF330 that the carve-guard
+// measured in the T15 verification run (the first carve top 0x1FF8000
+// overlapped THAT park). The game's builder scratch (tid3, measured dsts
+// 0x1FFF260/0x1FFF4A0; 0 [t11-copy] dsts below 0x1FFB900) never reaches the
+// band: the top keeps 0xF120 under the deepest park, the base 0xE40 over the
+// arena top.
+inline constexpr uint32_t kMainInvocationCarveBase = 0x01FD9000u;
+inline constexpr uint32_t kMainInvocationCarveTop = 0x01FE0000u;
 // SetupThread's kernel-pick anchor (stack=-1, size=0x28000) records main's
 // declared stack region as [anchor - size, anchor] = [0x1FD7FF0, 0x1FFFFF0]
 // (T13-corrected metadata): the carve and the carve guard are scoped to it.

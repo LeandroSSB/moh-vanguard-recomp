@@ -1574,8 +1574,11 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMain
         // (SetupThread stack=-1, size=0x28000 -> [0x1FD7FF0,0x1FFFFF0]),
         // below main's observed live floor (0x1FFB840 across every m5 run)
         // and above the game's static arena top (0x1FD81C0): the game's
-        // scratch provably never reaches it (0 measured [t11-copy] dsts
-        // below 0x1FFB900). Main is parked while a carve frame runs, so
+        // scratch never reaches (0 measured [t11-copy] dsts below
+        // 0x1FFB900). The top keeps 0xF120 under main's DEEPEST measured
+        // park - 0x1FEF120 at the movie-end boundary (the first carve top
+        // 0x1FF8000 overlapped THAT park; the carve-guard caught main inside
+        // the band and the constants were re-derived). Main is parked while a carve frame runs, so
         // the T11 freeze does NOT apply to this path (no starvation
         // concern); foreign-owner invocations keep the T11/T12
         // owner-stack/freeze semantics unchanged. selectReady's
@@ -1703,9 +1706,10 @@ uint32_t EeScheduler::carveInvocationSp()
 void EeScheduler::guardMainCarve(uint32_t mainSp)
 {
     // Scope: main's DECLARED stack region below the carve top. Main's
-    // observed live floor across every m5 run is 0x1FFB840 (above the
-    // carve top), so a sp under 0x1FF8000 is a real descent into the
-    // carve band (or past it) - the design's known failure mode.
+    // measured parks: 0x1FFB840 steady-state across every m5 run, and
+    // 0x1FEF120 at the movie-end boundary (measured by THIS guard in the
+    // T15 verification run). A sp under the carve top is a real descent into
+    // the carve band (or past it) - the design's known failure mode.
     if (mainSp == 0u || mainSp >= kMainInvocationCarveTop ||
         mainSp < kMainInvocationStackFloor)
     {
