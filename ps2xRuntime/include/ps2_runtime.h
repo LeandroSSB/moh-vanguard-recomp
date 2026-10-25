@@ -229,6 +229,21 @@ inline constexpr uint32_t PS2_PATH_WATCH_BYTES = 0x200u;
 // callback stacks used by interrupt/alarm/SIF invocations — have to start
 // below this line.
 inline constexpr uint32_t kAsyncCallbackStackMainReserve = 0x8000u;
+// M5-T15: the dedicated defended carve for MAIN-OWNED async invocations -
+// a fixed band INSIDE main's declared stack (SetupThread stack=-1,
+// size=0x28000 -> [0x1FD7FF0, 0x1FFFFF0]) that sits above the game's
+// static arena top (0x1FD81C0, the M2 memory-map decode) and below main's
+// observed live sp floor (0x1FFB840 across every m5 run log): the game's
+// below-sp scratch writes (the T14 filename builder on tid3, measured dsts
+// 0x1FFF260/0x1FFF4A0) provably never reach it (0 measured [t11-copy] dsts
+// below 0x1FFB900).
+inline constexpr uint32_t kMainInvocationCarveBase = 0x01FE0000u;
+inline constexpr uint32_t kMainInvocationCarveTop = 0x01FF8000u;
+// SetupThread's kernel-pick anchor (stack=-1, size=0x28000) records main's
+// declared stack region as [anchor - size, anchor] = [0x1FD7FF0, 0x1FFFFF0]
+// (T13-corrected metadata): the carve and the carve guard are scoped to it.
+inline constexpr uint32_t kMainInvocationStackFloor = 0x01FD7FF0u;
+
 
 inline uint32_t ps2PathWatchPhysAddr()
 {

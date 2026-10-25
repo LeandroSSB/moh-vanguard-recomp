@@ -4159,7 +4159,7 @@ void register_ps2_gs_tests()
                      "second interlaced VBlank should report odd field");
         });
 
-        tc.Run("sceGsSyncVCallback runs as a scheduler invocation on the owner's own stack", [](TestCase &t)
+        tc.Run("sceGsSyncVCallback runs as a scheduler invocation on the dedicated defended carve", [](TestCase &t)
         {
             g_gsSyncCallbackHits.store(0u, std::memory_order_relaxed);
             g_gsSyncCallbackLastTick.store(0u, std::memory_order_relaxed);
@@ -4193,16 +4193,16 @@ void register_ps2_gs_tests()
             // game's own configuration) and returned the top-of-RDRAM anchor.
             t.Equals(g_gsSyncCallbackSetupSp.load(std::memory_order_acquire), PS2_RAM_SIZE - 0x10u,
                      "SetupThread(stack=-1) should anchor the automatic main stack at the top of RDRAM");
-            // M5-T12: the invocation binds on the OWNING thread's own stack -
-            // hardware runs the VBlank interrupt frame just below the
-            // interrupted $sp (the T7 reserved-pool doctrine was replaced by
-            // the owner-stack binding in T11 and completed by the main-owned
-            // case in T12: main's own callbacks must never route through the
-            // fallback, whose freeze count wedged the post-movie session).
-            // M5-T13: this must hold WITH the kernel-managed stack metadata
-            // recorded - the bind never derives from the recorded region.
-            t.Equals(g_gsSyncCallbackSp.load(std::memory_order_acquire), kGsCallbackCallerSp,
-                     "callback invocation should bind at the interrupted owner's own $sp");
+            // M5-T12 -> M5-T15: the invocation used to bind on the OWNING
+            // thread's own stack (the T7 fallback freeze wedge was fixed in
+            // T11/T12); M5-T15 measured the below-sp band is the game's own
+            // scratch (the builder-on-tid3 poison) and moved every
+            // MAIN-OWNED bind to the dedicated defended carve - inside
+            // main's declared stack, below its observed live floor, above
+            // the game's arena top. M5-T13 still holds: the bind never
+            // derives from the recorded SetupThread region.
+            t.Equals(g_gsSyncCallbackSp.load(std::memory_order_acquire), kMainInvocationCarveTop - 0x10u,
+                     "the main-owned callback invocation should bind on the dedicated defended carve");
         });
 
         tc.Run("GS T4HL/T4HH shared-plane upload preserves both index planes via RMW", [](TestCase &t)

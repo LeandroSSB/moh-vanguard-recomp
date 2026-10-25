@@ -498,6 +498,98 @@ namespace
         runtime->requestStop();
     }
 
+    // M5-T15: the DEDICATED DEFENDED CARVE. The measured T13/T14 poison
+    // shape: a MAIN-OWNED invocation (the loader's cid-1 completion
+    // handler) binds at main's live boundary sp - INSIDE the below-sp band
+    // the game's loader filename builder (running on tid3) fills as
+    // scratch (measured builder dsts 0x1FFF260/0x1FFF4A0; main's observed
+    // live sp floor 0x1FFB840 across every m5 run; the game's static arena
+    // top 0x1FD81C0, the M2 memory-map decode). The architectural fix: a
+    // main-owned invocation (no explicit sp) binds on a FIXED carve inside
+    // main's DECLARED stack [kMainInvocationCarveBase, kMainInvocationCarveTop)
+    // that the game's scratch provably never reaches - never below main's
+    // live sp. RED pre-fix: the cid-1 SifCommand binds AT main's suspended
+    // sp (the T12 main branch) and its sd ra,0x20(sp) word lands on the
+    // canary band - the exact collision the captures measured as the
+    // movie-end poison (pc=ra=0x100). GREEN post-fix: the bind lands at
+    // the carve top and main's live window stays byte-identical.
+    constexpr uint32_t K_M5T15_PUMP_PC = 0x00160850u;
+    constexpr uint32_t K_M5T15_HANDLER_PC = 0x00160860u;
+    constexpr uint32_t K_M5T15_MAIN_SP = 0x01FFF4A0u;   // capture B's death sp region
+    constexpr uint32_t K_M5T15_WINDOW_BOTTOM = 0x01FFE000u; // canary: main's live window below sp
+    constexpr uint32_t K_M5T15_CANARY = 0x0BADCAFEu;
+    constexpr uint32_t K_M5T15_RA_MARKER = 0xC0DEC0DEu;
+    static_assert(kMainInvocationCarveTop <= K_M5T15_WINDOW_BOTTOM,
+                  "the carve must sit entirely below main's live-frame window");
+    std::vector<std::string> g_m5t15Trace;
+    bool g_m5t15Armed = false;
+    uint32_t g_m5t15SifSp = 0;
+    uint32_t g_m5t15SifRaSlot = 0;
+    uint32_t g_m5t15CanaryClobberAddr = 0;
+
+    void m5t15Pump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (!g_m5t15Armed)
+        {
+            g_m5t15Armed = true;
+            g_m5t15Trace.push_back("pump");
+            // The scratch canary: main's below-sp live window (the band the
+            // game's builder fills on tid3 while main is out of the way).
+            for (uint32_t addr = K_M5T15_WINDOW_BOTTOM; addr < K_M5T15_MAIN_SP; addr += 4u)
+            {
+                writeGuestU32(rdram, addr, K_M5T15_CANARY);
+            }
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::SifCommand;
+            invocation.tag = 1u; // cid-1, the loader completion channel (the measured main-owned traffic: 20,491 own-stack deliveries)
+            invocation.context.pc = K_M5T15_HANDLER_PC;
+            setRegU32(invocation.context, 31, 0u); // creator's ra=0 return convention
+            invocation.onComplete = [](const R5900Context &, R5900Context &)
+            {
+                g_m5t15Trace.push_back("pop");
+            };
+            // NO explicit sp - the main-owned delivery shape (queueInvocation
+            // -> the pump's pending drain binds it on MAIN's record).
+            scheduler.queueInvocation(std::move(invocation));
+            ctx->pc = K_M5T15_PUMP_PC; // the real pump loops here
+            return;
+        }
+        g_m5t15Trace.push_back("main");
+        // The poisoned-word probe, T14 pattern: main's live window must be
+        // exactly as main left it, and the handler's saved-ra slot (entry
+        // sp - 0x20, the sub_0036C1A8 sd ra,0x20(sp) slot both captures
+        // measured the builder poisoning) must still hold the marker.
+        g_m5t15CanaryClobberAddr = 0u;
+        for (uint32_t addr = K_M5T15_WINDOW_BOTTOM; addr < K_M5T15_MAIN_SP; addr += 4u)
+        {
+            uint32_t word = 0u;
+            std::memcpy(&word, rdram + addr, sizeof(uint32_t));
+            if (word != K_M5T15_CANARY)
+            {
+                g_m5t15CanaryClobberAddr = addr;
+                break;
+            }
+        }
+        g_m5t15SifRaSlot = 0u;
+        if (g_m5t15SifSp != 0u)
+        {
+            std::memcpy(&g_m5t15SifRaSlot, rdram + g_m5t15SifSp - 0x20u, sizeof(uint32_t));
+        }
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void m5t15Handler(uint8_t *rdram, R5900Context *ctx, PS2Runtime * /*runtime*/)
+    {
+        g_m5t15Trace.push_back("handler");
+        g_m5t15SifSp = ::getRegU32(ctx, 29); // the entry (bind) sp
+        // The measured handler shape: -0x40 prologue, saved ra at entry-0x20.
+        setRegU32(*ctx, 29, g_m5t15SifSp - 0x40u);
+        writeGuestU32(rdram, g_m5t15SifSp - 0x20u, K_M5T15_RA_MARKER);
+        ctx->pc = 0u; // the callback completed (ra=0 return convention)
+    }
+
     // Runs the scheduler on a worker thread with a hard watchdog so a missing
     // completion fails the test instead of hanging the suite.
     bool m5t2RunSchedulerWithWatchdog(TestEnv &env)
@@ -1107,7 +1199,19 @@ void register_ps2_sif_rpc_tests()
         // heap reaches that band) and the callback frames poisoned live game
         // data - the deterministic tid=1 pc=0x100 invalid-jump death. The
         // invocation binding must use the owner's suspended $sp.
-        tc.Run("guest invocations run on the owning thread's own stack", [](TestCase &t)
+        // M5-T11 -> M5-T15: hardware runs interrupt/SIF/RPC callbacks on the
+        // interrupted thread's OWN stack (the T7 host-reserved blocks marched
+        // DOWN from 0x1FF8000 into Vanguard's malloc arena and poisoned live
+        // game data - the deterministic tid=1 pc=0x100 invalid-jump death).
+        // M5-T15 measured the NEXT collision on that same doctrine: the
+        // owner's below-sp band is the game's own SCRATCH (the loader's
+        // filename builder on tid3 fills it while main is out of the way -
+        // the intermittent movie-end poison, pc=ra=0x100). Main-owned
+        // invocations now bind on the DEDICATED DEFENDED CARVE - the fixed
+        // band inside main's declared stack the game's scratch provably
+        // never reaches (below main's observed live floor 0x1FFB840, above
+        // the arena top 0x1FD81C0).
+        tc.Run("main-owned guest invocations run on the dedicated defended carve", [](TestCase &t)
         {
             TestEnv env;
             constexpr uint32_t kMainSp = 0x01FFF000u; // a live main-thread sp (top-of-RAM 32 KiB stack)
@@ -1140,9 +1244,9 @@ void register_ps2_sif_rpc_tests()
             const bool finished = m5t2RunSchedulerWithWatchdog(env);
             t.IsTrue(finished, "the scheduler must deliver the completion invocation");
             t.Equals(g_m5t2HandlerRuns, 1u, "the cid-1 handler should run exactly once");
-            t.Equals(g_m5t11HandlerSp, kMainSp,
-                     "the invocation must be bound to the owner's suspended sp (the T7 block "
-                     "stacks march down through the game's malloc arena)");
+            t.Equals(g_m5t11HandlerSp, kMainInvocationCarveTop - 0x10u,
+                     "the main-owned invocation must bind on the dedicated carve (M5-T15) - "
+                     "never at main's suspended sp, the below-sp band the game's builder fills");
         });
 
         // M5-T11 fix: the freeze must hold main out of schedule while a
@@ -1337,6 +1441,49 @@ void register_ps2_sif_rpc_tests()
             t.Equals(g_m5t14bSifRaSlot, K_M5T14B_RA_MARKER,
                      "the cid-1 handler's saved-ra slot was overwritten while it was parked "
                      "(the exact slot the T14 captures measured the poison in)");
+        });
+
+        // M5-T15: the dedicated defended carve. Geometry: main parked at
+        // 0x01FFF4A0 (capture B's death sp) holding a canary-filled live
+        // window below its sp; the loader's cid-1 SifCommand queued with NO
+        // explicit sp (the main-owned delivery shape). Pre-fix the bind
+        // lands AT main's suspended sp and the handler's saved-ra word
+        // lands on the canary (the T13/T14 poison collision); post-fix it
+        // must bind at the carve top - below main's live window and the
+        // game's scratch, above the arena top - and leave main's window
+        // byte-identical.
+        tc.Run("a main-owned invocation must bind on the dedicated carve, never below main's live sp", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(K_M5T15_PUMP_PC, m5t15Pump);
+            env.runtime.registerFunction(K_M5T15_HANDLER_PC, m5t15Handler);
+
+            g_m5t15Trace.clear();
+            g_m5t15Armed = false;
+            g_m5t15SifSp = 0u;
+            g_m5t15SifRaSlot = 0u;
+            g_m5t15CanaryClobberAddr = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = K_M5T15_PUMP_PC;
+            setRegU32(mainContext, 29, K_M5T15_MAIN_SP);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            const bool finished = m5t2RunSchedulerWithWatchdog(env);
+            t.IsTrue(finished, "the run must end on its own: the carve-bound callback completes and main resumes");
+
+            t.Equals(g_m5t15SifSp, kMainInvocationCarveTop - 0x10u,
+                     "the main-owned cid-1 SifCommand must bind at the carve top - not at main's "
+                     "suspended sp, inside the below-sp band the game's filename builder fills "
+                     "(the measured T13/T14 poison band; the sd-ra slot was overwritten "
+                     "in both captures)");
+            t.Equals(g_m5t15CanaryClobberAddr, 0u,
+                     "main's below-sp live-frame window was clobbered by the callback frame");
+            t.Equals(g_m5t15SifRaSlot, K_M5T15_RA_MARKER,
+                     "the handler's saved-ra slot must be intact (the exact slot the builder poisoned)");
+            const auto popAt = std::find(g_m5t15Trace.begin(), g_m5t15Trace.end(), "pop");
+            const auto mainAt = std::find(g_m5t15Trace.begin(), g_m5t15Trace.end(), "main");
+            t.IsTrue(popAt != g_m5t15Trace.end(), "the carve-bound invocation must complete (pop)");
+            t.IsTrue(mainAt != g_m5t15Trace.end(), "main must run again after the callback completes");
         });
 
         // The reply direction (cid=1) is the game's own completion traffic:

@@ -387,6 +387,32 @@ public:
     // M5-T11 fix: one-shot gate for the degenerate reserved-block fallback
     // log (see invocationEntrySp) - the T10 heap-trample risk must be loud.
     bool m_degenerateInvocationStackLogged = false;
+    // M5-T15: the dedicated defended carve for MAIN-OWNED async invocations
+    // (the T13/T14 architectural closure). The T12 rule bound main's own
+    // callbacks at main's live boundary sp - INSIDE the below-sp band the
+    // game's loader filename builder (on tid3) fills as scratch: the
+    // captures measured the builder's memcpy landing directly in the
+    // handler's saved-ra slot (pc=ra=0x100, the movie-end poison). Main
+    // now binds its invocations on the fixed carve
+    // [kMainInvocationCarveBase, kMainInvocationCarveTop) instead - inside
+    // main's DECLARED stack, below its observed live floor, above the
+    // game's arena top. Main is parked while a carve frame runs, so the
+    // T11 freeze does not apply to this path; foreign owners keep the
+    // owner-stack/freeze semantics unchanged.
+    // The next carve bind goes at the lowest live carve sp (nested frames
+    // push below the innermost live frame), or at the carve top - 0x10
+    // when the carve is idle. Returns the bind sp.
+    [[nodiscard]] uint32_t carveInvocationSp();
+    // M5-T15 guard: main's own suspended sp sampled at every scheduling
+    // decision - a sp anywhere inside main's declared stack BELOW the
+    // carve top means main descended into the carve band (the design's
+    // known failure mode): log loudly, rate-limited, naming the live
+    // carve frames - diagnosable in minutes (M3-T4 rule).
+    void guardMainCarve(uint32_t mainSp);
+    std::chrono::steady_clock::time_point m_lastCarveGuardLog{};
+    // M5-T15: one-shot gate for the carve-exhausted log (would need >90 KiB
+    // of simultaneous carve frames - never measured at 4-6 KiB/callback).
+    bool m_carveExhaustedLogged = false;
     [[nodiscard]] uint32_t invocationStackTop();
 
     int addIrqHandler(bool dmac,

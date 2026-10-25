@@ -240,6 +240,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_mainStackUsers = 0;
     m_lastMainFreezeLog = {};
     m_degenerateInvocationStackLogged = false;
+    m_carveExhaustedLogged = false;
+    m_lastCarveGuardLog = {};
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
@@ -1530,6 +1532,7 @@ void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invoc
             "SyscallOverride", "ExitHandler", "HleCall", "SifCommand",
         };
         const size_t kindIndex = static_cast<size_t>(invocation.kind);
+        const uint32_t boundSp = getRegU32(&invocation.context, 29);
         uint32_t bandBase = 0u;
         uint32_t bandTop = 0u;
         const bool inBand = m_runtime.asyncCallbackStackBand(bandBase, bandTop);
@@ -1537,9 +1540,10 @@ void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invoc
                    << " kind=" << (kindIndex < sizeof(kBindKinds) / sizeof(kBindKinds[0]) ? kBindKinds[kindIndex] : "?")
                    << " seq=" << std::dec << invocation.sequence
                    << " entry=0x" << std::hex << invocation.context.pc
-                   << " sp=0x" << getRegU32(&invocation.context, 29)
+                   << " sp=0x" << boundSp
                    << " ownSp=0x" << getRegU32(&owner.activeContext(), 29)
                    << " mainStack=" << invocation.usesMainStack
+                   << " carve=" << (boundSp >= kMainInvocationCarveBase && boundSp < kMainInvocationCarveTop ? "1" : "0")
                    << " band=" << (inBand ? "1" : "0")
                    << std::dec << std::endl);
     }
@@ -1556,19 +1560,30 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMain
     usedMainStack = false;
     if (ownSp != 0u)
     {
-        // M5-T12: MAIN's own stack IS the callback stack - hardware runs the
-        // interrupt frame below the interrupted $sp on the SAME stack.
-        // main.stack records the initial $sp (SetupThread's kernel-pick
-        // lands on the stack TOP, e.g. 0x1FFFFF0), not a base, so the
-        // owner.stack floor below declines every real main $sp and routes
-        // main's OWN callbacks through the main-stack fallback - inflating
-        // m_mainStackUsers with main's own frames and wedging the freeze the
-        // first time a completed callback waits for its pop (the measured
-        // MOH Vanguard seq-509/524 post-movie stall: main Ready the whole
-        // run, reads parked at 157).
+        // M5-T15: MAIN-OWNED invocations bind on the dedicated defended
+        // carve - NOT below main's live $sp. The T12 rule above was
+        // hardware-faithful (an interrupt frame descends below the
+        // interrupted $sp on the same stack) and put every main-owned
+        // cid-1 handler INSIDE the below-sp band the game's loader
+        // filename builder (running on tid3) fills as scratch: the T13/T14
+        // captures measured the builder's memcpy landing DIRECTLY in the
+        // handler's saved-ra slot (dst=0x1fff260/0x1fff4a0 = entry sp
+        // 0x1fff280/0x1fff4c0 - 0x20) - the intermittent pc=ra=0x100
+        // movie-end death. The carve [kMainInvocationCarveBase,
+        // kMainInvocationCarveTop) sits inside main's DECLARED stack
+        // (SetupThread stack=-1, size=0x28000 -> [0x1FD7FF0,0x1FFFFF0]),
+        // below main's observed live floor (0x1FFB840 across every m5 run)
+        // and above the game's static arena top (0x1FD81C0): the game's
+        // scratch provably never reaches it (0 measured [t11-copy] dsts
+        // below 0x1FFB900). Main is parked while a carve frame runs, so
+        // the T11 freeze does NOT apply to this path (no starvation
+        // concern); foreign-owner invocations keep the T11/T12
+        // owner-stack/freeze semantics unchanged. selectReady's
+        // carve-guard watches the known failure mode (main descending
+        // into the band) loudly.
         if (owner.id == kMainThreadId)
         {
-            return ownSp;
+            return carveInvocationSp();
         }
         uint32_t floor = 0x00100000u;
         if (owner.stack != 0u && owner.stackSize != 0u)
@@ -1632,6 +1647,99 @@ uint32_t EeScheduler::invocationEntrySp(const GuestThread &owner, bool &usedMain
                     << std::dec << std::endl);
     }
     return degenerateTop;
+}
+
+// M5-T15: the dedicated defended carve - see the declaration in
+// ee_scheduler.h and the constants in ps2_runtime.h.
+uint32_t EeScheduler::carveInvocationSp()
+{
+    assertExecutor();
+    // The next frame binds at the lowest live carve sp (the innermost live
+    // frame's adjusted $sp - a nested callback pushes below it, exactly
+    // like a second interrupt taken inside a handler), or at the carve top
+    // minus the 0x10 word-slot convention when the carve is idle. Bind
+    // order needs no separate cursor state: sequential deliveries reuse
+    // the same sp safely (strict LIFO lifetimes), nested ones see the
+    // innermost live frame's CURRENT sp in its invocation record.
+    uint32_t cursor = kMainInvocationCarveTop - 0x10u;
+    for (const auto &entry : m_threads)
+    {
+        for (const GuestInvocation &live : entry.second.invocations)
+        {
+            const uint32_t liveSp = getRegU32(&live.context, 29);
+            if (liveSp >= kMainInvocationCarveBase && liveSp < kMainInvocationCarveTop &&
+                liveSp < cursor)
+            {
+                cursor = liveSp;
+            }
+        }
+    }
+    if (cursor < kMainInvocationCarveBase + 0x400u)
+    {
+        // Exhausted: >90 KiB of simultaneous carve frames - never measured
+        // at 4-6 KiB per callback. The design's named alternative
+        // (hold-at-park) is unimplementable on the synchronous
+        // invokeCurrent delivery sites without re-wedging the T12 flow
+        // (the risk the T14 report already named), so the bind CLAMPS to
+        // the carve base: the overflow frame descends into the dead band
+        // below the carve base - still inside main's declared stack, still
+        // below main's live floor, still above the game's arena top - and
+        // the loud one-shot log makes the state attributable in minutes.
+        cursor = kMainInvocationCarveBase;
+        if (!m_carveExhaustedLogged)
+        {
+            m_carveExhaustedLogged = true;
+            RUNTIME_LOG("[ee-sched:carve-exhausted] the dedicated invocation carve [0x"
+                        << std::hex << kMainInvocationCarveBase << ",0x" << kMainInvocationCarveTop
+                        << ") is full of live frames - clamping the bind to the carve base "
+                        "(would need >90 KiB of simultaneous main-owned callback frames)"
+                        << std::dec << std::endl);
+        }
+    }
+    return cursor;
+}
+
+// M5-T15: the carve guard - see the declaration in ee_scheduler.h.
+void EeScheduler::guardMainCarve(uint32_t mainSp)
+{
+    // Scope: main's DECLARED stack region below the carve top. Main's
+    // observed live floor across every m5 run is 0x1FFB840 (above the
+    // carve top), so a sp under 0x1FF8000 is a real descent into the
+    // carve band (or past it) - the design's known failure mode.
+    if (mainSp == 0u || mainSp >= kMainInvocationCarveTop ||
+        mainSp < kMainInvocationStackFloor)
+    {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastCarveGuardLog != std::chrono::steady_clock::time_point{} &&
+        now - m_lastCarveGuardLog < std::chrono::seconds(2))
+    {
+        return;
+    }
+    m_lastCarveGuardLog = now;
+    RUNTIME_LOG("[ee-sched:carve-guard] main sp 0x" << std::hex << mainSp
+                << " entered the dedicated invocation carve band [0x"
+                << kMainInvocationCarveBase << ",0x" << kMainInvocationCarveTop
+                << ") or below it - main descended into the carve (the T15 design's "
+                   "known failure mode); live carve frames follow"
+                << std::dec << std::endl);
+    for (const auto &entry : m_threads)
+    {
+        for (const GuestInvocation &live : entry.second.invocations)
+        {
+            const uint32_t liveSp = getRegU32(&live.context, 29);
+            if (liveSp >= kMainInvocationCarveBase && liveSp < kMainInvocationCarveTop)
+            {
+                RUNTIME_LOG("[ee-sched:carve-guard]   live carve frame tid="
+                            << entry.first
+                            << " kind=" << static_cast<int>(live.kind)
+                            << " seq=" << std::dec << live.sequence
+                            << " pc=0x" << std::hex << live.context.pc
+                            << " sp=0x" << liveSp << std::dec << std::endl);
+            }
+        }
+    }
 }
 
 uint32_t EeScheduler::invocationStackTop()
@@ -2148,6 +2256,14 @@ void EeScheduler::removeReady(GuestThread &item)
 
 GuestThread *EeScheduler::selectReady()
 {
+    // M5-T15: the carve guard - main's own suspended sp is sampled at every
+    // scheduling decision here (the freeze log samples the same thread
+    // table); a sp under the carve top means main descended into the
+    // dedicated carve band - loud, rate-limited (M3-T4 rule).
+    if (const GuestThread *mainThread = thread(kMainThreadId))
+    {
+        guardMainCarve(getRegU32(&mainThread->context, 29));
+    }
     for (auto &queue : m_readyQueues)
     {
         for (size_t i = 0; i < queue.size(); ++i)
