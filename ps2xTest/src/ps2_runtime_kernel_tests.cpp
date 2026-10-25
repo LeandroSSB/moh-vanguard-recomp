@@ -1157,7 +1157,14 @@ void register_ps2_runtime_kernel_tests()
             TestEnv env;
             constexpr uint32_t kInitialLoaderSp = PS2_RAM_SIZE - 0x100u;
             constexpr uint32_t kMainStackSize = 0x00020000u;
-            constexpr uint32_t kExpectedStack = PS2_RAM_SIZE - 0x10u;
+            constexpr uint32_t kAnchorSp = PS2_RAM_SIZE - 0x10u;
+            // M5-T13: stack=-1 means kernel-managed - SetupThread picks the
+            // region and anchors $sp at its TOP. The recorded metadata must be
+            // the region BASE (the low edge below the anchor), the same meaning
+            // `stack` carries in the CreateThread ABI. Recording the anchor
+            // itself presented a "base" above every real frame and is what fed
+            // the T12 spy fallback (invocationEntrySp declined all main $sp).
+            constexpr uint32_t kExpectedBase = kAnchorSp - kMainStackSize;
             constexpr uint32_t kMainGp = 0x0036A7F0u;
 
             env.ctx.pc = 0x00100000u;
@@ -1167,28 +1174,37 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 6, kMainStackSize);
             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
                      "SetupThread syscall should dispatch");
-            t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
+            t.Equals(::getRegU32(&env.ctx, 2), kAnchorSp,
                      "automatic main stack should be anchored at the top of RDRAM");
 
             // ReferThreadStatus can be called after many nested frames have moved $sp.
-            // It must report the initial stack recorded by SetupThread, not this live snapshot.
-            constexpr uint32_t kTransientSp = kExpectedStack - 0x80u;
-            setRegU32(env.ctx, 29, kTransientSp);
-            setRegU32(env.ctx, 4, 0u);
-            setRegU32(env.ctx, 5, K_STATUS_ADDR);
-            t.IsTrue(callSyscall(0x30u, env.rdram.data(), &env.ctx, &env.runtime),
-                     "ReferThreadStatus syscall should dispatch");
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should accept the current-thread id alias");
+            // It must report the stack region recorded by SetupThread, not a live snapshot.
+            auto referAt = [&](uint32_t transientSp)
+            {
+                setRegU32(env.ctx, 29, transientSp);
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, K_STATUS_ADDR);
+                t.IsTrue(callSyscall(0x30u, env.rdram.data(), &env.ctx, &env.runtime),
+                         "ReferThreadStatus syscall should dispatch");
+                t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should accept the current-thread id alias");
+                EeThreadStatusAbi status{};
+                std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
+                return status;
+            };
 
-            EeThreadStatusAbi status{};
-            std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
-            t.Equals(status.stack, kExpectedStack,
-                     "main thread status must expose SetupThread's stable initial stack");
-            t.Equals(status.stack_size, static_cast<int32_t>(kMainStackSize),
+            const EeThreadStatusAbi first = referAt(kAnchorSp - 0x80u);
+            const EeThreadStatusAbi second = referAt(kAnchorSp - 0x40u);
+            t.Equals(first.stack, kExpectedBase,
+                     "main thread status must expose the kernel-managed stack REGION BASE below the anchor");
+            t.Equals(second.stack, kExpectedBase,
+                     "repeated ReferThreadStatus calls must return the same stable base at any live $sp");
+            t.Equals(first.stack_size, static_cast<int32_t>(kMainStackSize),
                      "main thread status must preserve SetupThread's stack size");
-            t.Equals(status.gp_reg, kMainGp,
+            t.Equals(static_cast<uint32_t>(first.stack) + static_cast<uint32_t>(first.stack_size), kAnchorSp,
+                     "base + size must reconstruct the anchor top (the metadata is the base, never the anchor)");
+            t.Equals(first.gp_reg, kMainGp,
                      "main thread status must preserve SetupThread's global pointer");
-            t.IsTrue(status.stack != kInitialLoaderSp && status.stack != kTransientSp,
+            t.IsTrue(first.stack != kInitialLoaderSp && first.stack != kAnchorSp - 0x80u && first.stack != kAnchorSp - 0x40u,
                      "main thread status must never expose a live stack-pointer snapshot");
         });
 

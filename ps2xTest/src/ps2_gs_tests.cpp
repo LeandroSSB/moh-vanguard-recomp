@@ -141,8 +141,21 @@ namespace
         runtime->requestStop();
     }
 
+    std::atomic<uint32_t> g_gsSyncCallbackSetupSp{0u};
+
     void testGsCallbackMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // M5-T13: record the game's own SetupThread shape first (stack=-1 =
+        // kernel-managed, size 0x28000). The bind contract under test must
+        // hold WITH the main-stack metadata present: the invocation binds at
+        // the owner's interrupted $sp, never at anything derived from the
+        // recorded region (a wrong "base" was the T12 spy-fallback feed).
+        setRegU32(*ctx, 4, 0u);         // gp: leave the current $gp untouched
+        setRegU32(*ctx, 5, 0xFFFFFFFFu); // stack: kernel-managed
+        setRegU32(*ctx, 6, 0x28000u);   // stack_size
+        SetupThread(rdram, ctx, runtime);
+        g_gsSyncCallbackSetupSp.store(getRegU32(ctx, 2), std::memory_order_release);
+
         setRegU32(*ctx, 4, kGsCallbackPc);
         setRegU32(*ctx, 28, kGsCallbackGp);
         setRegU32(*ctx, 29, kGsCallbackCallerSp);
@@ -4153,6 +4166,7 @@ void register_ps2_gs_tests()
             g_gsSyncCallbackSp.store(0u, std::memory_order_relaxed);
             g_gsSyncCallbackGp.store(0u, std::memory_order_relaxed);
             g_gsSyncCallbackPrevious.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            g_gsSyncCallbackSetupSp.store(0u, std::memory_order_relaxed);
 
             PS2Runtime runtime;
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
@@ -4175,12 +4189,18 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
+            // M5-T13: the kernel-managed SetupThread shape was recorded (the
+            // game's own configuration) and returned the top-of-RDRAM anchor.
+            t.Equals(g_gsSyncCallbackSetupSp.load(std::memory_order_acquire), PS2_RAM_SIZE - 0x10u,
+                     "SetupThread(stack=-1) should anchor the automatic main stack at the top of RDRAM");
             // M5-T12: the invocation binds on the OWNING thread's own stack -
             // hardware runs the VBlank interrupt frame just below the
             // interrupted $sp (the T7 reserved-pool doctrine was replaced by
             // the owner-stack binding in T11 and completed by the main-owned
             // case in T12: main's own callbacks must never route through the
             // fallback, whose freeze count wedged the post-movie session).
+            // M5-T13: this must hold WITH the kernel-managed stack metadata
+            // recorded - the bind never derives from the recorded region.
             t.Equals(g_gsSyncCallbackSp.load(std::memory_order_acquire), kGsCallbackCallerSp,
                      "callback invocation should bind at the interrupted owner's own $sp");
         });

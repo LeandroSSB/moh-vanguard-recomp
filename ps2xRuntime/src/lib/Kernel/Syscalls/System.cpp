@@ -533,7 +533,15 @@ namespace ps2_syscalls
         sp &= ~0xFu;
         if (stack == 0xFFFFFFFFu)
         {
-            initialStack = sp;
+            // M5-T13: stack=-1 means kernel-managed - the kernel picked the
+            // region and anchored $sp at its TOP. Record the region BASE (the
+            // low edge below the anchor): `stack` is a base everywhere else in
+            // the ABI (CreateThread passes the low address, ReferThreadStatus
+            // reports the allocation's lower bound), and a base above every
+            // real frame is what fed the T12 spy fallback (invocationEntrySp
+            // treated owner.stack as a floor and declined all main $sp).
+            // base + stackSize reconstructs the anchor exactly.
+            initialStack = sp - stackSize;
         }
         else if (stack != 0u)
         {
