@@ -265,6 +265,17 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
     m_debugPublishCountdown = 0u;
+    // M6-T2 review: a previous session may have left a published wall beat -
+    // park the clock thread on a cleared schedule until the fresh chain
+    // scheduled below republishes (otherwise the new session's first beat
+    // could fire from the stale deadline of the old one).
+    m_wallBeatPending.store(false, std::memory_order_release);
+    m_nextHostDeadlineNs.store(0u, std::memory_order_release);
+    {
+        std::lock_guard clockLock(m_clockMutex);
+        m_hostScheduleGeneration.fetch_add(1u, std::memory_order_acq_rel);
+    }
+    m_clockCv.notify_all();
     {
         std::lock_guard lock(m_eventMutex);
         m_events.clear();
@@ -2722,7 +2733,16 @@ void EeScheduler::processDueDeadlines()
         // past (the T1 82/s overshoot plateaus - the cycle gate running hot
         // while the wall deadlines stayed stale) and recovery bursts are
         // bounded to ~kCatchUpDebt / kVBlankPeriod immediate fires.
-        static constexpr auto kCatchUpDebt = kVBlankPeriod * 2;
+        // Grace threshold before a wall chain is treated as stalled (env
+        // PS2X_CATCHUP_DEBT_PERIODS, default 2 periods): beats less late than
+        // this keep the exact wall schedule (the single-beat replay); M6-T3
+        // replaces the old beyond-threshold drop with a bounded replay.
+        static const auto kCatchUpDebt = []()
+        {
+            const char *env = std::getenv("PS2X_CATCHUP_DEBT_PERIODS");
+            const int periods = env != nullptr ? std::atoi(env) : 2;
+            return kVBlankPeriod * (periods > 0 ? periods : 2);
+        }();
         const auto deliveryNow = std::chrono::steady_clock::now();
         for (ScheduledEvent &scheduled : due)
         {
@@ -3136,6 +3156,17 @@ void EeScheduler::clockThreadMain()
         {
             m_wallBeatPending.store(true, std::memory_order_release);
             m_checkpointPending.store(true, std::memory_order_release);
+            // Deliberately notified WITHOUT holding m_eventMutex: this thread
+            // already owns m_clockMutex, and taking m_eventMutex here would
+            // invert the event->clock lock order the executor uses
+            // (processDueDeadlines publishes the schedule through
+            // publishHostScheduleLocked while holding m_eventMutex). The
+            // notify-losing race (an executor waiter checking its predicate
+            // just before these stores) is deadline-bounded: every waiter
+            // parks with wait_until on the very host deadline that just
+            // tripped (waitForEvent) or on the beat's pacingDeadline
+            // (processDueDeadlines), so a lost wakeup costs no more than
+            // waking on the deadline itself.
             m_eventCv.notify_all();
             // Do not spin between the trip and the executor's delivery pass
             // (the generation changes once the executor re-arms the chain).

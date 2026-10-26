@@ -3855,12 +3855,12 @@ void PS2Runtime::run()
                                                << " gif=" << curGif
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
-                                               // M6-T1 clock-drift baseline: wall ms
-                                               // since the first tick dump, the guest
-                                               // vsync counter, the engine time base
-                                               // 0x510A18 (game tick; expected 100/s
-                                               // per the GameDelay decode of 0x510A10)
-                                               // and the emulated-cycle position.
+                                               // M6-T1 clock-drift baseline (opt-in
+                                               // PS2X_ENABLE_M6T1=1): wall ms since
+                                               // the first tick dump, the guest vsync
+                                               // counter and the emulated-cycle
+                                               // position. The game-specific tbase
+                                               // field rides the same gate.
                                                << " wallMs=" << []()
                                                   {
                                                       static const std::chrono::steady_clock::time_point s_m6Start = std::chrono::steady_clock::now();
@@ -3869,7 +3869,22 @@ void PS2Runtime::run()
                                                           .count();
                                                   }()
                                                << " vsync=" << m_eeScheduler->currentVSyncTick()
-                                               << " tbase=" << m_memory.read32(0x510A18u)
+                                               << [&]()
+                                                  {
+                                                      // Vanguard engine time base
+                                                      // 0x510A18 (game tick; expected
+                                                      // 100/s per the GameDelay decode
+                                                      // of 0x510A10) - kept behind the
+                                                      // M6-T1 gate so the generic dump
+                                                      // stays upstream-clean.
+                                                      static const char *s_m6t1Env = std::getenv("PS2X_ENABLE_M6T1");
+                                                      static const bool s_m6t1Dump = s_m6t1Env != nullptr && s_m6t1Env[0] == '1';
+                                                      if (!s_m6t1Dump)
+                                                      {
+                                                          return std::string();
+                                                      }
+                                                      return " tbase=" + std::to_string(m_memory.read32(0x510A18u));
+                                                  }()
                                                << " eeCycle=0x" << std::hex << m_eeScheduler->currentEeCycle() << std::dec
                                                << std::endl);
 

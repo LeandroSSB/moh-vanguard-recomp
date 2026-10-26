@@ -49,7 +49,8 @@ namespace
     };
 
     std::atomic<uint32_t> g_lastIntcArg{0u};
-    constexpr uint32_t kIdleVSyncWaitPc = 0x00160000u;    constexpr uint32_t kVSyncWaitPc = 0x00160100u;
+    constexpr uint32_t kIdleVSyncWaitPc = 0x00160000u;
+    constexpr uint32_t kVSyncWaitPc = 0x00160100u;
     constexpr uint32_t kVSyncResumePc = 0x00160110u;
     constexpr uint32_t kIrqWaitPc = 0x00160200u;
     constexpr uint32_t kIrqResumePc = 0x00160210u;
