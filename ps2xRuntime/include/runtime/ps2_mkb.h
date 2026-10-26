@@ -71,4 +71,10 @@ namespace ps2x
     // button down): LMB=CROSS (fire), RMB=L1 (aim down sights). Other
     // buttons unmapped for now.
     uint16_t MkbMouseButtonsToPad(uint32_t mouseButtons);
+
+    // Prints the one-shot "[mkb] ..." startup status line (enabled or
+    // disabled, the resolved config path and values) so run logs evidence
+    // the layer regardless of whether the game ever polls the pad. Pure
+    // environment/config work - no raylib. Idempotent (first call wins).
+    void MkbLogStartupStatus();
 }

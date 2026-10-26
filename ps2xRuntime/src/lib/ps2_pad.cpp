@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_input_script.h"
+#include "runtime/ps2_mkb.h"
 #include "ps2_host_backend.h"
 #include <chrono>
 #include <cstring>
@@ -27,6 +28,31 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    // Vanguard M5-T19: opt-in mouse-look (PS2X_MKB=1). Mouse deltas feed a
+    // virtual right stick (accumulate -> clamp -> decay toward center once
+    // per host frame); LMB=CROSS (fire), RMB=L1 (aim down sights). Config
+    // (sens/deadzone/invert_y) from PS2X_MKB_CONFIG or mkb.ini next to the
+    // runner; a missing config keeps the defaults. The input script above
+    // still takes precedence, and the gamepad path is unchanged when the
+    // env is unset. With a gamepad connected AND MKB on, the mouse owns
+    // the right stick (look) while the gamepad keeps sticks-left/buttons.
+    // The one-shot "[mkb]" status line is printed by MkbLogStartupStatus
+    // from PS2Runtime::initialize (this path is lazy: it only runs when
+    // the game actually polls the pad).
+    bool mkbEnabled()
+    {
+        const char *env = std::getenv("PS2X_MKB");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }
+
+    ps2x::MkbConfig mkbStartupConfig()
+    {
+        ps2x::MkbConfig cfg;
+        const char *env = std::getenv("PS2X_MKB_CONFIG");
+        ps2x::MkbLoadConfig((env != nullptr && env[0] != '\0') ? env : "mkb.ini", cfg);
+        return cfg;
+    }
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -63,6 +89,18 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         ps2x::ApplyPadScript(inputScript, static_cast<uint32_t>(elapsed), data);
         return true;
     }
+
+    // Vanguard M5-T19: the MKB mouse-look layer (script input above still
+    // wins; nothing below runs when PS2X_MKB is unset).
+    static const bool useMkb = mkbEnabled();
+    static const ps2x::MkbConfig mkbConfig = useMkb ? mkbStartupConfig() : ps2x::MkbConfig{};
+    static float mkbRx = 0.0f;
+    static float mkbRy = 0.0f;
+    // Consume the mouse once per host frame: GetMouseDelta() accumulates
+    // per frame, so a second pad poll in the same frame must not re-add it
+    // (and the decay must run exactly once per frame). raylib updates
+    // GetTime() once per frame, making it a frame token.
+    static double mkbLastFrameTime = -1.0;
 
     std::memset(data, 0, 32);
     data[0] = 0x01;
@@ -151,6 +189,26 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+    }
+
+    if (useMkb)
+    {
+        const double frameTime = GetTime();
+        if (frameTime != mkbLastFrameTime)
+        {
+            mkbLastFrameTime = frameTime;
+            const Vector2 mouseDelta = GetMouseDelta();
+            ps2x::MkbApplyMouseDelta(mkbRx, mkbRy, mouseDelta.x, mouseDelta.y,
+                                     mkbConfig);
+        }
+        // The mouse owns the right stick (look); whatever the gamepad or
+        // keyboard branches wrote above still feeds sticks-left and the
+        // rest of the buttons.
+        ps2x::MkbStickToBytes(mkbRx, mkbRy, mkbConfig, data[4], data[5]);
+        const uint32_t mouseButtons =
+            (IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1u : 0u) |
+            (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ? 2u : 0u);
+        btns &= static_cast<uint16_t>(~ps2x::MkbMouseButtonsToPad(mouseButtons));
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
