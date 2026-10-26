@@ -2711,21 +2711,25 @@ void EeScheduler::processDueDeadlines()
             return;
         }
 
-        // M6-T2 (H2): bounded catch-up. When delivery discovers the chain is
-        // already one or more beats behind the wall (a stall left the wall
-        // schedule in the past), the successor re-anchors at now: the current
-        // beat fires exactly once, the missed ones are dropped, and the chain
-        // resumes one period from the delivery instant. The wall chain can
-        // never again pace from the past (the T1 82/s overshoot plateaus -
-        // the cycle gate running hot while the wall deadlines stayed stale),
-        // and recovery bursts are bounded to a single immediate fire.
+        // M6-T2 (H2): bounded catch-up. The successor keeps its wall schedule
+        // while the debt is small (delivery a beat or two late replays the
+        // missed beat on the next pass - the count stays faithful when the
+        // executor is chronically a few ms late per beat); once the debt
+        // exceeds kCatchUpDebt (a stall left the schedule far in the past),
+        // the successor re-anchors at now: the current beat fires once, the
+        // missed ones are dropped, and the chain resumes one period from the
+        // delivery instant. The wall chain can never pace from far in the
+        // past (the T1 82/s overshoot plateaus - the cycle gate running hot
+        // while the wall deadlines stayed stale) and recovery bursts are
+        // bounded to ~kCatchUpDebt / kVBlankPeriod immediate fires.
+        static constexpr auto kCatchUpDebt = kVBlankPeriod * 2;
         const auto deliveryNow = std::chrono::steady_clock::now();
         for (ScheduledEvent &scheduled : due)
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
                 auto nextEndHost = scheduled.hostDeadline + kVBlankDuration;
-                if (nextEndHost <= deliveryNow)
+                if (deliveryNow - nextEndHost >= kCatchUpDebt)
                 {
                     nextEndHost = deliveryNow + kVBlankDuration;
                 }
@@ -2733,7 +2737,7 @@ void EeScheduler::processDueDeadlines()
                               nextEndHost,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 auto nextHost = scheduled.hostDeadline + kVBlankPeriod;
-                if (nextHost <= deliveryNow)
+                if (deliveryNow - nextHost >= kCatchUpDebt)
                 {
                     nextHost = deliveryNow + kVBlankPeriod;
                 }
