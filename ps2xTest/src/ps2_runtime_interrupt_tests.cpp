@@ -216,6 +216,74 @@ namespace
         }
     }
 
+    // ---- M6-T3: bounded replay of stall-missed beats ------------------------
+    // The measured boot-regime shape: ~10%-realtime guest work, then a
+    // several-hundred-ms ZERO-cycle stretch (the executor blocked inside a
+    // host call - ISO streaming), then more guest work. The wall chain owes
+    // ~59.94 beats per wall second across the whole span; the pre-T3
+    // re-anchor silently DROPPED every beat past the 2-period catch-up grace
+    // (the measured boot loss: 45.8/s). Falsifiable prediction: the stall's
+    // missed beats are REPLAYED (bounded) so the count stays wall-faithful.
+    constexpr uint32_t kM6t3PhaseSlow = 1u;
+    constexpr uint32_t kM6t3PhaseStall = 2u;
+    constexpr uint32_t kM6t3StallMs = 600u; // ~36 wall beats, far past the grace
+    std::atomic<uint32_t> g_m6t3Phase{0u};
+    std::atomic<uint32_t> g_m6t3SlowWindowsLeft{0u};
+    std::chrono::steady_clock::time_point g_m6t3PhaseStart{};
+    std::vector<M6T2ClockSample> g_m6t3Samples;
+
+    void m6t3SpinFor(std::chrono::steady_clock::time_point until)
+    {
+        while (std::chrono::steady_clock::now() < until)
+        {
+        }
+    }
+
+    // slow 1.5 s -> stall 600 ms -> slow 1.5 s -> stop (the T2 throttle
+    // shape with the stall in the middle and no recovery-overshoot phase).
+    void m6t3ThrottleBlock(uint8_t *, R5900Context *, PS2Runtime *runtime)
+    {
+        using clock = std::chrono::steady_clock;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        const uint32_t phase = g_m6t3Phase.load(std::memory_order_acquire);
+        const auto now = clock::now();
+        g_m6t3Samples.push_back({scheduler.currentVSyncTick(), phase,
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     now.time_since_epoch())
+                                     .count()});
+        switch (phase)
+        {
+        case kM6t3PhaseSlow:
+            // ~9.7% of realtime: 30k accounted cycles per ~1.05 ms wall
+            // (the T2-calibrated boot/film shape).
+            scheduler.accountCycles(30000u);
+            m6t3SpinFor(now + std::chrono::microseconds(1050));
+            if (now - g_m6t3PhaseStart >= std::chrono::milliseconds(1500))
+            {
+                if (g_m6t3SlowWindowsLeft.fetch_sub(1u, std::memory_order_acq_rel) <= 1u)
+                {
+                    g_m6t3Phase.store(3u, std::memory_order_release);
+                    runtime->requestStop();
+                }
+                else
+                {
+                    g_m6t3Phase.store(kM6t3PhaseStall, std::memory_order_release);
+                    g_m6t3PhaseStart = clock::now();
+                }
+            }
+            break;
+        case kM6t3PhaseStall:
+            // The zero-cycle host stall: wall advances, guest cycles do
+            // not, and no scheduling pass runs for the whole stretch.
+            m6t3SpinFor(now + std::chrono::milliseconds(kM6t3StallMs));
+            g_m6t3Phase.store(kM6t3PhaseSlow, std::memory_order_release);
+            g_m6t3PhaseStart = clock::now();
+            break;
+        default:
+            break;
+        }
+    }
+
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
         ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
@@ -1196,6 +1264,119 @@ void register_ps2_runtime_interrupt_tests()
                      "recovery after a stall must be rate-limited to the wall beat (~60/s): the "
                      "T1 overshoot plateaus (82/s at 1.37x) and multi-fire bursts were the "
                      "unbounded wall-debt replay");
+        });
+
+        tc.Run("M6-T3: beats missed under a zero-cycle stall are replayed bounded, not dropped", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kClockThrottlePc, m6t3ThrottleBlock);
+
+            g_m6t3Phase.store(kM6t3PhaseSlow, std::memory_order_release);
+            g_m6t3SlowWindowsLeft.store(2u, std::memory_order_release);
+            g_m6t3PhaseStart = std::chrono::steady_clock::now();
+            g_m6t3Samples.clear();
+            g_m6t3Samples.reserve(8192);
+
+            R5900Context mainContext{};
+            mainContext.pc = kClockThrottlePc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            using clock = std::chrono::steady_clock;
+            // Full-run count fidelity: ~3 s of slow guest plus the 600 ms
+            // stall; the delivered count over the measured span must track
+            // the wall schedule (~59.94/s) - the stall's missed beats come
+            // back as a bounded replay instead of being dropped.
+            uint64_t firstTick = 0;
+            uint64_t lastTick = 0;
+            clock::time_point first{};
+            clock::time_point last{};
+            bool haveFirst = false;
+            for (const M6T2ClockSample &s : g_m6t3Samples)
+            {
+                const auto ts = clock::time_point(std::chrono::nanoseconds(s.tNs));
+                if (!haveFirst)
+                {
+                    first = ts;
+                    firstTick = s.vsyncTick;
+                    haveFirst = true;
+                }
+                last = ts;
+                lastTick = s.vsyncTick;
+            }
+            const double span = std::chrono::duration<double>(last - first).count();
+            const double rate = span > 0.0
+                                    ? static_cast<double>(lastTick - firstTick) / span
+                                    : 0.0;
+            t.IsTrue(span > 3.2, "the run should span the programmed slow-stall-slow shape (~3.6 s)");
+            t.IsTrue(rate >= 56.9,
+                     "a 600 ms zero-cycle stall must not cost beats: the missed wall beats are "
+                     "replayed (bounded) so the delivered count stays wall-faithful (~59.94/s over "
+                     "the whole span); the pre-T3 re-anchor dropped every beat past the 2-period "
+                     "grace (~34 here) - the measured boot-regime loss (45.8/s)");
+            t.IsTrue(rate <= 65.0,
+                     "the replay must not over-deliver past the wall schedule (the T1 82/s-class "
+                     "overshoot plateau)");
+
+            // Bounded replay: the per-call replay budget spreads the burst
+            // over scheduling passes - never a single-pass flood (the T1
+            // unbounded multi-fire shape).
+            uint64_t maxDelta = 0;
+            for (size_t i = 1; i < g_m6t3Samples.size(); ++i)
+            {
+                const uint64_t delta = g_m6t3Samples[i].vsyncTick - g_m6t3Samples[i - 1].vsyncTick;
+                if (delta > maxDelta)
+                {
+                    maxDelta = delta;
+                }
+            }
+            t.IsTrue(maxDelta <= 16u,
+                     "the replay must spread over scheduling passes (a few beats per pass), not "
+                     "fire an unbounded multi-fire flood within one pass");
+
+            // Post-drain sustained rate: after the replay head, delivery is
+            // the ordinary wall beat again (the T2 rate-limit invariant).
+            clock::time_point anchor{};
+            uint64_t skipFirstTick = 0;
+            uint64_t skipLastTick = 0;
+            clock::time_point skipFirst{};
+            clock::time_point skipLast{};
+            bool haveAnchor = false;
+            bool haveSkip = false;
+            for (const M6T2ClockSample &s : g_m6t3Samples)
+            {
+                if (s.phase != kM6t3PhaseSlow)
+                {
+                    continue;
+                }
+                const auto ts = clock::time_point(std::chrono::nanoseconds(s.tNs));
+                if (!haveAnchor)
+                {
+                    anchor = ts;
+                    haveAnchor = true;
+                }
+                if (ts - anchor < std::chrono::milliseconds(150))
+                {
+                    continue;
+                }
+                if (!haveSkip)
+                {
+                    skipFirst = ts;
+                    skipFirstTick = s.vsyncTick;
+                    haveSkip = true;
+                }
+                skipLast = ts;
+                skipLastTick = s.vsyncTick;
+            }
+            const double tailSpan = std::chrono::duration<double>(skipLast - skipFirst).count();
+            const double tailRate = tailSpan > 0.0
+                                        ? static_cast<double>(skipLastTick - skipFirstTick) / tailSpan
+                                        : 0.0;
+            t.IsTrue(tailSpan > 0.5, "the tail measurement window should span ~1.3 s of wall");
+            t.IsTrue(tailRate >= 50.0 && tailRate <= 75.0,
+                     "after the replay drains, delivery returns to the ordinary wall beat (~60/s, "
+                     "no overshoot plateau)");
         });
     });
 }
