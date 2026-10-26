@@ -498,6 +498,15 @@ private:
     void waitForEvent();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
+    // M6-T2: publishes the earliest HOST deadline over m_deadlines to the
+    // clock thread (m_nextHostDeadlineNs + a generation bump). Called with
+    // m_eventMutex held (from updateNextDeadline).
+    void publishHostScheduleLocked();
+    // M6-T2: the clock beat thread. Discovers passed host deadlines while the
+    // executor is busy executing guest code (no cycle deadline wakes it) and
+    // asks for a scheduling pass via m_wallBeatPending; delivery itself always
+    // happens on the executor thread.
+    void clockThreadMain();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
@@ -564,6 +573,28 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+
+    // M6-T2: wall-master clock pacing. The vsync/timer beat is a wall-clock
+    // source (the NTSC crystal does not care how fast the guest executes):
+    // delivery is gated on the HOST deadline alone. The executor's cycle
+    // position may lag arbitrarily when the guest runs slower than realtime -
+    // the beat then fires late in guest-time terms, never fewer-per-wall-
+    // second. The clock thread below is the discovery mechanism for passed
+    // host deadlines while the executor is busy; the pacing decision (a
+    // guest AHEAD of its guest-time schedule sleeps until the beat) stays on
+    // the executor path inside processDueDeadlines.
+    std::mutex m_clockMutex;
+    std::condition_variable m_clockCv;
+    std::thread m_clockThread;
+    std::atomic<bool> m_clockStop{false};
+    // Earliest host deadline over m_deadlines, ns since the steady epoch
+    // (0 = no scheduled events), plus a generation counter so the clock
+    // thread detects re-arms.
+    std::atomic<uint64_t> m_nextHostDeadlineNs{0};
+    std::atomic<uint64_t> m_hostScheduleGeneration{0};
+    // Set by the clock thread when a host deadline passes; consumed (and
+    // cleared) by processDueDeadlines on the executor thread.
+    std::atomic<bool> m_wallBeatPending{false};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

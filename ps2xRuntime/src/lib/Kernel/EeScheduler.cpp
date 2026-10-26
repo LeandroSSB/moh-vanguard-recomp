@@ -203,11 +203,25 @@ namespace
 EeScheduler::EeScheduler(PS2Runtime &runtime)
     : m_runtime(runtime)
 {
+    // M6-T2: the wall-beat discovery thread lives for the scheduler's whole
+    // lifetime; it only reads the published schedule atomics and asks for
+    // scheduling passes - it never touches guest state.
+    m_clockThread = std::thread([this]()
+                                { clockThreadMain(); });
 }
 
 EeScheduler::~EeScheduler()
 {
     requestStop();
+    m_clockStop.store(true, std::memory_order_release);
+    {
+        std::lock_guard clockLock(m_clockMutex);
+    }
+    m_clockCv.notify_all();
+    if (m_clockThread.joinable())
+    {
+        m_clockThread.join();
+    }
 }
 
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
@@ -2623,7 +2637,18 @@ void EeScheduler::processDueDeadlines()
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);
-            const auto now = std::chrono::steady_clock::now();
+            // M6-T2 (H1): the vsync/timer beat is delivered on the HOST
+            // deadline - the wall clock - never gated on the executor's cycle
+            // position. The old conjunct (deadlineCycle <= m_eeCycle in the
+            // delivery partition) let a guest executing slower than realtime
+            // throttle the clock 1:1 with its cycle deficit (the T1 baseline:
+            // delivered vsync/s == cycle% x 60 in every regime). The cycle
+            // position now only serves the PACING decision below: a guest
+            // running AHEAD of its guest-time schedule sleeps until the wall
+            // beat; a guest running BEHIND never sleeps here, so the beat
+            // fires on schedule and the guest sees the interrupt late in
+            // guest-time terms - never fewer per wall second.
+            const bool wallBeatRequested = m_wallBeatPending.exchange(false, std::memory_order_acq_rel);
             for (const ScheduledEvent &item : m_deadlines)
             {
                 if (item.deadlineCycle <= m_eeCycle &&
@@ -2634,13 +2659,14 @@ void EeScheduler::processDueDeadlines()
                 }
             }
 
-            if (pacingDeadline == std::chrono::steady_clock::time_point{})
+            if (pacingDeadline == std::chrono::steady_clock::time_point{} && !wallBeatRequested)
             {
                 updateNextDeadline();
                 return;
             }
 
-            if (now < pacingDeadline)
+            auto now = std::chrono::steady_clock::now();
+            if (pacingDeadline != std::chrono::steady_clock::time_point{} && now < pacingDeadline)
             {
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
@@ -2650,13 +2676,13 @@ void EeScheduler::processDueDeadlines()
                     updateNextDeadline();
                     return;
                 }
+                now = std::chrono::steady_clock::now();
             }
 
-            const auto pacedNow = std::chrono::steady_clock::now();
+            // M6-T2 (H1): HOST-deadline partition - no cycle conjunct.
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
-                                              [this, pacedNow](const ScheduledEvent &item)
-                                              { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+                                              [&now](const ScheduledEvent &item)
+                                              { return item.hostDeadline <= now; });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -2685,15 +2711,34 @@ void EeScheduler::processDueDeadlines()
             return;
         }
 
+        // M6-T2 (H2): bounded catch-up. When delivery discovers the chain is
+        // already one or more beats behind the wall (a stall left the wall
+        // schedule in the past), the successor re-anchors at now: the current
+        // beat fires exactly once, the missed ones are dropped, and the chain
+        // resumes one period from the delivery instant. The wall chain can
+        // never again pace from the past (the T1 82/s overshoot plateaus -
+        // the cycle gate running hot while the wall deadlines stayed stale),
+        // and recovery bursts are bounded to a single immediate fire.
+        const auto deliveryNow = std::chrono::steady_clock::now();
         for (ScheduledEvent &scheduled : due)
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                auto nextEndHost = scheduled.hostDeadline + kVBlankDuration;
+                if (nextEndHost <= deliveryNow)
+                {
+                    nextEndHost = deliveryNow + kVBlankDuration;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              nextEndHost,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                auto nextHost = scheduled.hostDeadline + kVBlankPeriod;
+                if (nextHost <= deliveryNow)
+                {
+                    nextHost = deliveryNow + kVBlankPeriod;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              nextHost,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2942,6 +2987,17 @@ void EeScheduler::waitForEvent()
     auto hostDeadline = std::chrono::steady_clock::time_point::max();
     if (!m_deadlines.empty())
     {
+        // M6-T2: the park wakes on the earliest HOST deadline (the wall beat
+        // schedule); the fast-forward target stays the earliest guest-time
+        // deadline. Sleeping until the min-CYCLE item's host deadline could
+        // hold the park past a nearer wall beat of a different event.
+        for (const ScheduledEvent &item : m_deadlines)
+        {
+            if (item.hostDeadline < hostDeadline)
+            {
+                hostDeadline = item.hostDeadline;
+            }
+        }
         const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
                                            [](const ScheduledEvent &left, const ScheduledEvent &right)
                                            {
@@ -2952,7 +3008,6 @@ void EeScheduler::waitForEvent()
                                                return left.sequence < right.sequence;
                                            });
         deadlineCycle = next->deadlineCycle;
-        hostDeadline = next->hostDeadline;
     }
     if (hasTimerDeadline)
     {
@@ -2999,6 +3054,7 @@ void EeScheduler::updateNextDeadline()
     if (m_deadlines.empty())
     {
         m_nextDeadlineCycle.store(0u, std::memory_order_release);
+        publishHostScheduleLocked();
         return;
     }
     const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
@@ -3011,6 +3067,79 @@ void EeScheduler::updateNextDeadline()
                                          return left.sequence < right.sequence;
                                      });
     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
+    publishHostScheduleLocked();
+}
+
+// M6-T2: the earliest HOST deadline is the wall beat the clock thread waits
+// for. Requires m_eventMutex held (the m_deadlines reader side). No-ops when
+// the published beat is unchanged: this runs on every scheduling pass, and
+// notifying the clock thread with an unchanged target would wake it on every
+// executor dispatch.
+void EeScheduler::publishHostScheduleLocked()
+{
+    auto minHost = std::chrono::steady_clock::time_point::max();
+    for (const ScheduledEvent &item : m_deadlines)
+    {
+        if (item.hostDeadline < minHost)
+        {
+            minHost = item.hostDeadline;
+        }
+    }
+    const uint64_t nextNs = minHost == std::chrono::steady_clock::time_point::max()
+                                ? 0u
+                                : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            minHost.time_since_epoch())
+                                                            .count());
+    if (m_nextHostDeadlineNs.exchange(nextNs, std::memory_order_acq_rel) == nextNs)
+    {
+        return;
+    }
+    {
+        std::lock_guard clockLock(m_clockMutex);
+        m_hostScheduleGeneration.fetch_add(1u, std::memory_order_acq_rel);
+    }
+    m_clockCv.notify_all();
+}
+
+// M6-T2: wakes the executor when the next wall beat passes. The executor
+// discovers the beat on its next checkpoint (checkpointDue sees
+// m_checkpointPending) and processDueDeadlines delivers everything whose
+// host deadline has passed - on the executor thread, never here.
+void EeScheduler::clockThreadMain()
+{
+    std::unique_lock lock(m_clockMutex);
+    while (!m_clockStop.load(std::memory_order_acquire))
+    {
+        const uint64_t generation = m_hostScheduleGeneration.load(std::memory_order_acquire);
+        const uint64_t nextNs = m_nextHostDeadlineNs.load(std::memory_order_acquire);
+        if (nextNs == 0u)
+        {
+            m_clockCv.wait(lock, [this, generation]()
+                           { return m_clockStop.load(std::memory_order_acquire) ||
+                                    m_hostScheduleGeneration.load(std::memory_order_acquire) != generation; });
+            continue;
+        }
+        const auto deadline = std::chrono::time_point<std::chrono::steady_clock, std::chrono::nanoseconds>(
+            std::chrono::nanoseconds(nextNs));
+        m_clockCv.wait_until(lock, deadline, [this, generation]()
+                             { return m_clockStop.load(std::memory_order_acquire) ||
+                                      m_hostScheduleGeneration.load(std::memory_order_acquire) != generation; });
+        if (m_clockStop.load(std::memory_order_acquire))
+        {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            m_wallBeatPending.store(true, std::memory_order_release);
+            m_checkpointPending.store(true, std::memory_order_release);
+            m_eventCv.notify_all();
+            // Do not spin between the trip and the executor's delivery pass
+            // (the generation changes once the executor re-arms the chain).
+            m_clockCv.wait_for(lock, std::chrono::milliseconds(2), [this, generation]()
+                               { return m_clockStop.load(std::memory_order_acquire) ||
+                                        m_hostScheduleGeneration.load(std::memory_order_acquire) != generation; });
+        }
+    }
 }
 
 bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
