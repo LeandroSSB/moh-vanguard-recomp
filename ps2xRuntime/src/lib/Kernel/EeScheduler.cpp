@@ -2642,6 +2642,14 @@ void EeScheduler::processPendingEvents()
 
 void EeScheduler::processDueDeadlines()
 {
+    // M6-T3: deep-late VBlank beats (past the kCatchUpDebt grace) are
+    // replayed, not dropped; this budget bounds how many of them one
+    // call may deliver before handing the CPU back to the guest (the
+    // clock beat re-flags m_checkpointPending within ~2 ms and the next
+    // pass continues the replay, so a stall's debt drains while real
+    // guest work interleaves between replay passes).
+    static constexpr uint32_t kMaxBeatReplayPerPass = 8u;
+    uint32_t replaysThisCall = 0u;
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -2743,29 +2751,71 @@ void EeScheduler::processDueDeadlines()
             const int periods = env != nullptr ? std::atoi(env) : 2;
             return kVBlankPeriod * (periods > 0 ? periods : 2);
         }();
+        // M6-T3: a debt beyond the replay limit is a true suspension
+        // (debugger halt, multi-second host stall) - the chain re-anchors
+        // once instead of bursting minutes of replayed frames into the game.
+        // 64x the grace (= 128 periods, ~2.1 s at the default grace) covers
+        // every stall the boot/film regime measured (300 ms - 2 s) while a
+        // minutes-long halt still cannot flood the game.
+        const auto kReplayLimit = kCatchUpDebt * 64;
         const auto deliveryNow = std::chrono::steady_clock::now();
-        for (ScheduledEvent &scheduled : due)
+        // M6-T3 (bounded replay): the successor keeps its PURE wall schedule
+        // (hostDeadline + period) - a stall's missed beats are replayed, not
+        // dropped (the pre-T3 re-anchor discarded every beat past the grace
+        // and was the measured boot-regime loss: 45.8/s vs 56/s). Deep-late
+        // beats (past the kCatchUpDebt grace) draw on the per-call replay
+        // budget; when it runs out the still-due tail goes back to
+        // m_deadlines and this call returns, so the executor interleaves
+        // real guest work between replay passes (the clock beat re-flags the
+        // checkpoint within ~2 ms). A debt beyond kReplayLimit is a true
+        // suspension: that chain re-anchors once (the current beat fires,
+        // the debt is dropped - replaying minutes of frames would be worse).
+        bool replayBudgetExhausted = false;
+        size_t deliveredCount = 0u;
+        for (; deliveredCount < due.size(); ++deliveredCount)
         {
+            ScheduledEvent &scheduled = due[deliveredCount];
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
-                auto nextEndHost = scheduled.hostDeadline + kVBlankDuration;
-                if (deliveryNow - nextEndHost >= kCatchUpDebt)
+                const bool deepLate = deliveryNow - scheduled.hostDeadline >= kCatchUpDebt;
+                if (deepLate && deliveryNow - scheduled.hostDeadline >= kReplayLimit)
                 {
-                    nextEndHost = deliveryNow + kVBlankDuration;
+                    scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                                  deliveryNow + kVBlankDuration,
+                                  EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                    scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+                                  deliveryNow + kVBlankPeriod,
+                                  EeEvent{EeEventType::VBlankStart, 0, 0});
+                    processEvent(scheduled.event);
+                    continue;
+                }
+                if (deepLate)
+                {
+                    if (replaysThisCall >= kMaxBeatReplayPerPass)
+                    {
+                        replayBudgetExhausted = true;
+                        break;
+                    }
+                    ++replaysThisCall;
                 }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              nextEndHost,
+                              scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                auto nextHost = scheduled.hostDeadline + kVBlankPeriod;
-                if (deliveryNow - nextHost >= kCatchUpDebt)
-                {
-                    nextHost = deliveryNow + kVBlankPeriod;
-                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              nextHost,
+                              scheduled.hostDeadline + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
+        }
+        if (replayBudgetExhausted)
+        {
+            // The undelivered tail stays due - replayed on a later pass.
+            std::lock_guard pushBackLock(m_eventMutex);
+            m_deadlines.insert(m_deadlines.end(),
+                               std::make_move_iterator(due.begin() + static_cast<long>(deliveredCount)),
+                               std::make_move_iterator(due.end()));
+            updateNextDeadline();
+            return;
         }
     }
 }
