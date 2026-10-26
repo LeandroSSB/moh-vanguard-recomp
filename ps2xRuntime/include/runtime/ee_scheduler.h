@@ -466,6 +466,10 @@ public:
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
 
+    // M7-T1 probe: one-line state of the clock/alarm pipeline for the
+    // post-movie wait decode (opt-in PS2X_ENABLE_M7T1). Log-only.
+    void m7t1ClockState();
+
 private:
     struct ScheduledEvent
     {

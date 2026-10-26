@@ -1464,11 +1464,23 @@ int EeScheduler::setAlarm(uint16_t ticks,
     assertExecutor();
     if (handler == 0u || !m_runtime.hasFunction(handler))
     {
+        static const char *s_m7t1ArmEnv = std::getenv("PS2X_ENABLE_M7T1");
+        static const bool s_m7t1Arm = s_m7t1ArmEnv != nullptr && s_m7t1ArmEnv[0] == '1';
+        if (s_m7t1Arm)
+        {
+            RUNTIME_LOG("[m7t1-arm-fail] reason=handler handler=0x" << std::hex << handler << std::dec << std::endl);
+        }
         return KE_ERROR;
     }
     const int id = allocatePositiveId(m_nextAlarmId, m_alarms);
     if (id == 0)
     {
+        static const char *s_m7t1ArmEnv2 = std::getenv("PS2X_ENABLE_M7T1");
+        static const bool s_m7t1Arm2 = s_m7t1ArmEnv2 != nullptr && s_m7t1ArmEnv2[0] == '1';
+        if (s_m7t1Arm2)
+        {
+            RUNTIME_LOG("[m7t1-arm-fail] reason=id liveAlarms=" << m_alarms.size() << std::endl);
+        }
         return KE_ERROR;
     }
     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
@@ -2944,6 +2956,14 @@ void EeScheduler::processEvent(const EeEvent &event)
         auto it = m_alarms.find(static_cast<int>(event.id));
         if (it == m_alarms.end())
         {
+            static const char *s_m7t1DropEnv = std::getenv("PS2X_ENABLE_M7T1");
+            static const bool s_m7t1Drop = s_m7t1DropEnv != nullptr && s_m7t1DropEnv[0] == '1';
+            if (s_m7t1Drop)
+            {
+                RUNTIME_LOG("[m7t1-alarm-drop] id=" << std::dec << event.id
+                                                    << " liveAlarms=" << m_alarms.size()
+                                                    << std::endl);
+            }
             break;
         }
         const EeAlarm alarm = it->second;
@@ -2958,6 +2978,20 @@ void EeScheduler::processEvent(const EeEvent &event)
                                                 << " arg=0x" << alarm.argument
                                                 << std::dec << " ticks=" << alarm.ticks
                                                 << std::endl);
+            }
+            else
+            {
+                static const char *s_m7t1FireEnv = std::getenv("PS2X_ENABLE_M7T1");
+                static const bool s_m7t1Fire = s_m7t1FireEnv != nullptr && s_m7t1FireEnv[0] == '1';
+                if (s_m7t1Fire && (s_t8AlarmFires % 64u) == 0u)
+                {
+                    RUNTIME_LOG("[m7t1-alarm-fire] #" << std::dec << s_t8AlarmFires
+                                                      << " handler=0x" << std::hex << alarm.handler
+                                                      << " arg=0x" << alarm.argument
+                                                      << std::dec << " ticks=" << alarm.ticks
+                                                      << " pendInv=" << m_pendingInvocations.size()
+                                                      << std::endl);
+                }
             }
         }
         GuestInvocation invocation{};
@@ -3142,6 +3176,48 @@ void EeScheduler::updateNextDeadline()
                                      });
     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
     publishHostScheduleLocked();
+}
+
+// M7-T1 probe: one-line state of the clock/alarm pipeline (log-only, opt-in
+// PS2X_ENABLE_M7T1 from the ps2_runtime tick dump). Names, at the terminal:
+// how many deadlines are armed per type, how far the earliest host deadline
+// is from now (a healthy alarm chain keeps this in the ~ms range; a stalled
+// chain shows the gap growing unbounded), how many kernel alarms are live,
+// and how many invocations (direct + vsync-deferred) are queued undelivered.
+void EeScheduler::m7t1ClockState()
+{
+    std::lock_guard lock(m_eventMutex);
+    uint32_t counts[8] = {};
+    auto minHost = std::chrono::steady_clock::time_point::max();
+    for (const ScheduledEvent &item : m_deadlines)
+    {
+        const auto t = static_cast<uint32_t>(item.event.type);
+        if (t < 8u)
+        {
+            ++counts[t];
+        }
+        if (item.hostDeadline < minHost)
+        {
+            minHost = item.hostDeadline;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const long long minHostMs = minHost == std::chrono::steady_clock::time_point::max()
+                                    ? -1LL
+                                    : std::chrono::duration_cast<std::chrono::milliseconds>(minHost - now).count();
+    RUNTIME_LOG("[m7t1-clock] deadlines=" << m_deadlines.size()
+                                          << " stop=" << counts[0]
+                                          << " vsync=" << counts[1]
+                                          << " vsyncEnd=" << counts[2]
+                                          << " dmac=" << counts[3]
+                                          << " extWake=" << counts[4]
+                                          << " alarm=" << counts[5]
+                                          << " minHostMs=" << minHostMs
+                                          << " liveAlarms=" << m_alarms.size()
+                                          << " pendInv=" << m_pendingInvocations.size()
+                                          << " defInv=" << m_deferredInvocations.size()
+                                          << " eeCycle=0x" << std::hex << m_eeCycle << std::dec
+                                          << std::endl);
 }
 
 // M6-T2: the earliest HOST deadline is the wall beat the clock thread waits

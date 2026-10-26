@@ -4536,6 +4536,76 @@ void PS2Runtime::run()
                                                              << " enabled=" << (h.enabled ? 1 : 0)
                                                              << std::dec);
                         }
+                        // M7-T1 probe (runtime-only, opt-in PS2X_ENABLE_M7T1=1):
+                        // the post-movie main wait, decoded. Three candidate
+                        // parks for main at the terminal: (1) the message-wait
+                        // sub_0033F208(handle) — sleeps one scheduler tick per
+                        // iteration (sub_00355948(1) -> sub_00355860:
+                        // SetAlarm(cycles, cb 0x355840=->iWakeupThread(thid))
+                        // + SleepThread) and polls *(rec+8), rec = *(0x647F70)
+                        // + (handle>>24)*48; (2) the SleepThread park inside
+                        // sub_00355860 (any SDK delay caller); (3) the burn
+                        // loop 0x3110D0 inside sub_00311058 (fill-wait, v1
+                        // counts to a0). For whichever zone main samples in,
+                        // dump pc/ra/sp, the live registers (a0-a3, s0-s1) and
+                        // the first 12 stack words so the caller chain decodes
+                        // against the gen call sites.
+                        {
+                            static const bool s_m7t1 = []()
+                            {
+                                const char *env = std::getenv("PS2X_ENABLE_M7T1");
+                                return env != nullptr && env[0] == '1';
+                            }();
+                            if (s_m7t1)
+                            {
+                                m_eeScheduler->m7t1ClockState();
+                                for (const auto &t : threadSnap.threads)
+                                {
+                                    if (t.id != 1u)
+                                    {
+                                        continue;
+                                    }
+                                    const uint32_t m7t1Pc = t.pc;
+                                    const bool inWaitLoop = (m7t1Pc >= 0x33F208u && m7t1Pc < 0x33F340u);
+                                    const bool inDelay = (m7t1Pc == 0x49B480u || m7t1Pc == 0x49B488u);
+                                    const bool inBurn = (m7t1Pc >= 0x311058u && m7t1Pc < 0x311100u);
+                                    if (!inWaitLoop && !inDelay && !inBurn)
+                                    {
+                                        continue;
+                                    }
+                                    std::ostringstream m7;
+                                    m7 << "[m7t1-main]" << (inWaitLoop ? " WAIT" : inDelay ? " SLEEP" : " BURN")
+                                       << " pc=0x" << std::hex << m7t1Pc
+                                       << " ra=0x" << t.ra
+                                       << " sp=0x" << t.sp
+                                       << " st=" << std::dec << static_cast<int>(t.status);
+                                    if (inBurn || inWaitLoop)
+                                    {
+                                        auto g = [&](int idx) -> uint32_t
+                                        { return static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[idx], 0)); };
+                                        m7 << " a0=0x" << std::hex << g(4) << " a1=0x" << g(5)
+                                           << " s0=0x" << g(16) << " s1=0x" << g(17);
+                                    }
+                                    m7 << std::hex;
+                                    for (uint32_t off = 0; off < 80u; off += 4u)
+                                    {
+                                        m7 << " w" << (off / 4u) << "=0x" << m_memory.read32(t.sp + off);
+                                    }
+                                    RUNTIME_LOG(m7.str() << std::dec << std::endl);
+                                    if (inWaitLoop)
+                                    {
+                                        auto g = [&](int idx) -> uint32_t
+                                        { return static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[idx], 0)); };
+                                        const uint32_t s1 = g(17);
+                                        RUNTIME_LOG("[m7t1-wait] s1=0x" << std::hex << s1
+                                                                        << " [s1+8]=0x" << (s1 != 0u && s1 < 0x02000000u ? m_memory.read32(s1 + 8u) : 0u)
+                                                                        << " [0x647F6C]=0x" << m_memory.read32(0x647F6Cu)
+                                                                        << " deferredFlag=" << std::dec << m_memory.read32(0x6480B8u)
+                                                                        << std::endl);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
