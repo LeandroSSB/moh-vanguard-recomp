@@ -160,7 +160,7 @@ public:
 
                 try
                 {
-                    std::cout << "\033[33m" << "  [Run]: " << "\033[0m" << testName << " ";
+                    std::cout << "\033[33m" << "  [Run]: " << "\033[0m" << testName << " " << std::flush;
                     testFn(testCase);
 
                     if (!testCase.m_failReason.empty())
