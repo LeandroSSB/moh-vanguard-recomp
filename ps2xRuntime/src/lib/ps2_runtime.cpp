@@ -3855,6 +3855,22 @@ void PS2Runtime::run()
                                                << " gif=" << curGif
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
+                                               // M6-T1 clock-drift baseline: wall ms
+                                               // since the first tick dump, the guest
+                                               // vsync counter, the engine time base
+                                               // 0x510A18 (game tick; expected 100/s
+                                               // per the GameDelay decode of 0x510A10)
+                                               // and the emulated-cycle position.
+                                               << " wallMs=" << []()
+                                                  {
+                                                      static const std::chrono::steady_clock::time_point s_m6Start = std::chrono::steady_clock::now();
+                                                      return std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                 std::chrono::steady_clock::now() - s_m6Start)
+                                                          .count();
+                                                  }()
+                                               << " vsync=" << m_eeScheduler->currentVSyncTick()
+                                               << " tbase=" << m_memory.read32(0x510A18u)
+                                               << " eeCycle=0x" << std::hex << m_eeScheduler->currentEeCycle() << std::dec
                                                << std::endl);
 
                 // M5-T8 fix round: IOP liveness snapshot (measurement only).

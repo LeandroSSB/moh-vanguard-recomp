@@ -1999,6 +1999,11 @@ uint64_t EeScheduler::currentVSyncTick() const noexcept
     return m_vsyncTick;
 }
 
+uint64_t EeScheduler::currentEeCycle() const noexcept
+{
+    return m_eeCycle;
+}
+
 uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp)
 {
     assertExecutor();
@@ -2705,6 +2710,22 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        // M6-T1 drift baseline (opt-in PS2X_ENABLE_M6T1=1): wall timestamp
+        // (steady_clock ns since epoch - monotonic; analysis subtracts the
+        // first sample) taken at the delivery point of every vsync. With the
+        // guest parked this line is the ONLY pacing signal: inter-arrival
+        // directly measures the delivered-vsync rate vs the 59.94 NTSC / 60.0
+        // host constant (kVBlankPeriod = 16667us) expectation.
+        {
+            static const char *s_m6t1Env = std::getenv("PS2X_ENABLE_M6T1");
+            static const bool s_m6t1 = s_m6t1Env != nullptr && s_m6t1Env[0] == '1';
+            if (s_m6t1)
+            {
+                RUNTIME_LOG("[m6t1-vsync] n=" << std::dec << m_vsyncTick
+                                              << " t=" << std::chrono::steady_clock::now().time_since_epoch().count()
+                                              << std::endl);
+            }
+        }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
