@@ -136,6 +136,85 @@ namespace
     uint32_t g_invocationQueueSp = 0u;
     bool g_invocationQueueSpChanged = false;
 
+    // ---- M6-T2: clock pacing (wall-master vsync delivery) ------------------
+    // Simulates the measured T1 baseline shape (contrib/m6-clock-baseline.md):
+    // a guest whose cycles arrive at ~9.7% of realtime (the movie-decode
+    // regime), a total executor stall, then a ~5x-realtime recovery (the T1
+    // overshoot-plateau shape, amplified). Falsifiable predictions:
+    //   H1: delivered vsyncs in the slow window track the DEADLINE schedule
+    //       (~59.94/s wall), not cycle% x 60 (~5.8/s - the T1 identity).
+    //   H2: the recovery window shows no overshoot plateau - catch-up is
+    //       rate-limited to the wall beat.
+    constexpr uint32_t kClockThrottlePc = 0x00161000u;
+    constexpr uint32_t kM6t2PhaseSlow = 1u;
+    constexpr uint32_t kM6t2PhaseStall = 2u;
+    constexpr uint32_t kM6t2PhaseFast = 3u;
+
+    struct M6T2ClockSample
+    {
+        uint64_t vsyncTick;
+        uint32_t phase;
+        int64_t tNs;
+    };
+    std::atomic<uint32_t> g_m6t2Phase{0u};
+    std::chrono::steady_clock::time_point g_m6t2PhaseStart{};
+    std::vector<M6T2ClockSample> g_m6t2Samples;
+
+    void m6t2SpinFor(std::chrono::steady_clock::time_point until)
+    {
+        while (std::chrono::steady_clock::now() < until)
+        {
+        }
+    }
+
+    // The "guest block": charges a calibrated accounted-cycle chunk per
+    // dispatch and eats a precise wall slice (spin-wait, immune to the
+    // Windows timer granularity), then loops on the same pc forever.
+    void m6t2ThrottleBlock(uint8_t *, R5900Context *, PS2Runtime *runtime)
+    {
+        using clock = std::chrono::steady_clock;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        const uint32_t phase = g_m6t2Phase.load(std::memory_order_acquire);
+        const auto now = clock::now();
+        g_m6t2Samples.push_back({scheduler.currentVSyncTick(), phase,
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     now.time_since_epoch())
+                                     .count()});
+        switch (phase)
+        {
+        case kM6t2PhaseSlow:
+            // ~9.7% of realtime: 28.6k accounted cycles per ~1.05 ms wall.
+            scheduler.accountCycles(30000u);
+            m6t2SpinFor(now + std::chrono::microseconds(1050));
+            if (now - g_m6t2PhaseStart >= std::chrono::milliseconds(1500))
+            {
+                g_m6t2Phase.store(kM6t2PhaseStall, std::memory_order_release);
+                g_m6t2PhaseStart = clock::now();
+            }
+            break;
+        case kM6t2PhaseStall:
+            // The T1 total stall: wall advances, guest cycles do not.
+            m6t2SpinFor(now + std::chrono::milliseconds(300));
+            g_m6t2Phase.store(kM6t2PhaseFast, std::memory_order_release);
+            g_m6t2PhaseStart = clock::now();
+            break;
+        case kM6t2PhaseFast:
+            // ~5x realtime: with the old double gate the wall chain ends up
+            // in the past and the CYCLE gate paces recovery (the T1 82/s
+            // plateau shape) with unbounded multi-fire bursts.
+            scheduler.accountCycles(1500000u);
+            m6t2SpinFor(now + std::chrono::microseconds(1000));
+            if (now - g_m6t2PhaseStart >= std::chrono::milliseconds(1000))
+            {
+                g_m6t2Phase.store(4u, std::memory_order_release);
+                runtime->requestStop();
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
         ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
@@ -1024,6 +1103,98 @@ void register_ps2_runtime_interrupt_tests()
                       "the scheduler stop path should not throw");
 
             cleanupRuntime(env);
+        });
+
+        tc.Run("M6-T2: vsync delivery tracks the wall deadline schedule, not guest cycle throughput", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kClockThrottlePc, m6t2ThrottleBlock);
+
+            g_m6t2Phase.store(kM6t2PhaseSlow, std::memory_order_release);
+            g_m6t2PhaseStart = std::chrono::steady_clock::now();
+            g_m6t2Samples.clear();
+            g_m6t2Samples.reserve(8192);
+
+            R5900Context mainContext{};
+            mainContext.pc = kClockThrottlePc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            using clock = std::chrono::steady_clock;
+            const auto sampleTime = [](const M6T2ClockSample &s)
+            {
+                return clock::time_point(std::chrono::nanoseconds(s.tNs));
+            };
+            // Collects the delivered-vsync count and span over the tail of one
+            // phase (the head is skipped: regime transitions are noisy).
+            const auto phaseDelivery = [&](uint32_t phase, std::chrono::milliseconds skip,
+                                           uint64_t &outCount, double &outSeconds)
+            {
+                clock::time_point anchor{};
+                clock::time_point first{};
+                clock::time_point last{};
+                uint64_t firstTick = 0;
+                uint64_t lastTick = 0;
+                bool haveAnchor = false;
+                bool haveFirst = false;
+                for (const M6T2ClockSample &s : g_m6t2Samples)
+                {
+                    if (s.phase != phase)
+                    {
+                        continue;
+                    }
+                    const auto ts = sampleTime(s);
+                    if (!haveAnchor)
+                    {
+                        anchor = ts;
+                        haveAnchor = true;
+                    }
+                    if (ts - anchor < skip)
+                    {
+                        continue;
+                    }
+                    if (!haveFirst)
+                    {
+                        first = ts;
+                        firstTick = s.vsyncTick;
+                        haveFirst = true;
+                    }
+                    last = ts;
+                    lastTick = s.vsyncTick;
+                }
+                outCount = lastTick - firstTick;
+                outSeconds = std::chrono::duration<double>(last - first).count();
+            };
+
+            // H1: guest at ~9.7% realtime - delivery must track the deadline
+            // schedule (~59.94/s => ~75 deliveries in the 1.35 s window), not
+            // the cycle deficit (the T1 identity: ~5.8/s => ~8 deliveries).
+            uint64_t slowCount = 0;
+            double slowSeconds = 0.0;
+            phaseDelivery(kM6t2PhaseSlow, std::chrono::milliseconds(150), slowCount, slowSeconds);
+            t.IsTrue(slowSeconds > 1.0, "the slow-phase measurement window should span ~1.35 s of wall");
+            t.IsTrue(slowCount >= 50u,
+                     "a guest executing at ~10% realtime must still receive ~59.94 vsyncs per wall "
+                     "second (each deadline fires when passed), not cycle% x 60 (~6/s - the T1 "
+                     "cycle-gating identity that collapsed delivery to 11-12% of NTSC)");
+            t.IsTrue(slowCount <= 100u,
+                     "the slow regime must not over-deliver past the wall beat schedule");
+
+            // H2: recovery at ~5x realtime - catch-up must be rate-limited to
+            // the wall beat (no T1 82/s-class overshoot plateau, no multi-fire
+            // burst; pre-fix this window paces off the cycle gate at ~300/s).
+            uint64_t fastCount = 0;
+            double fastSeconds = 0.0;
+            phaseDelivery(kM6t2PhaseFast, std::chrono::milliseconds(100), fastCount, fastSeconds);
+            t.IsTrue(fastSeconds > 0.7, "the fast-phase measurement window should span ~0.9 s of wall");
+            const double fastRate = fastSeconds > 0.0
+                                        ? static_cast<double>(fastCount) / fastSeconds
+                                        : 0.0;
+            t.IsTrue(fastRate <= 75.0,
+                     "recovery after a stall must be rate-limited to the wall beat (~60/s): the "
+                     "T1 overshoot plateaus (82/s at 1.37x) and multi-fire bursts were the "
+                     "unbounded wall-debt replay");
         });
     });
 }
