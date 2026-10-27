@@ -439,6 +439,23 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             continue;
         }
 
+        // M9-T2: a latched timer HOLDS its count at the event point until
+        // the guest acks. Hardware takes the compare/overflow interrupt
+        // within microseconds of the match, so the guest's re-arm protocol
+        // (compare += reload - count) always reads the match point back;
+        // the executor's dispatch granularity (guest functions run 40-220
+        // ms host-side in heavy regimes - the M6-T2 residue) must not
+        // surface as a swept count. The measured alternative: every
+        // delivery landed a sweep late, the re-arm wrapped (TIM1 compare
+        // median 44775 vs the healthy 5760), tbase collapsed to ~15/s and
+        // self-sustained - the poison feeds itself because a stretched
+        // period desynchronizes the raise points from the dispatch
+        // boundaries.
+        if ((timer.mode & (kEeTimerModeEquf | kEeTimerModeOvff)) != 0u)
+        {
+            continue;
+        }
+
         const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
         const uint64_t wholeSeconds = eeCycles / kEeClockHz;
         const uint64_t remainingCycles = eeCycles % kEeClockHz;
@@ -483,11 +500,20 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         {
             timer.mode |= kEeTimerModeEquf;
             interruptMask |= 1u << index;
+            // M9-T2: the raise clamps the count at the event point - the
+            // handler (whenever the dispatch reaches it) reads exactly what
+            // hardware hands it, and its re-arm lands one healthy period
+            // out. The event point is the MATCH (non-ZRET keeps counting
+            // past it) or the ZRET clear (count returns to zero at the
+            // match). Ticks past the event in this call are the
+            // already-named hardware-faithful skip.
+            timer.count = zeroReturn ? 0u : compare;
         }
         if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
         {
             timer.mode |= kEeTimerModeOvff;
             interruptMask |= 1u << index;
+            timer.count = 0u; // the wrap point
         }
     }
     return interruptMask;

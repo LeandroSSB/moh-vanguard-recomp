@@ -869,7 +869,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 // re-anchors. REPLAY means the count sweeps every owed period - the
 // raised IRQs stay subject to the guest-side EQUF discipline (see the
 // replay block inside): a period that lapses while the latch is pinned
-// is skipped hardware-faithfully, never multiplied into a raise storm.
+// is skipped hardware-faithfully, never multiplied into a raise storm,
+// and the pinned timer holds its count at the match point (M9-T2).
 void EeScheduler::advanceEeTimersToWall()
 {
     const auto now = std::chrono::steady_clock::now();
@@ -909,13 +910,14 @@ void EeScheduler::advanceEeTimersToWall()
     // replay sweeps the count through every owed period, but the RAISES
     // stay under the guest-side latch discipline (advanceEeTimers): a
     // timer raises only while its EQUF/OVFF latch is clear, so AT MOST ONE
-    // compare event per timer survives a stall - the periods that lapse
-    // while the latch is pinned are skipped hardware-faithfully (the
-    // game's dispatcher acks once and its re-arm compare += reload - count
-    // re-anchors the phase to the live count; it guards its wheel with
-    // 0x510690). The pending COUNTS (not a mask) exist because one replay
-    // can latch compare AND overflow for the same timer - a mask would
-    // lose the second event. Past the replay bound (env
+    // compare event per timer survives a stall, and while the latch is
+    // pinned the count HOLDS at the event point (M9-T2 - the game's
+    // dispatcher acks and its re-arm compare += reload - count reads the
+    // match point, never a swept count; it guards its wheel with
+    // 0x510690). Periods that lapse inside the pinned window are skipped
+    // hardware-faithfully. The pending COUNTS (not a mask) exist because
+    // one replay can latch compare AND overflow for the same timer - a
+    // mask would lose the second event. Past the replay bound (env
     // PS2X_TIMER_WALL_DEBT_MS, default 2100 ms = the M6-T3 64x grace) this
     // is a true suspension: drop, re-anchor.
     if (elapsedNs > kTimerWallDebtNs)

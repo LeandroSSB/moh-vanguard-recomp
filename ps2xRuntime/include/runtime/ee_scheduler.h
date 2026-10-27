@@ -570,9 +570,11 @@ private:
     // can latch compare AND overflow for the same timer, and a mask would
     // lose the second event. Counts do NOT multiply per period - the
     // EQUF/OVFF latches pin at most one outstanding event per timer until
-    // the guest acks, so a period that lapses while the latch is pinned is
-    // skipped hardware-faithfully (the game's dispatcher re-arms against
-    // the live count on its next ack).
+    // the guest acks. While pinned, the timer's count HOLDS at the event
+    // point (M9-T2: hardware takes the interrupt within microseconds, so
+    // the guest re-arm protocol must read the match point, never a swept
+    // count); periods that lapse inside the pinned window are skipped
+    // hardware-faithfully.
     std::array<uint32_t, 4> m_pendingEeTimerInterrupts{};
     uint64_t m_eeCycle = 0;
     // M9-T1: wall anchor for the EE timer advance (executor-thread only).
