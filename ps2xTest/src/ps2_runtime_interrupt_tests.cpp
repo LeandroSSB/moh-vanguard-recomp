@@ -131,6 +131,16 @@ namespace
     std::atomic<uint32_t> g_m9t2FillerRuns{0u};
     std::atomic<uint32_t> g_m9t2MaxQueueDepth{0u};
     uint32_t g_m9t2FirstFireSp = 0u;
+
+    // M9-T2 iteration 2: the long-dispatch decode. The verify run (with the
+    // timer lane) showed the FIFO empty while TIM1 re-arm wrapped compares
+    // (median 44775 vs healthy 5760) - the latency is the RAISE->DISPATCH
+    // window: the executor only reaches a drain gate at guest function
+    // boundaries (the M6-T2 granularity residue, 40-220 ms in heavy
+    // regimes), and the count that sweeps past the match inside that
+    // window poisons the game's own re-arm arithmetic self-sustainingly.
+    constexpr uint32_t kM9T2LongDispatchPc = 0x001607E0u;
+    std::atomic<bool> g_m9t2LongProgrammed{false};
     std::atomic<bool> g_t18Resumed{false};
     uint32_t g_t18PostVsync = 0u;
     uint32_t g_t18HandlerVsync = 0u;
@@ -775,6 +785,33 @@ namespace
             g_m9t2FirstFireSp = getRegU32(ctx, 29);
         }
         ctx->pc = 0u;
+    }
+
+    // M9-T2 iteration 2: a guest whose dispatches take longer than the
+    // timer period (25 ms blocks - the movie-phase function granularity).
+    void m9t2LongDispatchBlock(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        using clock = std::chrono::steady_clock;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        bool expected = false;
+        if (g_m9t2LongProgrammed.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        {
+            PS2Memory &memory = runtime->memory();
+            scheduler.addIrqHandler(false, 10u, kM9Tim1HandlerPc, true, 0u, 0u, 0u);
+            memory.writeIORegister(0x10000800u, 0u);     // T1_COUNT = 0
+            memory.writeIORegister(0x10000820u, 5760u);  // T1_COMPARE = 100 Hz @ bus/256
+            memory.writeIORegister(0x10000810u, 0x182u); // T1_MODE CLKS=2 | CUE | CMPE
+        }
+        scheduler.accountCycles(30000u);
+        const auto now = clock::now();
+        while (clock::now() < now + std::chrono::milliseconds(25))
+        {
+        }
+        if (clock::now() - now > std::chrono::milliseconds(2500))
+        {
+            runtime->requestStop();
+        }
+        ctx->pc = kM9T2LongDispatchPc; // loop the same block forever
     }
 
     void t18Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
@@ -1435,6 +1472,68 @@ void register_ps2_runtime_interrupt_tests()
                                                                "keep the T16 carve shape on the "
                                                                "priority lane too");
             t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "the congested timer path should not throw");
+        });
+
+        // M9-T2 iteration 2: the raise->dispatch window. With the lane in,
+        // the verify run still re-arm-wrapped compares (median 44775) with
+        // the FIFO EMPTY - the delivery latency is the executor's dispatch
+        // granularity (guest functions run 40-220 ms host-side in heavy
+        // regimes; the M6-T2 residue), and the count that sweeps past the
+        // match inside that window poisons the game's own re-arm
+        // (compare += reload - count) on EVERY delivery: the next match
+        // lands many periods out, the raises drift off the dispatch
+        // boundaries, the poison sustains itself. On hardware the
+        // interrupt is taken within microseconds - the count the handler
+        // reads IS the match point. The runtime must give the guest
+        // protocol the same view: a latched timer holds its count at the
+        // event point until the ack.
+        tc.Run("M9-T2: a timer delivery delayed by a long guest dispatch must still re-arm a healthy period (the raise-to-ack window reads as zero latency)", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kM9T2LongDispatchPc, m9t2LongDispatchBlock);
+            env.runtime.registerFunction(kM9Tim1HandlerPc, m9t2Tim1Handler);
+
+            g_m9t2Fires.store(0u, std::memory_order_release);
+            g_m9t2MaxSweepTicks.store(0u, std::memory_order_release);
+            g_m9t2FirstFireSp = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kM9T2LongDispatchPc;
+            setRegU32(mainContext, 29, kT18MainSp);
+            std::atomic<bool> schedulerThrew{false};
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+            });
+
+            const bool fired = waitUntil([]()
+            {
+                return g_m9t2Fires.load(std::memory_order_acquire) >= 12u;
+            }, std::chrono::milliseconds(400));
+            const uint32_t firesAtSnapshot = g_m9t2Fires.load(std::memory_order_acquire);
+            const uint32_t maxSweep = g_m9t2MaxSweepTicks.load(std::memory_order_acquire);
+            env.runtime.requestStop();
+            gameThread.join();
+
+            t.IsTrue(maxSweep <= 11520u, "the handler must read T1_COUNT within two periods of "
+                                         "the match even when its dispatch waits for a 25 ms "
+                                         "guest block (swept max=" +
+                                             std::to_string(maxSweep) + " ticks) - hardware "
+                                             "takes the interrupt within microseconds, so the "
+                                             "guest protocol never sees a swept count; a "
+                                             "runtime that delivers the sweep poisons every "
+                                             "re-arm and self-sustains the tbase collapse");
+            t.IsTrue(fired, "TIM1 must keep beating (>=12 fires in 400 ms) under long guest "
+                            "dispatches - a poisoned re-arm stretches the period past 50 ms "
+                            "and the game-time collapse compounds");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "the long-dispatch timer path should not throw");
         });
 
         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
