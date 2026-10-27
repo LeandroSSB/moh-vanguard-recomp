@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1237,6 +1238,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                                       << " value=0x" << std::hex << value
                                                       << " prev=0x" << previousMode
                                                       << std::dec << std::endl);
+                }
+                // M9-T3: the ack stamp - the EQUF W1C that closes the
+                // raise->ack dwell window opened by [m9t3-entry]. W1C
+                // semantics: EQUF clears iff the latched mode had it and the
+                // write carries the 1 (kEeTimerModeStatusMask path above).
+                if ((previousMode & kEeTimerModeEquf) != 0u && (value & kEeTimerModeEquf) != 0u)
+                {
+                    static const bool s_m9t3Enabled = []()
+                    {
+                        const char *env = std::getenv("PS2X_ENABLE_M9T3");
+                        return env != nullptr && env[0] == '1';
+                    }();
+                    if (s_m9t3Enabled)
+                    {
+                        const auto m9t3Now = std::chrono::steady_clock::now().time_since_epoch();
+                        RUNTIME_LOG("[m9t3-ack] t=" << std::chrono::duration_cast<std::chrono::nanoseconds>(m9t3Now).count()
+                                  << " prev=0x" << std::hex << previousMode
+                                  << " value=0x" << value << std::dec << std::endl);
+                    }
                 }
             }
             timer.mode = (value & kEeTimerModeConfigMask) | status;

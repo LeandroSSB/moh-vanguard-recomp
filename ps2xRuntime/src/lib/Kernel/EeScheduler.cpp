@@ -43,6 +43,34 @@ namespace
         return s_enabled;
     }
 
+    // M9-T3: opt-in dwell decomposition probe (PS2X_ENABLE_M9T3=1, log-only).
+    // The raise->ack dwell of every timer fire is stamped at its four chain
+    // points: [m9t3-raise] (the EQUF latch absorbed into
+    // m_pendingEeTimerInterrupts), [m9t3-dispatch] (processPendingEvents ->
+    // dispatchIrq -> the prompt lane), [m9t3-entry] (the run-loop dispatch of
+    // the 0x355300 handler invocation; sequence-tagged so the window's
+    // re-entries log as [m9t3-reentry]), and - in ps2_memory.cpp - the ack
+    // ([m9t3-ack], the EQUF W1C that closes the window). Offline pairing
+    // splits the dwell into ours (raise->dispatch, dispatch->entry) vs the
+    // guest handler's own cost (entry->ack).
+    bool ps2xM9T3Enabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *env = std::getenv("PS2X_ENABLE_M9T3");
+            return env != nullptr && env[0] == '1';
+        }();
+        return s_enabled;
+    }
+
+    uint64_t ps2xM9T3NowNs()
+    {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -715,6 +743,34 @@ void EeScheduler::run()
         try
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+            // M9-T3: the handler-entry stamp of the dwell decomposition. The
+            // timer handler invocation is recognized by its ENTRY pc (the
+            // live context pc has already moved by the first checkpoint
+            // abort) and its unique sequence: the entry dispatch opens the
+            // window, every later run-loop dispatch under the same sequence
+            // is a checkpoint re-entry inside the guest handler (counted, pc
+            // named) until the ack stamp in ps2_memory.cpp closes it.
+            if (ps2xM9T3Enabled() && m_insideInterrupt)
+            {
+                const GuestInvocation &m9t3Top = running->invocations.back();
+                static uint64_t s_m9t3TimerSeq = 0u;
+                if (m9t3Top.context.pc == 0x355300u)
+                {
+                    s_m9t3TimerSeq = m9t3Top.sequence;
+                    RUNTIME_LOG("[m9t3-entry] t=" << ps2xM9T3NowNs()
+                              << " tid=" << running->id
+                              << " seq=" << m9t3Top.sequence
+                              << " inv=" << running->invocations.size() << std::endl);
+                }
+                else if (m9t3Top.sequence == s_m9t3TimerSeq && m9t3Top.context.pc != 0u)
+                {
+                    RUNTIME_LOG("[m9t3-reentry] t=" << ps2xM9T3NowNs()
+                                << " tid=" << running->id
+                                << " seq=" << m9t3Top.sequence
+                                << " pc=0x" << std::hex << m9t3Top.context.pc
+                                << std::dec << std::endl);
+                }
+            }
             m_guestExecuting.store(true, std::memory_order_release);
             running->lastGoodPc = context.pc;
             running->lastGoodRa = static_cast<uint32_t>(_mm_extract_epi32(context.r[31], 0));
@@ -1030,6 +1086,11 @@ void EeScheduler::advanceEeTimersToWall() noexcept
             if ((raisedTotal & (1u << timer)) != 0u)
             {
                 ++m_pendingEeTimerInterrupts[timer];
+                if (ps2xM9T3Enabled())
+                {
+                    RUNTIME_LOG("[m9t3-raise] t=" << ps2xM9T3NowNs()
+                                                  << " timer=" << timer << std::endl);
+                }
                 raisedTotal &= ~(1u << timer);
             }
         }
@@ -2991,6 +3052,11 @@ void EeScheduler::processPendingEvents()
     {
         for (uint32_t raise = 0u; raise < timerInterrupts[timer]; ++raise)
         {
+            if (ps2xM9T3Enabled())
+            {
+                RUNTIME_LOG("[m9t3-dispatch] t=" << ps2xM9T3NowNs()
+                                                 << " cause=" << (9u + timer) << std::endl);
+            }
             dispatchIrq(false, 9u + timer, true);
         }
     }
