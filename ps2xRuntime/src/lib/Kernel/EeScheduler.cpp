@@ -299,6 +299,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
         m_events.clear();
         m_deadlines.clear();
         m_pendingInvocations.clear();
+        m_pendingTimerInvocations.clear();
         m_deferredInvocations.clear();
     }
     m_eventSequence = 0;
@@ -347,7 +348,7 @@ void EeScheduler::run()
         if (m_currentThreadId == 0)
         {
             GuestThread *next = selectReady();
-            if (!next && m_pendingInvocations.empty())
+            if (!next && m_pendingInvocations.empty() && m_pendingTimerInvocations.empty())
             {
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
@@ -362,8 +363,20 @@ void EeScheduler::run()
             else
             {
                 GuestThread *owner = &acquireInvocationThread();
-                GuestInvocation invocation = std::move(m_pendingInvocations.front());
-                m_pendingInvocations.pop_front();
+                // M9-T2: the prompt timer lane drains first - a wall-raised
+                // timer IRQ must not queue behind the completion backlog.
+                const bool timerLane = !m_pendingTimerInvocations.empty();
+                GuestInvocation invocation = timerLane
+                                                 ? std::move(m_pendingTimerInvocations.front())
+                                                 : std::move(m_pendingInvocations.front());
+                if (timerLane)
+                {
+                    m_pendingTimerInvocations.pop_front();
+                }
+                else
+                {
+                    m_pendingInvocations.pop_front();
+                }
                 // M9-T2: the acquisition path is one of the two drain
                 // gates for prompt timer deliveries (it fires only when
                 // NO thread is ready). Count its pops so the stall dump
@@ -522,10 +535,22 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty() && running->invocations.empty())
+        // M9-T2: the nest gate also drains the prompt timer lane first.
+        if ((!m_pendingInvocations.empty() || !m_pendingTimerInvocations.empty()) &&
+            running->invocations.empty())
         {
-            GuestInvocation invocation = std::move(m_pendingInvocations.front());
-            m_pendingInvocations.pop_front();
+            const bool timerLane = !m_pendingTimerInvocations.empty();
+            GuestInvocation invocation = timerLane
+                                             ? std::move(m_pendingTimerInvocations.front())
+                                             : std::move(m_pendingInvocations.front());
+            if (timerLane)
+            {
+                m_pendingTimerInvocations.pop_front();
+            }
+            else
+            {
+                m_pendingInvocations.pop_front();
+            }
             // M9-T2: the nest path is the other drain gate (fires only
             // while the running thread carries NO live invocation). Its
             // pop count next to [m9t2-acquire] names which gate died.
@@ -936,6 +961,7 @@ void EeScheduler::advanceEeTimersToWall()
                  << "," << m_pendingEeTimerInterrupts[2]
                  << "," << m_pendingEeTimerInterrupts[3] << "}"
                  << " q=" << m_pendingInvocations.size()
+                 << "+" << m_pendingTimerInvocations.size()
                  << " t1 mode=0x" << std::hex << t1.mode
                  << " cnt=" << std::dec << t1.count
                  << " cmp=" << t1.compare
@@ -1778,7 +1804,13 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
 // for a wall-raised timer IRQ drops from "behind the whole completion
 // backlog" to at most one executor pass - the SDK re-arm invariant
 // (delivery latency << the 10 ms period) holds again.
-
+void EeScheduler::queuePromptTimerInvocation(GuestInvocation invocation)
+{
+    assertExecutor();
+    invocation.sequence = ++m_invocationSequence;
+    m_pendingTimerInvocations.push_back(std::move(invocation));
+    m_checkpointPending.store(true, std::memory_order_release);
+}
 
 // M5-T16: the async-invocation hold-for-vsync queue. The executor posts
 // here from the SIF-cmd synthesis (sceSifSendCmd); processEvent drains it
@@ -2308,7 +2340,19 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause, bool promptShapedDelive
             {
                 SET_GPR_U32(&invocation.context, 29, carveInvocationSp());
             }
-            queueInvocation(std::move(invocation));
+            if (!dmac && cause >= 9u && cause <= 12u)
+            {
+                // M9-T2: prompt timer deliveries ride the dedicated lane -
+                // the shared FIFO carried seconds of SIF/CD backlog in the
+                // decode run, and the late delivery wraps the game's
+                // re-arm arithmetic (compare += reload - count) into a
+                // multi-period oscillation.
+                queuePromptTimerInvocation(std::move(invocation));
+            }
+            else
+            {
+                queueInvocation(std::move(invocation));
+            }
         }
     }
 }

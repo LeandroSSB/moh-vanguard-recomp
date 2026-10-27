@@ -351,6 +351,10 @@ public:
     // right now (the congestion the prompt timer lane must jump).
     [[nodiscard]] size_t pendingInvocationCount() const noexcept { return m_pendingInvocations.size(); }
 
+    // M9-T2: the prompt cause-9..12 lane (m_pendingTimerInvocations) -
+    // same checkpoint semantics as queueInvocation, but the drain sites
+    // pop it BEFORE the shared FIFO.
+    void queuePromptTimerInvocation(GuestInvocation invocation);
     // M5-T16: hold an async invocation until a later vsync boundary. The
     // synthesized SIF-cmd completions (the T2 loader handshake) posted
     // INLINE at request time let main's loader/pump wake inside the
@@ -588,6 +592,16 @@ private:
     std::vector<ScheduledEvent> m_deadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
 
+    // M9-T2: the prompt cause-9..12 delivery lane. The shared FIFO above
+    // also carries SIF/CD/vsync completion traffic; the decode run measured
+    // it 67-201 deep under movie-phase pass cadence, holding each timer
+    // delivery behind seconds of backlog - the SDK dispatcher's re-arm
+    // (compare += reload - count) reads a T1_COUNT that swept whole periods
+    // past the match and wraps into a multi-period oscillation (tbase
+    // collapse, then the EQUF latch pins it shut: the freeze). On hardware
+    // the interrupt controller latches the timer causes ahead of any
+    // software completion queue; the lane gives them the same jump.
+    std::deque<GuestInvocation> m_pendingTimerInvocations;
 
     // M5-T16: async invocations held until a vsync boundary (guarded by
     // m_eventMutex, drained on the executor from processEvent).
