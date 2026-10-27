@@ -982,7 +982,13 @@ void EeScheduler::run()
             running->lastGoodPc = context.pc;
             running->lastGoodRa = static_cast<uint32_t>(_mm_extract_epi32(context.r[31], 0));
             running->lastGoodSp = static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0));
-            ps2xM9T4Gap().lastPc = context.pc;
+            // M9-T4 fix: the lastPc bookkeeping is probe state - keep the
+            // claim "gated no-ops with the env unset" true for this store
+            // too (behavior-neutral when enabled: the store still runs).
+            if (ps2xM9T4Enabled())
+            {
+                ps2xM9T4Gap().lastPc = context.pc;
+            }
             function(m_rdram, &context, &m_runtime);
             if (ps2xM9T4Enabled())
             {
