@@ -316,6 +316,18 @@ public:
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
 
+    // M9-T2 decode probe (runtime-only, opt-in): read a timer's latched
+    // state without disturbing it - mode (EQUF/CUE bits), count, compare.
+    // The EQUF latch is the raise-side half of the cause-10 completion
+    // stall; the dump names which side of the raise/ack pair is stuck.
+    struct EeTimerDebugState
+    {
+        uint32_t mode = 0;
+        uint32_t count = 0;
+        uint32_t compare = 0;
+    };
+    [[nodiscard]] EeTimerDebugState eeTimerDebugState(size_t timerIndex) const noexcept;
+
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }

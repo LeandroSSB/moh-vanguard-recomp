@@ -28,6 +28,21 @@ namespace
         return s_enabled;
     }
 
+    // M9-T2: opt-in decode probe (PS2X_ENABLE_M9T2=1) for the cause-10
+    // completion stall - per-pass pending/raise/dispatch counts, the TIM1
+    // latch state (EQUF/CUE/count/compare) and the invocation drain
+    // (pending queue depth, per-thread invocation depths, acquisition
+    // path counters) sampled at a 1 Hz wall cadence.
+    bool ps2xM9T2Enabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *env = std::getenv("PS2X_ENABLE_M9T2");
+            return env != nullptr && env[0] == '1';
+        }();
+        return s_enabled;
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -349,6 +364,25 @@ void EeScheduler::run()
                 GuestThread *owner = &acquireInvocationThread();
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
+                // M9-T2: the acquisition path is one of the two drain
+                // gates for prompt timer deliveries (it fires only when
+                // NO thread is ready). Count its pops so the stall dump
+                // can separate "queued and never acquired" from
+                // "acquired and never completed".
+                if (ps2xM9T2Enabled())
+                {
+                    static uint64_t s_t8Acquires = 0u;
+                    ++s_t8Acquires;
+                    if (s_t8Acquires <= 12u || (s_t8Acquires % 512u) == 0u)
+                    {
+                        RUNTIME_LOG("[m9t2-acquire] pop #" << s_t8Acquires
+                                   << " owner=" << owner->id
+                                   << " kind=" << static_cast<int>(invocation.kind)
+                                   << " entry=0x" << std::hex << invocation.context.pc
+                                   << " remaining=" << std::dec << m_pendingInvocations.size()
+                                   << std::endl);
+                    }
+                }
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
@@ -431,6 +465,23 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                // M9-T2: completion counter per invocation kind - the tail
+                // of the delivery chain. Compare against the acquire/nest
+                // push counters: pushes without pops = handlers that never
+                // return; pops without pushes is impossible.
+                if (ps2xM9T2Enabled() &&
+                    completed.kind == GuestInvocationKind::Interrupt)
+                {
+                    static uint64_t s_t8Iret = 0u;
+                    ++s_t8Iret;
+                    if (s_t8Iret <= 12u || (s_t8Iret % 512u) == 0u)
+                    {
+                        RUNTIME_LOG("[m9t2-iret] complete #" << s_t8Iret
+                                   << " owner=" << running->id
+                                   << " entry=0x" << std::hex << completed.context.pc
+                                   << std::dec << std::endl);
+                    }
+                }
                 if (completed.usesMainStack && m_mainStackUsers > 0)
                 {
                     --m_mainStackUsers;
@@ -475,6 +526,23 @@ void EeScheduler::run()
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
+            // M9-T2: the nest path is the other drain gate (fires only
+            // while the running thread carries NO live invocation). Its
+            // pop count next to [m9t2-acquire] names which gate died.
+            if (ps2xM9T2Enabled())
+            {
+                static uint64_t s_t8Nests = 0u;
+                ++s_t8Nests;
+                if (s_t8Nests <= 12u || (s_t8Nests % 512u) == 0u)
+                {
+                    RUNTIME_LOG("[m9t2-nest] push #" << s_t8Nests
+                               << " owner=" << running->id
+                               << " kind=" << static_cast<int>(invocation.kind)
+                               << " entry=0x" << std::hex << invocation.context.pc
+                               << " remaining=" << std::dec << m_pendingInvocations.size()
+                               << std::endl);
+                }
+            }
             // M5-T14: bindInvocationStack self-guards - explicit-sp
             // invocations get their main-stack residency marked there.
             bindInvocationStack(*running, invocation);
@@ -770,9 +838,13 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 // the T16 carve shape (dispatchIrq promptShapedDelivery) - the SDK
 // dispatcher's re-arm arithmetic needs delivery latency << the 10 ms
 // period, so the M5-T18 vsync-deferred delivery would break the invariant.
-// Stall policy = the M6-T3 wall-chain policy: past the grace the debt is
-// DROPPED and the chain re-anchors (env PS2X_TIMER_WALL_DEBT_MS, default
-// 40 ms ~= 2 vsync periods of grace).
+// Stall policy (M9-T1, second iteration): the debt is REPLAYED in slices,
+// not dropped; past the replay bound (env PS2X_TIMER_WALL_DEBT_MS, default
+// 2100 ms = the M6-T3 64x grace) it is a true suspension and the chain
+// re-anchors. REPLAY means the count sweeps every owed period - the
+// raised IRQs stay subject to the guest-side EQUF discipline (see the
+// replay block inside): a period that lapses while the latch is pinned
+// is skipped hardware-faithfully, never multiplied into a raise storm.
 void EeScheduler::advanceEeTimersToWall()
 {
     const auto now = std::chrono::steady_clock::now();
@@ -809,11 +881,18 @@ void EeScheduler::advanceEeTimersToWall()
     // cut of this fix kept a 40 ms drop grace and the Vanguard executor -
     // whose passes land 40-220 ms apart under the function-granularity
     // preemption residue - lost ~83% of the timer beats: tbase 17/s). The
-    // debt is replayed in slices; each slice may latch each timer once and
-    // every owed period is delivered as a distinct IRQ (the game's
-    // dispatcher re-arms per delivery and guards its wheel with 0x510690).
-    // Past the replay bound (env PS2X_TIMER_WALL_DEBT_MS, default 2100 ms =
-    // the M6-T3 64x grace) this is a true suspension: drop, re-anchor.
+    // replay sweeps the count through every owed period, but the RAISES
+    // stay under the guest-side latch discipline (advanceEeTimers): a
+    // timer raises only while its EQUF/OVFF latch is clear, so AT MOST ONE
+    // compare event per timer survives a stall - the periods that lapse
+    // while the latch is pinned are skipped hardware-faithfully (the
+    // game's dispatcher acks once and its re-arm compare += reload - count
+    // re-anchors the phase to the live count; it guards its wheel with
+    // 0x510690). The pending COUNTS (not a mask) exist because one replay
+    // can latch compare AND overflow for the same timer - a mask would
+    // lose the second event. Past the replay bound (env
+    // PS2X_TIMER_WALL_DEBT_MS, default 2100 ms = the M6-T3 64x grace) this
+    // is a true suspension: drop, re-anchor.
     if (elapsedNs > kTimerWallDebtNs)
     {
         static uint32_t s_t8DebtDrops = 0u;
@@ -831,6 +910,76 @@ void EeScheduler::advanceEeTimersToWall()
     if (slices == 0u)
     {
         slices = 1u;
+    }
+    // M9-T2 decode: a 1 Hz wall-cadence snapshot of the whole raise ->
+    // dispatch -> ack chain. Answers, at the freeze point: does the wall
+    // advance still run (pass counter), do timers still raise (pendings),
+    // is the raise blocked by the EQUF latch (mode bit - the ack-side
+    // half), is the count still sweeping (CUE), and where do delivered
+    // invocations pile up (pending-queue depth + per-thread depths).
+    if (ps2xM9T2Enabled())
+    {
+        static uint64_t s_t8PassCount = 0u;
+        static std::chrono::steady_clock::time_point s_t8DumpAnchor{};
+        ++s_t8PassCount;
+        const auto nowDump = std::chrono::steady_clock::now();
+        if (s_t8DumpAnchor.time_since_epoch().count() == 0 ||
+            nowDump - s_t8DumpAnchor >= std::chrono::seconds(1))
+        {
+            s_t8DumpAnchor = nowDump;
+            const PS2Memory::EeTimerDebugState t1 = m_runtime.memory().eeTimerDebugState(1u);
+            const PS2Memory::EeTimerDebugState t2 = m_runtime.memory().eeTimerDebugState(2u);
+            std::ostringstream dump;
+            dump << "[m9t2-stall] pass=" << s_t8PassCount
+                 << " pend={" << m_pendingEeTimerInterrupts[0]
+                 << "," << m_pendingEeTimerInterrupts[1]
+                 << "," << m_pendingEeTimerInterrupts[2]
+                 << "," << m_pendingEeTimerInterrupts[3] << "}"
+                 << " q=" << m_pendingInvocations.size()
+                 << " t1 mode=0x" << std::hex << t1.mode
+                 << " cnt=" << std::dec << t1.count
+                 << " cmp=" << t1.compare
+                 << std::hex << " (equf=" << ((t1.mode & 0x400u) ? 1 : 0)
+                 << " cue=" << ((t1.mode & 0x80u) ? 1 : 0) << ")"
+                 << " t2 mode=0x" << t2.mode
+                 << " cnt=" << std::dec << t2.count
+                 << " cmp=" << t2.compare
+                 << std::hex << " (equf=" << ((t2.mode & 0x400u) ? 1 : 0)
+                 << " cue=" << ((t2.mode & 0x80u) ? 1 : 0) << ")"
+                 << std::dec;
+            const GuestThread *runningDump = currentThread();
+            dump << " run=";
+            if (runningDump != nullptr)
+            {
+                dump << runningDump->id << " inv=" << runningDump->invocations.size();
+            }
+            else
+            {
+                dump << "-0";
+            }
+            dump << " mainUsers=" << m_mainStackUsers;
+            uint32_t dispatchers = 0u;
+            uint32_t dispatchersDormant = 0u;
+            dump << " threads=[";
+            for (const auto &[dumpId, dumpThread] : m_threads)
+            {
+                if (dumpId < 0)
+                {
+                    ++dispatchers;
+                    if (dumpThread.status == EeThreadStatus::Dormant &&
+                        dumpThread.invocations.empty())
+                    {
+                        ++dispatchersDormant;
+                    }
+                    continue;
+                }
+                dump << dumpId << ":"
+                     << static_cast<int>(dumpThread.status) << ":"
+                     << dumpThread.invocations.size() << " ";
+            }
+            dump << "] disp=" << dispatchers << "/" << dispatchersDormant;
+            RUNTIME_LOG(dump.str() << std::endl);
+        }
     }
     uint32_t raisedTotal = 0u;
     while (elapsedCycles > 0u)
@@ -1623,6 +1772,14 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     m_checkpointPending.store(true, std::memory_order_release);
 }
 
+// M9-T2: the prompt cause-9..12 lane. Same checkpoint semantics as
+// queueInvocation; the drain sites (the idle acquisition and the running
+// nest path) pop this deque BEFORE m_pendingInvocations. Delivery latency
+// for a wall-raised timer IRQ drops from "behind the whole completion
+// backlog" to at most one executor pass - the SDK re-arm invariant
+// (delivery latency << the 10 ms period) holds again.
+
+
 // M5-T16: the async-invocation hold-for-vsync queue. The executor posts
 // here from the SIF-cmd synthesis (sceSifSendCmd); processEvent drains it
 // on VBlankStart, so a deferred reply can never beat the next vsync
@@ -1714,6 +1871,28 @@ void EeScheduler::bindInvocationStack(GuestThread &owner, GuestInvocation &invoc
         {
             invocation.usesMainStack = true;
             ++m_mainStackUsers;
+        }
+        // M9-T2 (T1-review gap, now closed): the explicit-sp path returned
+        // BEFORE the bind trace, so the prompt timer deliveries (which
+        // arrive pre-bound on the carve sp) were invisible to it - the
+        // exact deliveries the stall decode needs. Trace them here too,
+        // marked exp=1.
+        if (ps2xM5T12Enabled() || ps2xM9T2Enabled())
+        {
+            static const char *kBindKinds[] = {
+                "Interrupt", "Alarm", "GsCallback", "RpcCallback",
+                "SyscallOverride", "ExitHandler", "HleCall", "SifCommand",
+            };
+            const size_t kindIndex = static_cast<size_t>(invocation.kind);
+            RUNTIME_LOG("[m5t12-bind] owner=" << owner.id
+                       << " kind=" << (kindIndex < sizeof(kBindKinds) / sizeof(kBindKinds[0]) ? kBindKinds[kindIndex] : "?")
+                       << " seq=" << std::dec << invocation.sequence
+                       << " entry=0x" << std::hex << invocation.context.pc
+                       << " sp=0x" << explicitSp
+                       << " exp=1"
+                       << " ownSp=0x" << getRegU32(&owner.activeContext(), 29)
+                       << " mainStack=" << invocation.usesMainStack
+                       << std::dec << std::endl);
         }
         return; // the caller already bound an explicit stack
     }
@@ -2062,12 +2241,17 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause, bool promptShapedDelive
     }
     if (!dmac && cause >= 9u && cause <= 12u)
     {
-        static uint32_t s_t8DispatchedTimer = 0u;
-        ++s_t8DispatchedTimer;
-        if (s_t8DispatchedTimer <= 12u || (s_t8DispatchedTimer % 512u) == 0u)
+        // M9-T2: per-cause counters (the old single shared counter made a
+        // late "#1536" line ambiguous between cause 10 and cause 11 - the
+        // stall decode needs to know WHICH timer stopped dispatching).
+        static uint32_t s_t8DispatchedByCause[4] = {};
+        const uint32_t causeIndex = cause - 9u;
+        ++s_t8DispatchedByCause[causeIndex];
+        if (s_t8DispatchedByCause[causeIndex] <= 12u ||
+            (s_t8DispatchedByCause[causeIndex] % 512u) == 0u)
         {
             RUNTIME_LOG("[t8-irq] timer cause " << cause
-                                                << " dispatched #" << s_t8DispatchedTimer << std::endl);
+                                                << " dispatched #" << s_t8DispatchedByCause[causeIndex] << std::endl);
         }
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;

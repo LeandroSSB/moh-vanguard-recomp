@@ -405,6 +405,18 @@ void PS2Memory::resetEeTimers() noexcept
     m_eeTimers = {};
 }
 
+PS2Memory::EeTimerDebugState PS2Memory::eeTimerDebugState(size_t timerIndex) const noexcept
+{
+    EeTimerDebugState state;
+    if (timerIndex < m_eeTimers.size())
+    {
+        state.mode = m_eeTimers[timerIndex].mode;
+        state.count = m_eeTimers[timerIndex].count & 0xFFFFu;
+        state.compare = m_eeTimers[timerIndex].compare & 0xFFFFu;
+    }
+    return state;
+}
+
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 {
     if (eeCycles == 0u)

@@ -346,6 +346,11 @@ public:
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
     void queueInvocation(GuestInvocation invocation);
+
+    // M9-T2: decode probe - how many invocations sit in the shared FIFO
+    // right now (the congestion the prompt timer lane must jump).
+    [[nodiscard]] size_t pendingInvocationCount() const noexcept { return m_pendingInvocations.size(); }
+
     // M5-T16: hold an async invocation until a later vsync boundary. The
     // synthesized SIF-cmd completions (the T2 loader handshake) posted
     // INLINE at request time let main's loader/pump wake inside the
@@ -557,9 +562,13 @@ private:
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
-    // M9-T1: pending TIM0..TIM3 raise COUNTS (not a mask): the wall replay
-    // can owe several periods of one timer after an executor stall, and each
-    // owed period is a distinct IRQ the game's dispatcher re-arms against.
+    // M9-T1: pending TIM0..TIM3 raise COUNTS (not a mask): one wall replay
+    // can latch compare AND overflow for the same timer, and a mask would
+    // lose the second event. Counts do NOT multiply per period - the
+    // EQUF/OVFF latches pin at most one outstanding event per timer until
+    // the guest acks, so a period that lapses while the latch is pinned is
+    // skipped hardware-faithfully (the game's dispatcher re-arms against
+    // the live count on its next ack).
     std::array<uint32_t, 4> m_pendingEeTimerInterrupts{};
     uint64_t m_eeCycle = 0;
     // M9-T1: wall anchor for the EE timer advance (executor-thread only).
@@ -578,6 +587,7 @@ private:
     std::deque<EeEvent> m_events;
     std::vector<ScheduledEvent> m_deadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
+
 
     // M5-T16: async invocations held until a vsync boundary (guarded by
     // m_eventMutex, drained on the executor from processEvent).

@@ -116,6 +116,21 @@ namespace
     uint32_t g_m9FirstFireVsync = 0u;
     uint32_t g_m9FirstFireSp = 0u;
     uint32_t g_m9PostVsync = 0u;
+
+    // M9-T2: the FIFO-congestion decode. The in-vivo shape: the shared
+    // pending-invocation FIFO measured 67-201 deep in the fixed build
+    // ([m9t2-stall] q=89..201) while TIM1 re-armed compare values like
+    // 59595/64146 (= the SDK re-arm (compare += reload - count) wrapped by
+    // a whole-sweep-late delivery) and tbase collapsed to ~15/s - the
+    // completion stall of the M9-T1 fixed runs.
+    constexpr uint32_t kM9T2CongestedPc = 0x001607A0u;
+    constexpr uint32_t kM9T2FillerPc = 0x001607C0u;
+    std::atomic<uint32_t> g_m9t2Fires{0u};
+    std::atomic<bool> g_m9t2Programmed{false};
+    std::atomic<uint32_t> g_m9t2MaxSweepTicks{0u};
+    std::atomic<uint32_t> g_m9t2FillerRuns{0u};
+    std::atomic<uint32_t> g_m9t2MaxQueueDepth{0u};
+    uint32_t g_m9t2FirstFireSp = 0u;
     std::atomic<bool> g_t18Resumed{false};
     uint32_t g_t18PostVsync = 0u;
     uint32_t g_t18HandlerVsync = 0u;
@@ -666,6 +681,98 @@ namespace
         {
             g_m9FirstFireVsync = static_cast<uint32_t>(runtime->eeScheduler().currentVSyncTick());
             g_m9FirstFireSp = getRegU32(ctx, 29);
+        }
+        ctx->pc = 0u;
+    }
+
+    // M9-T2: the movie-phase congestion shape - the guest loops ~1.05 ms
+    // passes and keeps the SHARED pending-invocation FIFO saturated with
+    // completion traffic (192 seeded, 4 more per pass), the way the SIF/CD
+    // completion storm saturated it in the decode run.
+    void m9t2CongestedBlock(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        using clock = std::chrono::steady_clock;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        bool expected = false;
+        if (g_m9t2Programmed.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        {
+            PS2Memory &memory = runtime->memory();
+            scheduler.addIrqHandler(false, 10u, kM9Tim1HandlerPc, true, 0u, 0u, 0u);
+            memory.writeIORegister(0x10000800u, 0u);     // T1_COUNT = 0
+            memory.writeIORegister(0x10000820u, 5760u);  // T1_COMPARE = 100 Hz @ bus/256
+            memory.writeIORegister(0x10000810u, 0x182u); // T1_MODE CLKS=2 | CUE | CMPE
+            for (uint32_t i = 0u; i < 192u; ++i)
+            {
+                GuestInvocation invocation{};
+                invocation.kind = GuestInvocationKind::Interrupt;
+                invocation.tag = i;
+                invocation.context.pc = kM9T2FillerPc;
+                setRegU32(invocation.context, 31, 0u);
+                scheduler.queueInvocation(std::move(invocation));
+            }
+        }
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.tag = 1000u + i;
+            invocation.context.pc = kM9T2FillerPc;
+            setRegU32(invocation.context, 31, 0u);
+            scheduler.queueInvocation(std::move(invocation));
+        }
+        uint32_t prevDepth = g_m9t2MaxQueueDepth.load(std::memory_order_acquire);
+        const uint32_t depth = static_cast<uint32_t>(scheduler.pendingInvocationCount());
+        while (depth > prevDepth &&
+               !g_m9t2MaxQueueDepth.compare_exchange_weak(prevDepth, depth, std::memory_order_acq_rel))
+        {
+        }
+        scheduler.accountCycles(30000u);
+        const auto now = clock::now();
+        while (clock::now() < now + std::chrono::microseconds(1050))
+        {
+        }
+        if (clock::now() - now > std::chrono::milliseconds(2500))
+        {
+            runtime->requestStop();
+        }
+        ctx->pc = kM9T2CongestedPc; // loop the same block forever
+    }
+
+    void m9t2FillerHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_m9t2FillerRuns.fetch_add(1u, std::memory_order_acq_rel);
+        // A completion costs real guest time in-vivo (the SIF/CD reply
+        // dispatches) - the drain is paced by DISPATCHES, not by the
+        // sub-microsecond pc==0 pop loop.
+        const auto now = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() < now + std::chrono::microseconds(1000))
+        {
+        }
+        ctx->pc = 0u;
+    }
+
+    // Re-arms EXACTLY like the game's dispatcher (sub_00355300): the SDK
+    // arithmetic compare += reload - count against the live T1_COUNT - the
+    // arithmetic a late delivery poisons.
+    void m9t2Tim1Handler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        PS2Memory &memory = runtime->memory();
+        const uint32_t sweptCount = memory.readIORegister(0x10000800u) & 0xFFFFu;
+        const uint32_t compareOld = memory.readIORegister(0x10000820u) & 0xFFFFu;
+        const uint32_t sweep = (sweptCount - compareOld) & 0xFFFFu; // ticks past the match
+        uint32_t prevMax = g_m9t2MaxSweepTicks.load(std::memory_order_acquire);
+        while (sweep > prevMax &&
+               !g_m9t2MaxSweepTicks.compare_exchange_weak(prevMax, sweep, std::memory_order_acq_rel))
+        {
+        }
+        const uint32_t compareNew = (5760u + compareOld - sweptCount) & 0xFFFFu;
+        memory.writeIORegister(0x10000800u, 0u);
+        memory.writeIORegister(0x10000820u, compareNew);
+        memory.writeIORegister(0x10000810u, memory.readIORegister(0x10000810u) | 0x400u);
+        const uint32_t previous = g_m9t2Fires.fetch_add(1u, std::memory_order_acq_rel);
+        if (previous == 0u)
+        {
+            g_m9t2FirstFireSp = getRegU32(ctx, 29);
         }
         ctx->pc = 0u;
     }
@@ -1255,6 +1362,79 @@ void register_ps2_runtime_interrupt_tests()
                                                                        "shape), never the stackless "
                                                                        "fallback into main's "
                                                                        "below-sp band");
+        });
+
+        // M9-T2: the completion-stall decode. The M9-T1 fix made the
+        // timers advance on the wall, but the prompt deliveries still rode
+        // the SHARED pending-invocation FIFO - which the decode run
+        // measured 67-201 deep (SIF/CD/vsync completion traffic) with the
+        // handler re-arming wrapped compares (59595/64146) and tbase
+        // collapsed to ~15/s: a delivery that lands whole sweeps late
+        // makes the SDK re-arm (compare += reload - count) wrap into a
+        // multi-period oscillation, and once EQUF latches with its
+        // delivery stuck the timer never raises again (the 1239 freeze).
+        // Hardware latches the timer causes ahead of any completion
+        // queue; the runtime must too.
+        tc.Run("M9-T2: a wall-raised timer delivery must not wait behind the shared invocation FIFO (late delivery poisons the SDK re-arm)", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kM9T2CongestedPc, m9t2CongestedBlock);
+            env.runtime.registerFunction(kM9T2FillerPc, m9t2FillerHandler);
+            env.runtime.registerFunction(kM9Tim1HandlerPc, m9t2Tim1Handler);
+
+            g_m9t2Fires.store(0u, std::memory_order_release);
+            g_m9t2Programmed.store(false, std::memory_order_release);
+            g_m9t2MaxSweepTicks.store(0u, std::memory_order_release);
+            g_m9t2FillerRuns.store(0u, std::memory_order_release);
+            g_m9t2MaxQueueDepth.store(0u, std::memory_order_release);
+            g_m9t2FirstFireSp = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kM9T2CongestedPc;
+            setRegU32(mainContext, 29, kT18MainSp);
+            std::atomic<bool> schedulerThrew{false};
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+            });
+
+            const bool fired = waitUntil([]()
+            {
+                return g_m9t2Fires.load(std::memory_order_acquire) >= 20u;
+            }, std::chrono::milliseconds(400));
+            const uint32_t firesAtSnapshot = g_m9t2Fires.load(std::memory_order_acquire);
+            const uint32_t maxSweep = g_m9t2MaxSweepTicks.load(std::memory_order_acquire);
+            const uint32_t maxDepth = g_m9t2MaxQueueDepth.load(std::memory_order_acquire);
+            const uint32_t firstSp = g_m9t2FirstFireSp;
+            env.runtime.requestStop();
+            gameThread.join();
+
+            t.IsTrue(maxDepth >= 100u, "the harness must actually congest the shared FIFO "
+                                       "(max depth " +
+                                           std::to_string(maxDepth) + ") - the seeded backlog "
+                                           "is what makes every timer delivery wait behind "
+                                           "real dispatch cost");
+            t.IsTrue(fired, "TIM1 at 100 Hz wall must keep firing (>=20 in 400 ms) while the "
+                            "shared invocation FIFO carries a completion backlog - the decode "
+                            "run measured tbase collapsing to ~15/s with the FIFO 67-201 deep");
+            t.IsTrue(maxSweep <= 11520u, "the handler must read T1_COUNT within two periods of "
+                                         "the match (swept max=" +
+                                             std::to_string(maxSweep) + " ticks) - the SDK "
+                                             "re-arm (compare += reload - count) wraps into a "
+                                             "multi-period oscillation when delivery lands "
+                                             "whole sweeps late, and the next match lands "
+                                             "many periods in the future (the tbase collapse)");
+            t.Equals(firstSp, kMainInvocationCarveTop - 0x10u, "the prompt timer callback must "
+                                                               "keep the T16 carve shape on the "
+                                                               "priority lane too");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "the congested timer path should not throw");
         });
 
         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
