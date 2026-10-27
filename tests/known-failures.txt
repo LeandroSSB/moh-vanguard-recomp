@@ -1,0 +1,8 @@
+# Known-flaky ps2x_tests entries, one per line, "suite :: test" (MiniTest names).
+# tools/ci/run_suite.py fails the job on ANY test not listed here (no retry),
+# retries a listed one exactly once, and warns when a listed one passes so the
+# line can be retired. Mechanisms and policy: tests/KNOWN-FAILURES.md.
+# Never add a line here to hide a regression - each entry needs a mechanism and
+# evidence in KNOWN-FAILURES.md.
+PS2RuntimeInterrupt :: M6-T3: beats missed under a zero-cycle stall are replayed bounded, not dropped
+PS2GS :: sceGsSyncV resumes through the scheduler with deterministic field parity

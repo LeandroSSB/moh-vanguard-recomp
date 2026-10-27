@@ -1,0 +1,70 @@
+# Quality control that needs no game data. The ps2x toolchain (analyzer,
+# recompiler) and the ps2x_tests suite are game-independent: every test
+# registers its own guest functions in a fresh PS2Runtime, so a clean clone
+# builds and runs the whole suite (proven: CI green runs reach
+# "Total Tests: 496" with zero game files present).
+#
+# The runner target (ps2EntryRunner) is deliberately NOT built here: it is
+# only useful with the recompiled "gen" output, which needs the game itself
+# (AGENTS.md, mine #1). Game data never enters CI.
+#
+# Known-flaky policy (tests/KNOWN-FAILURES.md, enforced by
+# tools/ci/run_suite.py): wall-clock-sensitive scheduler tests can fail on a
+# cold/loaded runner. A listed test is retried ONCE, scoped to its suite, and
+# only when the failing set matches tests/known-failures.txt exactly. Any
+# other failure fails the job with no retry: a known-failure must never mask
+# a NEW regression.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-msvc:
+    name: windows-msvc (toolchain + suite, no game data)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: lukka/get-cmake@latest
+
+      - uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Configure (PS2X_ENABLE_AGRESSIVE_LOGS=ON)
+        run: cmake -S . -B build -DPS2X_ENABLE_AGRESSIVE_LOGS=ON
+
+      # Suite + analyzer + recompiler only. No ps2EntryRunner: it needs the
+      # gen output, which needs the game - never in CI.
+      - name: Build (ps2x_tests, ps2_analyzer, ps2_recomp)
+        run: cmake --build build --config Release --target ps2x_tests ps2_analyzer ps2_recomp
+
+      # From the repo root (AGENTS.md). The wrapper parses the MiniTest
+      # output, applies tests/known-failures.txt and retries a listed flake
+      # exactly once.
+      - name: Run ps2x_tests
+        shell: pwsh
+        run: python tools/ci/run_suite.py build/ps2xTest/Release/ps2x_tests.exe tests/known-failures.txt
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-logs-${{ github.run_id }}
+          path: |
+            ps2x_tests.log
+            ps2x_tests_retry.log
+          if-no-files-found: ignore
+          retention-days: 14

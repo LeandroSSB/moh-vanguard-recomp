@@ -1,5 +1,7 @@
 # Medal of Honor: Vanguard — Recompilação Estática PS2
 
+[![CI](https://github.com/LeandroSSB/moh-vanguard-recomp/actions/workflows/ci.yml/badge.svg)](https://github.com/LeandroSSB/moh-vanguard-recomp/actions/workflows/ci.yml)
+
 Port nativo de PC de **Medal of Honor: Vanguard (PS2, NTSC-U SLUS-215.97)** via recompilação estática com [PS2Recomp](https://github.com/ran-j/PS2Recomp). Controles de FPS com mouse + teclado, clock NTSC 59.94 fiel, e o diário completo da pesquisa de bring-up.
 
 [![status](https://img.shields.io/badge/status-not_playable_end--to--end_yet-orange)](docs/research-frontier.md)
