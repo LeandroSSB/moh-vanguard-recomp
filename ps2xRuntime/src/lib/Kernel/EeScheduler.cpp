@@ -71,6 +71,126 @@ namespace
                 .count());
     }
 
+    // M9-T4: opt-in executor-stall probe (PS2X_ENABLE_M9T4=1, log-only).
+    // The T3 dwell decomposition left a common-mode ~103 ms silent executor
+    // stall (~0.7/s, both legs' tails) attributed as INTERPRETATION to host
+    // contention vs runtime locks. This probe names the owner per gap:
+    // - [m9t4-gap]  run-loop pass: wall dt since the previous pass, split
+    //               into busy (inside function() dispatches), park (CV waits
+    //               in waitForEvent/pacing) and other (lock waits, log
+    //               flushes, descheduling - whatever is left).
+    // - [m9t4-park] a CV wait >= threshold (default 20 ms), with the
+    //               overshoot past the planned deadline (scheduling latency
+    //               evidence) and whether it was signaled early.
+    // - [m9t4-lock] an executor-side GS m_stateMutex acquisition that waited
+    //               >= threshold (default 5 ms) - gs_frontend.cpp.
+    // - [m9t4-log]  the [m9t3-raise] stamp line (cout + runtime_log ring
+    //               mutex) that took >= threshold to emit.
+    bool ps2xM9T4Enabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *env = std::getenv("PS2X_ENABLE_M9T4");
+            return env != nullptr && env[0] == '1';
+        }();
+        return s_enabled;
+    }
+
+    uint64_t ps2xM9T4EnvMs(const char *name, uint64_t defaultMs)
+    {
+        if (const char *env = std::getenv(name))
+        {
+            const long long parsed = std::atoll(env);
+            if (parsed > 0)
+            {
+                return static_cast<uint64_t>(parsed);
+            }
+        }
+        return defaultMs;
+    }
+
+    uint64_t ps2xM9T4GapThresholdNs()
+    {
+        static const uint64_t s_ns = ps2xM9T4EnvMs("PS2X_M9T4_GAP_MS", 20u) * 1000000ull;
+        return s_ns;
+    }
+
+    uint64_t ps2xM9T4LockThresholdNs()
+    {
+        static const uint64_t s_ns = ps2xM9T4EnvMs("PS2X_M9T4_LOCK_MS", 5u) * 1000000ull;
+        return s_ns;
+    }
+
+    // The gap state lives between run-loop passes: busy accumulates around
+    // the function() dispatches, park around the CV waits. Single executor
+    // (assertExecutor) - plain statics are safe.
+    struct Ps2xM9T4GapState
+    {
+        bool valid = false;
+        std::chrono::steady_clock::time_point last{};
+        uint64_t busyNs = 0u;
+        uint64_t parkNs = 0u;
+        uint64_t ppeNs = 0u;
+        uint64_t cbNs = 0u;
+        uint64_t cpuCycles = 0u;
+        bool cpuValid = false;
+        uint32_t lastPc = 0u;
+    };
+
+    Ps2xM9T4GapState &ps2xM9T4Gap()
+    {
+        static Ps2xM9T4GapState s_state;
+        return s_state;
+    }
+
+    void ps2xM9T4AddBusyNs(uint64_t ns)
+    {
+        ps2xM9T4Gap().busyNs += ns;
+    }
+
+    void ps2xM9T4AddParkNs(uint64_t ns)
+    {
+        ps2xM9T4Gap().parkNs += ns;
+    }
+
+    void ps2xM9T4AddPpeNs(uint64_t ns)
+    {
+        ps2xM9T4Gap().ppeNs += ns;
+    }
+
+    void ps2xM9T4AddCbNs(uint64_t ns)
+    {
+        ps2xM9T4Gap().cbNs += ns;
+    }
+
+#if defined(_WIN32)
+    // M9-T4 v2: the executor thread's own CPU-cycle meter (QueryThreadCycleTime
+    // includes only cycles THIS thread actually spent on a CPU). A gap with
+    // cpu~=0 means the thread did not run at all during it - the OS never
+    // scheduled it (host contention) or it sat blocked in the kernel; a large
+    // cpu value with a small busy/park budget means it was SPINNING in
+    // uninstrumented runtime code. This is the descheduling-vs-userspace-work
+    // split the run-loop wall budget alone cannot make. Declared locally per
+    // the ThreadNaming.h pattern (no windows.h, no min/max macros).
+    extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread(void);
+    extern "C" __declspec(dllimport) int __stdcall QueryThreadCycleTime(void *threadHandle, unsigned long long *cycleTime);
+    uint64_t ps2xM9T4ThreadCpuCycles()
+    {
+        static thread_local void *s_thread = GetCurrentThread(); // pseudo-handle = current thread
+        unsigned long long cycles = 0u;
+        if (!QueryThreadCycleTime(s_thread, &cycles))
+        {
+            return 0u;
+        }
+        return cycles;
+    }
+#else
+    uint64_t ps2xM9T4ThreadCpuCycles()
+    {
+        return 0u;
+    }
+#endif
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -367,7 +487,71 @@ void EeScheduler::run()
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
+        // M9-T4: every executor pass brackets exactly one function() dispatch
+        // plus the run-loop overhead. A pass that arrives late names where
+        // the wall went: busy = inside guest dispatches (the M6-T2
+        // straight-line residue), park = CV waits, other = lock waits /
+        // log flushes / host descheduling (what this probe cannot name
+        // directly, it bounds by subtraction). The busy/park accumulators
+        // are snapshotted and reset on EVERY pass so each gap line reports
+        // only the wall accrued since the previous pass.
+        if (ps2xM9T4Enabled())
+        {
+            Ps2xM9T4GapState &gap = ps2xM9T4Gap();
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t nowCycles = ps2xM9T4ThreadCpuCycles();
+            const uint64_t cpuDelta = gap.cpuValid ? nowCycles - gap.cpuCycles : 0u;
+            gap.cpuCycles = nowCycles;
+            gap.cpuValid = true;
+            const uint64_t busyNs = std::exchange(gap.busyNs, 0u);
+            const uint64_t parkNs = std::exchange(gap.parkNs, 0u);
+            const uint64_t ppeNs = std::exchange(gap.ppeNs, 0u);
+            const uint64_t cbNs = std::exchange(gap.cbNs, 0u);
+            if (gap.valid)
+            {
+                const uint64_t dtNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - gap.last).count());
+                if (dtNs >= ps2xM9T4GapThresholdNs())
+                {
+                    const uint64_t otherNs = dtNs > busyNs + parkNs + ppeNs + cbNs
+                                                 ? dtNs - busyNs - parkNs - ppeNs - cbNs
+                                                 : 0u;
+                    RUNTIME_LOG("[m9t4-gap] dt=" << dtNs / 1000000ull
+                                                 << "." << (dtNs % 1000000ull) / 100000u
+                                                 << "ms busy=" << busyNs / 1000000ull
+                                                 << "." << (busyNs % 1000000ull) / 100000u
+                                                 << "ms park=" << parkNs / 1000000ull
+                                                 << "." << (parkNs % 1000000ull) / 100000u
+                                                 << "ms ppe=" << ppeNs / 1000000ull
+                                                 << "." << (ppeNs % 1000000ull) / 100000u
+                                                 << "ms cb=" << cbNs / 1000000ull
+                                                 << "." << (cbNs % 1000000ull) / 100000u
+                                                 << "ms other=" << otherNs / 1000000ull
+                                                 << "." << (otherNs % 1000000ull) / 100000u
+                                                 << "ms cpu=" << cpuDelta
+                                                 << " pc=0x" << std::hex << gap.lastPc
+                                                 << std::dec << " tid=" << m_currentThreadId
+                                                 << std::endl);
+                }
+            }
+            gap.last = now;
+            gap.valid = true;
+        }
+
+        // M9-T4 v2: the deadline drain (processPendingEvents) is one of the
+        // uninstrumented "other" zones - time it so a stall there names
+        // itself instead of falling into the residual.
+        const std::chrono::steady_clock::time_point m9t4PpeStart =
+            ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         processPendingEvents();
+        if (ps2xM9T4Enabled() && m9t4PpeStart != std::chrono::steady_clock::time_point{})
+        {
+            ps2xM9T4AddPpeNs(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - m9t4PpeStart)
+                    .count()));
+        }
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
@@ -440,12 +624,22 @@ void EeScheduler::run()
         {
             auto completion = std::move(running->resumeCompletion);
             running->resumeCompletion = {};
+            const std::chrono::steady_clock::time_point m9t4CbStart =
+                ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
             try
             {
                 completion(running->activeContext());
             }
             catch (const EeDispatcherTransfer &)
             {
+            }
+            if (ps2xM9T4Enabled() && m9t4CbStart != std::chrono::steady_clock::time_point{})
+            {
+                ps2xM9T4AddCbNs(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - m9t4CbStart)
+                        .count()));
             }
             if (m_currentThreadId == 0)
             {
@@ -545,12 +739,22 @@ void EeScheduler::run()
                 }
                 if (completed.onComplete)
                 {
+                    const std::chrono::steady_clock::time_point m9t4CbStart =
+                        ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
                     try
                     {
                         completed.onComplete(completed.context, running->activeContext());
                     }
                     catch (const EeDispatcherTransfer &)
                     {
+                    }
+                    if (ps2xM9T4Enabled() && m9t4CbStart != std::chrono::steady_clock::time_point{})
+                    {
+                        ps2xM9T4AddCbNs(static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - m9t4CbStart)
+                                .count()));
                     }
                 }
                 continue;
@@ -740,6 +944,9 @@ void EeScheduler::run()
             continue;
         }
 
+        const std::chrono::steady_clock::time_point m9t4FnStart =
+            ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         try
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
@@ -775,7 +982,15 @@ void EeScheduler::run()
             running->lastGoodPc = context.pc;
             running->lastGoodRa = static_cast<uint32_t>(_mm_extract_epi32(context.r[31], 0));
             running->lastGoodSp = static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0));
+            ps2xM9T4Gap().lastPc = context.pc;
             function(m_rdram, &context, &m_runtime);
+            if (ps2xM9T4Enabled())
+            {
+                ps2xM9T4AddBusyNs(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - m9t4FnStart)
+                        .count()));
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
             t10CheckSlotWrites(context.pc,
@@ -787,6 +1002,13 @@ void EeScheduler::run()
         }
         catch (const EeDispatcherTransfer &)
         {
+            if (ps2xM9T4Enabled())
+            {
+                ps2xM9T4AddBusyNs(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - m9t4FnStart)
+                        .count()));
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -822,12 +1044,22 @@ void EeScheduler::run()
                 }
                 if (completed.onComplete)
                 {
+                    const std::chrono::steady_clock::time_point m9t4CbStart =
+                        ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
                     try
                     {
                         completed.onComplete(completed.context, finishing->activeContext());
                     }
                     catch (const EeDispatcherTransfer &)
                     {
+                    }
+                    if (ps2xM9T4Enabled() && m9t4CbStart != std::chrono::steady_clock::time_point{})
+                    {
+                        ps2xM9T4AddCbNs(static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - m9t4CbStart)
+                                .count()));
                     }
                 }
             }
@@ -1088,8 +1320,29 @@ void EeScheduler::advanceEeTimersToWall() noexcept
                 ++m_pendingEeTimerInterrupts[timer];
                 if (ps2xM9T3Enabled())
                 {
+                    // M9-T4: the probe's own emission cost is a candidate
+                    // contributor to the stall tail (cout flush + the global
+                    // runtime-log ring mutex shared with the debug panel).
+                    // Time the hottest stamp so the probe can exonerate or
+                    // indict itself.
+                    const std::chrono::steady_clock::time_point m9t4LogStart =
+                        ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
                     RUNTIME_LOG("[m9t3-raise] t=" << ps2xM9T3NowNs()
                                                   << " timer=" << timer << std::endl);
+                    if (ps2xM9T4Enabled())
+                    {
+                        const uint64_t costNs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - m9t4LogStart)
+                                .count());
+                        if (costNs >= ps2xM9T4LockThresholdNs())
+                        {
+                            RUNTIME_LOG("[m9t4-log] site=raise cost=" << costNs / 1000000ull
+                                                                      << "." << (costNs % 1000000ull) / 100000u
+                                                                      << "ms" << std::endl);
+                        }
+                    }
                 }
                 raisedTotal &= ~(1u << timer);
             }
@@ -3127,9 +3380,31 @@ void EeScheduler::processDueDeadlines()
             auto now = std::chrono::steady_clock::now();
             if (pacingDeadline != std::chrono::steady_clock::time_point{} && now < pacingDeadline)
             {
+                const std::chrono::steady_clock::time_point m9t4ParkStart =
+                    ps2xM9T4Enabled() ? now : std::chrono::steady_clock::time_point{};
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
+                if (ps2xM9T4Enabled())
+                {
+                    const auto m9t4Woke = std::chrono::steady_clock::now();
+                    const uint64_t waitedNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(m9t4Woke - m9t4ParkStart).count());
+                    ps2xM9T4AddParkNs(waitedNs);
+                    if (waitedNs >= ps2xM9T4GapThresholdNs())
+                    {
+                        const uint64_t plannedNs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(pacingDeadline - m9t4ParkStart).count());
+                        const uint64_t overshootNs = waitedNs > plannedNs ? waitedNs - plannedNs : 0u;
+                        RUNTIME_LOG("[m9t4-park] site=pacing wait=" << waitedNs / 1000000ull
+                                                                    << "." << (waitedNs % 1000000ull) / 100000u
+                                                                    << "ms planned=" << plannedNs / 1000000ull
+                                                                    << "." << (plannedNs % 1000000ull) / 100000u
+                                                                    << "ms overshoot=" << overshootNs / 1000000ull
+                                                                    << "." << (overshootNs % 1000000ull) / 100000u
+                                                                    << std::endl);
+                    }
+                }
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -3514,8 +3789,25 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        const std::chrono::steady_clock::time_point m9t4ParkStart =
+            ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
+        if (ps2xM9T4Enabled())
+        {
+            const uint64_t waitedNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - m9t4ParkStart)
+                    .count());
+            ps2xM9T4AddParkNs(waitedNs);
+            if (waitedNs >= ps2xM9T4GapThresholdNs())
+            {
+                RUNTIME_LOG("[m9t4-park] site=idle wait=" << waitedNs / 1000000ull
+                                                          << "." << (waitedNs % 1000000ull) / 100000u
+                                                          << "ms" << std::endl);
+            }
+        }
         return;
     }
 
@@ -3555,9 +3847,35 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    const std::chrono::steady_clock::time_point m9t4ParkStart =
+        ps2xM9T4Enabled() ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
+    if (ps2xM9T4Enabled())
+    {
+        const auto m9t4Now = std::chrono::steady_clock::now();
+        const uint64_t waitedNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(m9t4Now - m9t4ParkStart).count());
+        ps2xM9T4AddParkNs(waitedNs);
+        if (waitedNs >= ps2xM9T4GapThresholdNs())
+        {
+            const uint64_t plannedNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(hostDeadline - m9t4ParkStart).count());
+            const uint64_t overshootNs = signaled || waitedNs <= plannedNs
+                                             ? 0u
+                                             : waitedNs - plannedNs;
+            RUNTIME_LOG("[m9t4-park] site=deadline wait=" << waitedNs / 1000000ull
+                                                          << "." << (waitedNs % 1000000ull) / 100000u
+                                                          << "ms planned=" << plannedNs / 1000000ull
+                                                          << "." << (plannedNs % 1000000ull) / 100000u
+                                                          << "ms overshoot=" << overshootNs / 1000000ull
+                                                          << "." << (overshootNs % 1000000ull) / 100000u
+                                                          << "ms signaled=" << (signaled ? 1 : 0)
+                                                          << std::endl);
+        }
+    }
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

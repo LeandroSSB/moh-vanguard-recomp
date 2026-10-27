@@ -4,15 +4,67 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    // M9-T4: opt-in lock-wait probe (PS2X_ENABLE_M9T4=1, log-only) on the
+    // executor-side GS m_stateMutex acquisitions - the T3 review named the
+    // renderer/GS lock as one of the two candidate owners of the ~103 ms
+    // common-mode executor stall. Each stamped site measures only the
+    // ACQUISITION wait (the critical section is not timed); waits >= the
+    // threshold (env PS2X_M9T4_LOCK_MS, default 5 ms) log [m9t4-lock].
+    // The epoch sentinel means the probe is off.
+    bool gsM9T4Enabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *env = std::getenv("PS2X_ENABLE_M9T4");
+            return env != nullptr && env[0] == '1';
+        }();
+        return s_enabled;
+    }
+
+    uint64_t gsM9T4LockThresholdNs()
+    {
+        uint64_t ms = 5u;
+        if (const char *env = std::getenv("PS2X_M9T4_LOCK_MS"))
+        {
+            const long long parsed = std::atoll(env);
+            if (parsed > 0)
+            {
+                ms = static_cast<uint64_t>(parsed);
+            }
+        }
+        return ms * 1000000ull;
+    }
+
+    void gsM9T4LockWait(const char *site, std::chrono::steady_clock::time_point start)
+    {
+        if (start == std::chrono::steady_clock::time_point{})
+        {
+            return;
+        }
+        const uint64_t waitNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+        if (waitNs >= gsM9T4LockThresholdNs())
+        {
+            RUNTIME_LOG("[m9t4-lock] site=" << site
+                                            << " wait=" << waitNs / 1000000ull
+                                            << "." << (waitNs % 1000000ull) / 100000u
+                                            << "ms" << std::endl);
+        }
+    }
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -663,7 +715,10 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    const auto m9t4LockStart = gsM9T4Enabled() ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    gsM9T4LockWait("processGIFPacket", m9t4LockStart);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
@@ -785,7 +840,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    const auto m9t4LockStart = gsM9T4Enabled() ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    gsM9T4LockWait("processNativePackedGIFPacket", m9t4LockStart);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
 
@@ -830,7 +888,10 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    const auto m9t4LockStart = gsM9T4Enabled() ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    gsM9T4LockWait("uploadImageNative", m9t4LockStart);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1152,7 +1213,10 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    const auto m9t4LockStart = gsM9T4Enabled() ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    gsM9T4LockWait("writeRegister", m9t4LockStart);
     writeRegisterUnlocked(regAddr, value);
 }
 
@@ -1797,13 +1861,19 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
+    const auto m9t4LockStart = gsM9T4Enabled() ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    gsM9T4LockWait("ReadVram", m9t4LockStart);
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
 void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
+    const auto m9t4LockStart = gsM9T4Enabled() ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    gsM9T4LockWait("WriteVram", m9t4LockStart);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);
 }
