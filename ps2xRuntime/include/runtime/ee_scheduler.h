@@ -454,8 +454,10 @@ public:
     // M9-T1: advance the EE hardware timers to the wall clock. Hardware
     // timers count the bus whether or not the CPU executes; feeding them
     // executed cycles (the old accountCycles path) scaled game-time with
-    // executor throughput (tbase 8.3/s vs the programmed 100/s).
-    void advanceEeTimersToWall();
+    // executor throughput (tbase 8.3/s vs the programmed 100/s). M9-T2:
+    // also charged at every checkpoint safe point (checkpointDue) - the
+    // run-loop passes alone miss the wall spent inside guest dispatches.
+    void advanceEeTimersToWall() noexcept;
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     // M6-T1: emulated-cycle position for clock-drift diagnostics (the

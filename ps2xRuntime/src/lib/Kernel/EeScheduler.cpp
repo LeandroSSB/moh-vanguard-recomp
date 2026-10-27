@@ -820,6 +820,17 @@ void EeScheduler::postEvent(EeEvent event)
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
+    // M9-T2 (iteration 3): the wall advance rides every safe point, not
+    // just the run-loop passes. Passes only cover the fraction of wall the
+    // executor spends between guest dispatches - the decode run measured
+    // raises at 27/s with every re-arm healthy (compare 5760 constant),
+    // i.e. ~74% of wall never reached the timer because it lives INSIDE
+    // guest dispatches. Safe points (inter-function branches +
+    // eeCheckpointDue backward edges) fire inside those dispatches; a
+    // raise here sets the checkpoint flag and THIS safe point aborts into
+    // the run loop, which drains the lane immediately - delivery latency
+    // stays one safe point.
+    advanceEeTimersToWall();
     accountCycles(cycles);
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
@@ -871,7 +882,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 // replay block inside): a period that lapses while the latch is pinned
 // is skipped hardware-faithfully, never multiplied into a raise storm,
 // and the pinned timer holds its count at the match point (M9-T2).
-void EeScheduler::advanceEeTimersToWall()
+void EeScheduler::advanceEeTimersToWall() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     if (!m_timerWallAnchorValid)
