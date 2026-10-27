@@ -1,0 +1,27 @@
+# PS2Recomp configuration — Medal of Honor: Vanguard (SLUS-215.97)
+# Template: point `input` at the boot ELF extracted from YOUR disc.
+# Pipeline: scripts/setup.ps1 does extract → analyze → recomp with this file.
+
+[general]
+# The game's boot ELF (extracted from your ISO; MOH5RDVD.ELF for Vanguard USA).
+input = "disc/MOH5RDVD.ELF"
+
+# Optional: Ghidra-exported function map CSV (ExportPS2Functions.java) —
+# recommended for retail (stripped) ELFs; the embedded analyzer works without it.
+ghidra_output = ""
+
+# Generated engine code destination (feeds the runner build).
+output = "gen"
+
+# Recommended for large games (Vanguard: 18.8k+ functions).
+single_file_output = false
+
+# Reduces peak memory during output; forces 1 output worker.
+low_memory_mode = true
+
+# 0 = auto (hardware_concurrency()-1; overridden to 1 by low_memory_mode).
+output_worker_threads = 0
+
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true

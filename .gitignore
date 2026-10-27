@@ -23,3 +23,13 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+# Jogo (NUNCA commitar): ISO, BIOS, gen output, dumps
+*.iso
+*.ISO
+*.bin
+disc/
+bios/
+gen/
+*.p2s
+console/
+memdump*.bin

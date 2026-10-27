@@ -1,0 +1,37 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Medal of Honor: Vanguard",
+  "system": "PS2",
+  "type": "recomp",
+  "original": {
+    "region": "USA",
+    "serial": "SLUS-215.97"
+  },
+  "project": "Medal of Honor: Vanguard — PS2 Static Recompilation",
+  "status": "in-progress",
+  "targets": ["Windows"],
+  "toolchain": "Ps2recomp",
+  "approach": "Static recompilation of MIPS R5900 code to C++20, with a PS2Recomp-based runtime and Vanguard-specific overrides (faithful 59.94 NTSC clock on the wall clock, dedicated invocation stack, MKB mouse-look).",
+  "maintainers": [
+    {
+      "name": "LeandroSSB",
+      "link": "https://github.com/LeandroSSB"
+    }
+  ],
+  "links": [
+    {
+      "label": "Upstream runtime fixes (12+ PRs)",
+      "url": "https://github.com/ran-j/PS2Recomp/pulls"
+    },
+    {
+      "label": "Bring-up research diary",
+      "url": "https://github.com/LeandroSSB/moh-vanguard-recomp/blob/main/docs/research-frontier.md"
+    }
+  ],
+  "help": [
+    "Front-end/menu progression (post-movie stage machine)",
+    "Game-time base rate (26.7 of 100 Hz)",
+    "Timer-completion delivery window (intermittent pc=0x100 class)"
+  ],
+  "notes": "Boots, plays the full EA logo movie with audio, stable post-movie (main alive past all former walls). The front-end/menu does not open yet: the game enters a post-movie circular idle decoded to instruction level (see docs/research-frontier.md). Mouse-look and scripted input implemented at the pad layer; menu interaction pending the front-end gate."
+}

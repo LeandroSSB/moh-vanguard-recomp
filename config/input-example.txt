@@ -1,0 +1,12 @@
+# Scripted input channel (PS2X_INPUT_SCRIPT=<path>) — deterministic pad
+# timeline for automated verification, no human hands. Each line is one
+# pad state: t=<ms> btns=<hex, pressed-bit> lx/ly/rx/ry=<-128..127>.
+# The state holds until the next event; buttons: START=8, CROSS=4000,
+# CIRCLE=2000, TRIANGLE=1000, SQUARE=8000, L1=400, R1=800, SELECT=1.
+
+# Example: START pulse at 90 s, CROSS at 120 s.
+t=0 btns=0
+t=90000 btns=8
+t=91500 btns=0
+t=120000 btns=4000
+t=121500 btns=0
