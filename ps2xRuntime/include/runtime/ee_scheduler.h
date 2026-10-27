@@ -432,7 +432,21 @@ public:
     int removeIrqHandler(bool dmac, uint32_t cause, int id);
     int setIrqHandlerEnabled(bool dmac, int id, bool enabled);
     int setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled);
-    void dispatchIrq(bool dmac, uint32_t cause);
+    // M9-T1: promptShapedDelivery - the wall-pass timer raise (timers now
+    // advance on the wall, not on executed cycles) is delivered on the SAME
+    // executor pass with the T16 carve pre-bind instead of waiting for the
+    // next vsync boundary: the SDK timer dispatcher's re-arm arithmetic
+    // (compare += reload - count, sub_00355300) needs delivery latency far
+    // below the 10 ms TIM1 period; a full-frame defer breaks the invariant
+    // and the tbase rate collapses into a wrap oscillation. Checkpoint-
+    // raised timer IRQs (none survive the wall advance; path kept for
+    // safety) keep the M5-T18 vsync-deferred shape.
+    void dispatchIrq(bool dmac, uint32_t cause, bool promptShapedDelivery = false);
+    // M9-T1: advance the EE hardware timers to the wall clock. Hardware
+    // timers count the bus whether or not the CPU executes; feeding them
+    // executed cycles (the old accountCycles path) scaled game-time with
+    // executor throughput (tbase 8.3/s vs the programmed 100/s).
+    void advanceEeTimersToWall();
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     // M6-T1: emulated-cycle position for clock-drift diagnostics (the
@@ -543,8 +557,14 @@ private:
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
-    uint32_t m_pendingEeTimerInterrupts = 0;
+    // M9-T1: pending TIM0..TIM3 raise COUNTS (not a mask): the wall replay
+    // can owe several periods of one timer after an executor stall, and each
+    // owed period is a distinct IRQ the game's dispatcher re-arms against.
+    std::array<uint32_t, 4> m_pendingEeTimerInterrupts{};
     uint64_t m_eeCycle = 0;
+    // M9-T1: wall anchor for the EE timer advance (executor-thread only).
+    std::chrono::steady_clock::time_point m_timerWallAnchor{};
+    bool m_timerWallAnchorValid = false;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};

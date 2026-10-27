@@ -99,6 +99,23 @@ namespace
     // discriminates the bind shape too.
     constexpr uint32_t kT18MainSp = 0x1FFFE000u;
 
+    // ---- M9-T1: the tbase famine (wall-rate EE timers) ----------------------
+    // Vanguard's game-time base 0x510A18 gains EXACTLY +1 per INTC cause-10
+    // dispatch (sub_00355300 0x355384..0x35538C) and the game programs TIM1
+    // at 100 Hz (SetTimer: bus/256, compare 5760, mode 0x182 - decoded at
+    // sub_00355038), so on hardware tbase == 100/s wall. The measured 8.3/s
+    // (M6-T1..T3) was the runtime advancing the timers with EXECUTED guest
+    // cycles (accountCycles) in a regime that covers ~9% of realtime cycles.
+    // Falsifiable prediction: a TIM1 programmed exactly like the game's,
+    // under a ~9.7%-realtime guest, must fire ~100x/s wall (30x in 300 ms),
+    // promptly (same vsync boundary), on the T16 carve.
+    constexpr uint32_t kM9Tim1PostPc = 0x00160760u;
+    constexpr uint32_t kM9Tim1HandlerPc = 0x00160780u;
+
+    std::atomic<uint32_t> g_m9Tim1Fires{0u};
+    uint32_t g_m9FirstFireVsync = 0u;
+    uint32_t g_m9FirstFireSp = 0u;
+    uint32_t g_m9PostVsync = 0u;
     std::atomic<bool> g_t18Resumed{false};
     uint32_t g_t18PostVsync = 0u;
     uint32_t g_t18HandlerVsync = 0u;
@@ -602,6 +619,55 @@ namespace
         g_t18PostVsync = static_cast<uint32_t>(scheduler.currentVSyncTick());
         ctx->pc = kT18AlarmResumePc;
         scheduler.waitSemaphore(g_t18SemaId);
+    }
+
+    // The Vanguard throttle shape: charges ~28.6k accounted cycles per
+    // ~1.05 ms wall (~9.7% of realtime - the post-movie regime) and loops
+    // on the same pc forever. The FIRST dispatch programs TIM1 exactly
+    // like the game's SetTimer(100) and records the post vsync.
+    void m9Tim1ThrottleBlock(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        using clock = std::chrono::steady_clock;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        static std::atomic<bool> s_programmed{false};
+        bool expected = false;
+        if (s_programmed.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        {
+            PS2Memory &memory = runtime->memory();
+            scheduler.addIrqHandler(false, 10u, kM9Tim1HandlerPc, true, 0u, 0u, 0u);
+            memory.writeIORegister(0x10000800u, 0u);     // T1_COUNT = 0
+            memory.writeIORegister(0x10000820u, 5760u);  // T1_COMPARE = 100 Hz @ bus/256
+            memory.writeIORegister(0x10000810u, 0x182u); // T1_MODE CLKS=2 | CUE | CMPE
+            g_m9PostVsync = static_cast<uint32_t>(scheduler.currentVSyncTick());
+        }
+        scheduler.accountCycles(30000u);
+        const auto now = clock::now();
+        while (clock::now() < now + std::chrono::microseconds(1050))
+        {
+        }
+        if (clock::now() - now > std::chrono::milliseconds(1500))
+        {
+            runtime->requestStop();
+        }
+        ctx->pc = kM9Tim1PostPc; // loop the same block forever
+    }
+
+    void m9Tim1Handler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Re-arm exactly like the game's dispatcher (sub_00355300): count
+        // zeroed, compare reloaded, EQUF acked by the W1C mode write. The
+        // latch would otherwise hold after the first fire.
+        PS2Memory &memory = runtime->memory();
+        memory.writeIORegister(0x10000800u, 0u);
+        memory.writeIORegister(0x10000820u, 5760u);
+        memory.writeIORegister(0x10000810u, memory.readIORegister(0x10000810u) | 0x400u);
+        const uint32_t previous = g_m9Tim1Fires.fetch_add(1u, std::memory_order_acq_rel);
+        if (previous == 0u)
+        {
+            g_m9FirstFireVsync = static_cast<uint32_t>(runtime->eeScheduler().currentVSyncTick());
+            g_m9FirstFireSp = getRegU32(ctx, 29);
+        }
+        ctx->pc = 0u;
     }
 
     void t18Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
@@ -1130,6 +1196,65 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_t18HandlerSp, kMainInvocationCarveTop - 0x10u,
                      "the alarm callback must bind on the dedicated carve, not inside main's "
                      "below-sp band");
+        });
+
+        // M9-T1: the tbase famine decode. The timers must advance with the
+        // wall (hardware timers count the bus whether or not the CPU
+        // executes), never with executed guest cycles - the 8.3/s game-time
+        // of the post-movie regime was exactly executed-cycle scaling.
+        tc.Run("a wall-programmed EE timer fires at wall rate under a ~10%-realtime guest (tbase 100/s, not cycle-scaled)", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kM9Tim1PostPc, m9Tim1ThrottleBlock);
+            env.runtime.registerFunction(kM9Tim1HandlerPc, m9Tim1Handler);
+
+            g_m9Tim1Fires.store(0u, std::memory_order_release);
+            g_m9FirstFireVsync = 0u;
+            g_m9FirstFireSp = 0u;
+            g_m9PostVsync = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kM9Tim1PostPc;
+            setRegU32(mainContext, 29, kT18MainSp);
+            std::atomic<bool> schedulerThrew{false};
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+            });
+
+            const bool fired = waitUntil([]()
+            {
+                return g_m9Tim1Fires.load(std::memory_order_acquire) >= 10u;
+            }, std::chrono::milliseconds(400));
+            const uint32_t firesAtSnapshot = g_m9Tim1Fires.load(std::memory_order_acquire);
+            env.runtime.requestStop();
+            gameThread.join();
+
+            t.IsTrue(fired, "TIM1 at 100 Hz wall must fire >=10x within 400 ms while the guest "
+                            "covers only ~10% of the cycle budget - the M6-T1 tbase famine "
+                            "(8.3/s) was executed-cycle scaling of the timer clock");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "the wall timer path should not throw");
+            t.IsTrue(firesAtSnapshot <= 60u, "a 400 ms window must hold well under the ~40 fires "
+                                             "of a faithful 100 Hz - never a compare-wrap "
+                                             "oscillation or a per-pass storm");
+            t.Equals(g_m9FirstFireVsync, g_m9PostVsync, "the first wall-raised timer IRQ must be "
+                                                        "delivered promptly (same vsync boundary) - "
+                                                        "the SDK dispatcher's re-arm arithmetic "
+                                                        "(compare += reload - count) needs delivery "
+                                                        "latency far below the 10 ms period");
+            t.Equals(g_m9FirstFireSp, kMainInvocationCarveTop - 0x10u, "the wall-raised timer "
+                                                                       "callback must bind on the "
+                                                                       "dedicated carve (the T16 "
+                                                                       "shape), never the stackless "
+                                                                       "fallback into main's "
+                                                                       "below-sp band");
         });
 
         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)

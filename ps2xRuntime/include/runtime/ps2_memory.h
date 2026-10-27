@@ -307,8 +307,11 @@ public:
     bool writeIORegister(uint32_t address, uint32_t value);
     uint32_t readIORegister(uint32_t address);
 
-    // EE timers advance from the scheduler's emulated EE-cycle clock. The
-    // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
+    // EE timers advance by the cycle budget the CALLER feeds them. Since
+    // M9-T1 the scheduler feeds WALL-clock cycles (advanceEeTimersToWall) -
+    // hardware timers count the bus whether or not the CPU executes; the
+    // caller decides the clock. The returned mask uses bits 0..3 for newly
+    // raised TIM0..TIM3 interrupts (at most one latch per call per timer).
     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;

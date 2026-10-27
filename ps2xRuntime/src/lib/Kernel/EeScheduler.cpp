@@ -259,9 +259,12 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
-    m_pendingEeTimerInterrupts = 0u;
+    m_pendingEeTimerInterrupts.fill(0u);
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
+    // M9-T1: the timer wall anchor dies with the session (else the first
+    // advance of the new one would see the old session's wall debt).
+    m_timerWallAnchorValid = false;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
     m_debugPublishCountdown = 0u;
@@ -756,27 +759,131 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
-void EeScheduler::accountCycles(uint32_t cycles) noexcept
+// M9-T1: the EE hardware timers advance with the WALL, never with executed
+// guest cycles. Hardware timers count the bus whether or not the CPU runs;
+// the old accountCycles advance scaled game-time with executor throughput -
+// the measured famine: Vanguard's tbase (0x510A18, +1 per TIM1 IRQ, the
+// game's SetTimer(100) programs TIM1 bus/256 compare 5760 = 100 Hz wall)
+// ran at 8.3/s because the post-movie regime executes ~9% of realtime
+// cycles. Advanced here (the executor pass runs at wall rate through the
+// M6 clock beat), and the raised IRQs are delivered on the SAME pass with
+// the T16 carve shape (dispatchIrq promptShapedDelivery) - the SDK
+// dispatcher's re-arm arithmetic needs delivery latency << the 10 ms
+// period, so the M5-T18 vsync-deferred delivery would break the invariant.
+// Stall policy = the M6-T3 wall-chain policy: past the grace the debt is
+// DROPPED and the chain re-anchors (env PS2X_TIMER_WALL_DEBT_MS, default
+// 40 ms ~= 2 vsync periods of grace).
+void EeScheduler::advanceEeTimersToWall()
 {
-    const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
-    m_eeCycle += elapsed;
-    const uint32_t t8Raised = m_runtime.memory().advanceEeTimers(elapsed);
-    if (t8Raised != 0u)
+    const auto now = std::chrono::steady_clock::now();
+    if (!m_timerWallAnchorValid)
+    {
+        m_timerWallAnchor = now;
+        m_timerWallAnchorValid = true;
+        return;
+    }
+    const uint64_t elapsedNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_timerWallAnchor).count());
+    m_timerWallAnchor = now;
+    static const uint64_t kTimerWallDebtNs = []()
+    {
+        uint64_t debtMs = 2100u; // the M6-T3 64x grace: a true suspension, not a beat stall
+        if (const char *env = std::getenv("PS2X_TIMER_WALL_DEBT_MS"))
+        {
+            const long long parsed = std::atoll(env);
+            if (parsed > 0)
+            {
+                debtMs = static_cast<uint64_t>(parsed);
+            }
+        }
+        return debtMs * 1000000ull;
+    }();
+    // 294.912M EE cycles per wall second (the timer clock table in
+    // ps2_memory.cpp scales from this base).
+    uint64_t elapsedCycles = (elapsedNs * 294912000ull + 500000000ull) / 1000000000ull;
+    if (elapsedCycles == 0u)
+    {
+        return;
+    }
+    // M9-T1: REPLAY, not drop (the M6-T3 lesson, measured twice: the first
+    // cut of this fix kept a 40 ms drop grace and the Vanguard executor -
+    // whose passes land 40-220 ms apart under the function-granularity
+    // preemption residue - lost ~83% of the timer beats: tbase 17/s). The
+    // debt is replayed in slices; each slice may latch each timer once and
+    // every owed period is delivered as a distinct IRQ (the game's
+    // dispatcher re-arms per delivery and guards its wheel with 0x510690).
+    // Past the replay bound (env PS2X_TIMER_WALL_DEBT_MS, default 2100 ms =
+    // the M6-T3 64x grace) this is a true suspension: drop, re-anchor.
+    if (elapsedNs > kTimerWallDebtNs)
+    {
+        static uint32_t s_t8DebtDrops = 0u;
+        ++s_t8DebtDrops;
+        if (s_t8DebtDrops <= 12u || (s_t8DebtDrops % 512u) == 0u)
+        {
+            RUNTIME_LOG("[m9t1-timer-debt] dropped " << (elapsedNs / 1000000ull) << " ms of wall"
+                                                     << " (past the " << (kTimerWallDebtNs / 1000000ull) << " ms replay bound) #"
+                                                     << s_t8DebtDrops << std::endl);
+        }
+        return;
+    }
+    static constexpr uint32_t kTimerWallReplaySlices = 32u;
+    uint32_t slices = static_cast<uint32_t>((elapsedCycles + kTimerWallReplaySlices - 1u) / kTimerWallReplaySlices);
+    if (slices == 0u)
+    {
+        slices = 1u;
+    }
+    uint32_t raisedTotal = 0u;
+    while (elapsedCycles > 0u)
+    {
+        const uint64_t slice = std::min<uint64_t>(elapsedCycles, slices);
+        raisedTotal |= m_runtime.memory().advanceEeTimers(slice);
+        for (uint32_t timer = 0u; timer < 4u; ++timer)
+        {
+            if ((raisedTotal & (1u << timer)) != 0u)
+            {
+                ++m_pendingEeTimerInterrupts[timer];
+                raisedTotal &= ~(1u << timer);
+            }
+        }
+        elapsedCycles -= slice;
+    }
+    bool anyPending = false;
+    for (const uint32_t pending : m_pendingEeTimerInterrupts)
+    {
+        anyPending = anyPending || pending != 0u;
+    }
+    if (anyPending)
     {
         static uint32_t s_t8RaiseCount = 0u;
         ++s_t8RaiseCount;
         if (s_t8RaiseCount <= 12u || (s_t8RaiseCount % 512u) == 0u)
         {
             RUNTIME_LOG("[t8-timer] raise #" << s_t8RaiseCount
-                                             << " mask=0x" << std::hex << t8Raised
-                                             << std::dec << std::endl);
+                                             << " pending={"
+                                             << m_pendingEeTimerInterrupts[0] << ","
+                                             << m_pendingEeTimerInterrupts[1] << ","
+                                             << m_pendingEeTimerInterrupts[2] << ","
+                                             << m_pendingEeTimerInterrupts[3] << "}"
+                                             << std::endl);
         }
-    }
-    m_pendingEeTimerInterrupts |= t8Raised;
-    m_runtime.advanceIopEeCycles(elapsed);
-    if (m_pendingEeTimerInterrupts != 0u)
-    {
         m_checkpointPending.store(true, std::memory_order_release);
+    }
+}
+
+void EeScheduler::accountCycles(uint32_t cycles) noexcept
+{
+    const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+    m_eeCycle += elapsed;
+    // M9-T1: the EE timers no longer ride executed cycles (they are
+    // wall-advanced in advanceEeTimersToWall at every executor pass).
+    m_runtime.advanceIopEeCycles(elapsed);
+    for (const uint32_t pending : m_pendingEeTimerInterrupts)
+    {
+        if (pending != 0u)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+            break;
+        }
     }
 }
 
@@ -1933,7 +2040,7 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
     return KE_OK;
 }
 
-void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+void EeScheduler::dispatchIrq(bool dmac, uint32_t cause, bool promptShapedDelivery)
 {
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
@@ -2001,12 +2108,22 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         // carve, so the frame never lands in main's below-sp band via the
         // stackless fallback. VBlank causes (2/3) already fire ON the
         // boundary - delivered inline, unchanged.
-        if (!dmac && cause >= 9u && cause <= 12u)
+        if (!dmac && cause >= 9u && cause <= 12u && !promptShapedDelivery)
         {
             queueDeferredInvocation(std::move(invocation), 1u);
         }
         else
         {
+            // M9-T1: the wall-raised timer delivery keeps the T16 shape -
+            // pre-bind the carve when the caller left sp empty (the same
+            // per-invocation shape the VBlankStart promote uses), so the
+            // frame can never land in main's below-sp band via the
+            // stackless fallback.
+            if (!dmac && cause >= 9u && cause <= 12u &&
+                getRegU32(&invocation.context, 29) == 0u)
+            {
+                SET_GPR_U32(&invocation.context, 29, carveInvocationSp());
+            }
             queueInvocation(std::move(invocation));
         }
     }
@@ -2622,14 +2739,18 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    // M9-T1: wall-advance the EE timers at every pass, then deliver the
+    // raised IRQs on THIS pass (prompt shaped delivery - see
+    // advanceEeTimersToWall).
+    advanceEeTimersToWall();
     processDueDeadlines();
-    const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
-    m_pendingEeTimerInterrupts = 0u;
+    const std::array<uint32_t, 4> timerInterrupts = m_pendingEeTimerInterrupts;
+    m_pendingEeTimerInterrupts.fill(0u);
     for (uint32_t timer = 0u; timer < 4u; ++timer)
     {
-        if ((timerInterrupts & (1u << timer)) != 0u)
+        for (uint32_t raise = 0u; raise < timerInterrupts[timer]; ++raise)
         {
-            dispatchIrq(false, 9u + timer);
+            dispatchIrq(false, 9u + timer, true);
         }
     }
     std::deque<EeEvent> pending;
