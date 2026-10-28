@@ -11,7 +11,7 @@ Native PC port of **Medal of Honor: Vanguard (PS2, NTSC-U SLUS-215.97)** via sta
 
 > ⚠️ **Status: in-progress.** The game boots, plays the full EA logo movie with audio, and runs stable post-movie (main alive past every former wall — the first stage-machine advance landed 2026-10-26). The front-end/menu does **not** open yet: the game enters a post-movie circular idle decoded to instruction level (see [docs/research-frontier.md](docs/research-frontier.md)). Not playable end-to-end yet.
 
-**[→ Live progress map](https://lesandrossb.github.io/moh-vanguard-recomp/progress.html)**
+**[→ Live progress map](https://leandrossb.github.io/moh-vanguard-recomp/progress.html)**
 
 ## Where it stands (measured)
 
