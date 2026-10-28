@@ -1,0 +1,185 @@
+{
+  "project": "Medal of Honor: Vanguard — PS2 static recomp",
+  "repo_url": "https://github.com/LeandroSSB/moh-vanguard-recomp",
+  "pages_url": "https://lesandrossb.github.io/moh-vanguard-recomp/progress.html",
+  "upstream_url": "https://github.com/ran-j/PS2Recomp",
+  "branch": "vanguard-bringup",
+  "updated": "2026-10-28",
+  "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
+  "status_note": "The game boots, plays the full EA logo movie with audio, and runs stable post-movie. The front-end/menu does not open yet: a post-movie circular idle, decoded link-by-link.",
+  "stats": [
+    { "value": "18,800+", "label": "functions recompiled" },
+    { "value": "0", "label": "undecoded instructions" },
+    { "value": "8", "label": "upstream PRs (#398–#405)" },
+    { "value": "0", "label": "deaths in 5+ h soak runs" }
+  ],
+  "stages": [
+    {
+      "name": "Recomp",
+      "status": "done",
+      "evidence": "18.8k fns · 0 undecoded",
+      "evidence_full": "18.8k+ functions recompiled, 0 undecoded instructions",
+      "unblocked_by": "Analyzer 3-tier discovery (#399) + EE LQ/SQ 16-byte alignment (#400)"
+    },
+    {
+      "name": "Boot",
+      "status": "done",
+      "evidence": "retail ELF boots",
+      "evidence_full": "retail ELF boots through the runtime; SIF/IOP alive",
+      "unblocked_by": "SetupThread anchor + stack metadata (#398); owner-stack invocation model + main-owned carve (branch)"
+    },
+    {
+      "name": "Loader/CDVD",
+      "status": "done",
+      "evidence": "270+ reads",
+      "evidence_full": "270+ CD reads served (files + sectors), cdvdfsv/IOP",
+      "unblocked_by": "cdvdfsv HLE + Scmd 0x27 (#403); SIF bit31 sids + cid-1 reply (#404)"
+    },
+    {
+      "name": "EA Logo Movie",
+      "status": "done",
+      "evidence": "128 uploads · audio",
+      "evidence_full": "full EAGMLOGO.MPC playback with audio; 128 GS uploads @ 639×448",
+      "unblocked_by": "MPEG need-data wake + end-of-stream (branch); PMODE A+D (#401); GIF DMA drain-to-END (#402)"
+    },
+    {
+      "name": "Post-Movie Stable",
+      "status": "done",
+      "evidence": "0 deaths",
+      "evidence_full": "main alive past every former wall; 0 deaths in 5+ hour-long runs",
+      "unblocked_by": "EE→IOP bridge wake + IOP endTimeslice (branch); vsync-boundary deferral"
+    },
+    {
+      "name": "Clock 59.94 NTSC",
+      "status": "done",
+      "evidence": "60.03/s ±0.15%",
+      "evidence_full": "59.94 NTSC faithful — terminal vsync 60.03/s ±0.15%",
+      "unblocked_by": "timers-on-wall clock + timer/alarm shaping + bounded beat replay (branch)"
+    },
+    {
+      "name": "Front-End Gate",
+      "status": "current",
+      "evidence": "circular idle, decoded",
+      "evidence_full": "post-movie circular idle, decoded link-by-link (worker 0 tokens ← 0 outstanding reads; armer no-ops at gate ≠ 6)",
+      "unblocked_by": "the pending resume-fix (in flight — landing)"
+    },
+    {
+      "name": "Attract",
+      "status": "future",
+      "evidence": "—",
+      "evidence_full": "—",
+      "unblocked_by": "gated on the front-end gate"
+    },
+    {
+      "name": "Menu",
+      "status": "future",
+      "evidence": "—",
+      "evidence_full": "—",
+      "unblocked_by": "gated on the front-end gate"
+    },
+    {
+      "name": "Gameplay 60fps",
+      "status": "future",
+      "evidence": "—",
+      "evidence_full": "—",
+      "unblocked_by": "gated on the front-end gate"
+    }
+  ],
+  "subsystems": [
+    {
+      "name": "EE Scheduler",
+      "status": "done",
+      "cells": 8,
+      "one_liner": "8 fixes — the 3 scheduler contracts hold (22k alarm fires/900 s, 0 fails)"
+    },
+    {
+      "name": "EE Timers",
+      "status": "done",
+      "one_liner": "hardware timers advance on the wall clock"
+    },
+    {
+      "name": "IOP Bridge",
+      "status": "done",
+      "one_liner": "EE→IOP wake + IOP endTimeslice — SNDDRV executes"
+    },
+    {
+      "name": "GIF DMA",
+      "status": "done",
+      "one_liner": "chains drain through IRQ tags to the END-tag CHCR readback"
+    },
+    {
+      "name": "MPEG Playback",
+      "status": "done",
+      "one_liner": "need-data wake + end-of-stream — the EA movie plays with audio"
+    },
+    {
+      "name": "LQ/SQ Alignment",
+      "status": "done",
+      "one_liner": "EE LQ/SQ force 16-byte alignment, as the hardware does"
+    },
+    {
+      "name": "Analyzer Discovery",
+      "status": "done",
+      "cells": 3,
+      "one_liner": "3 tiers — data-, instruction- and table-referenced entry points"
+    },
+    {
+      "name": "Input MKB",
+      "status": "done",
+      "one_liner": "mouse-look layer + scripted-input channel landed (PR #405)"
+    },
+    {
+      "name": "CDVD Streaming",
+      "status": "done",
+      "one_liner": "270+ reads served — cdvdfsv HLE + Scmd 0x27"
+    },
+    {
+      "name": "SetupHeap/Stacks",
+      "status": "done",
+      "one_liner": "SetupThread main stack anchored at the top of RDRAM"
+    },
+    {
+      "name": "Title→Attract Timeout",
+      "status": "frontier",
+      "one_liner": "the wall — post-movie circular idle; A/B vs PCSX2 is the named instrument"
+    },
+    {
+      "name": "Audio SPU2",
+      "status": "partial",
+      "one_liner": "movie audio plays (decode path); SPU2 beyond the gate not yet measured"
+    },
+    {
+      "name": "Gameplay Rendering",
+      "status": "future",
+      "one_liner": "not reached — beyond the front-end gate"
+    }
+  ],
+  "fixes": {
+    "upstream_base": "ran-j/PS2Recomp",
+    "upstream": [
+      { "pr": 398, "title": "SetupThread anchor + metadata", "detail": "the automatic main stack anchored at the top of RDRAM, kernel-managed stack metadata recorded" },
+      { "pr": 399, "title": "Analyzer: 3 tiers", "detail": "data-, instruction- and table-referenced function pointers exposed as callable entry candidates" },
+      { "pr": 400, "title": "LQ/SQ 16-byte align", "detail": "EE LQ/SQ force 16-byte alignment as the hardware does" },
+      { "pr": 401, "title": "PMODE A+D", "detail": "GIF A+D 0x58 PMODE writes routed to the privileged register file" },
+      { "pr": 402, "title": "GIF DMA drain-to-END", "detail": "GIF chains drain through IRQ tags to the END-tag CHCR readback" },
+      { "pr": 403, "title": "cdvdfsv HLE + Scmd 0x27", "detail": "the cdvdfsv RPC family served from a ROM-resident HLE service" },
+      { "pr": 404, "title": "SIF bit31 sids + cid-1 reply", "detail": "temporary IOP sids (bit31) accepted; the loader queue's SifSendCmd gets its completion reply" },
+      { "pr": 405, "title": "Input script + MKB layer", "detail": "opt-in scripted input channel (PS2X_INPUT_SCRIPT) + MKB mouse-look layer" }
+    ],
+    "branch_only": [
+      { "name": "EE→IOP bridge wake + IOP endTimeslice" },
+      { "name": "Owner-stack invocation model" },
+      { "name": "Main-owned carve (async-callback invocation)" },
+      { "name": "Vsync-boundary deferral" },
+      { "name": "Timer/alarm delivery shaping" },
+      { "name": "Timers on wall clock" },
+      { "name": "Bounded beat replay" },
+      { "name": "The pending resume-fix", "note": "landing" }
+    ]
+  },
+  "links": {
+    "research_frontier": "https://github.com/LeandroSSB/moh-vanguard-recomp/blob/main/docs/research-frontier.md",
+    "bring_up": "https://github.com/LeandroSSB/moh-vanguard-recomp/blob/main/docs/bring-up.md",
+    "repo": "https://github.com/LeandroSSB/moh-vanguard-recomp"
+  }
+}

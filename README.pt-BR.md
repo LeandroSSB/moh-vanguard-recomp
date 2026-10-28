@@ -11,6 +11,8 @@ Port nativo de PC de **Medal of Honor: Vanguard (PS2, NTSC-U SLUS-215.97)** via 
 
 > ⚠️ **Status: em progresso.** O jogo boota, roda o filme de logo da EA completo com áudio, e roda estável pós-filme (a main viva além de todas as paredes anteriores — o primeiro avanço da máquina de estágios pousou em 26/10/2026). O front-end/menu **ainda não abre**: o jogo entra num circular idle pós-filme decodado ao nível de instrução (veja [docs/research-frontier.md](docs/research-frontier.md)). Ainda não jogável de ponta a ponta.
 
+**[→ Mapa de progresso ao vivo](https://lesandrossb.github.io/moh-vanguard-recomp/progress.html)**
+
 ## Onde o port está (medido)
 
 | estágio | estado | medido |
