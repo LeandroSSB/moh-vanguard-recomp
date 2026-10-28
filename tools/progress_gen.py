@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """Generate the live progress page for moh-vanguard-recomp.
 
-Reads  docs/progress/progress.json
-Writes docs/progress/progress.svg
-       docs/progress/progress.html
+Reads  docs/progress.json
+Writes docs/progress.svg
+       docs/progress.html
 
 Python 3.8+, stdlib only. Run from anywhere:
 
     python tools/progress_gen.py
 
-The generated artifacts are committed, and GitHub Pages serves /docs/progress
-statically — so the live page refreshes on push without any CI.
+The generated artifacts are committed, and GitHub Pages (source: main /docs)
+publishes the docs/ directory at the site root — so the page is live at
+https://lesandrossb.github.io/moh-vanguard-recomp/progress.html on every push,
+no CI needed. GitHub's branch source only accepts / or /docs, hence docs/ root.
 
 TODO(ci): add .github/workflows/progress.yml to re-run this generator on push
-to main and commit any regenerated diff in docs/progress/ (fail the run if the
+to main and commit any regenerated diff under docs/ (fail the run if the
 committed artifacts are stale), so the page can never drift from progress.json.
 """
 import json
@@ -22,9 +24,9 @@ from html import escape
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "docs" / "progress" / "progress.json"
-SVG_OUT = ROOT / "docs" / "progress" / "progress.svg"
-HTML_OUT = ROOT / "docs" / "progress" / "progress.html"
+DATA = ROOT / "docs" / "progress.json"
+SVG_OUT = ROOT / "docs" / "progress.svg"
+HTML_OUT = ROOT / "docs" / "progress.html"
 
 # GitHub-dark surface + status palette. Status colors are never used alone:
 # every mark also carries geometry (solid / hollow / pulsing) and a text label.
