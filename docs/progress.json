@@ -4,14 +4,30 @@
   "pages_url": "https://leandrossb.github.io/moh-vanguard-recomp/progress.html",
   "upstream_url": "https://github.com/ran-j/PS2Recomp",
   "branch": "vanguard-bringup",
-  "updated": "2026-10-28",
+  "updated": "2026-10-31",
   "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
-  "status_note": "The game boots, plays the full EA logo movie with audio, and runs stable post-movie. The front-end/menu does not open yet: a post-movie circular idle, decoded link-by-link.",
+  "status_note": "Boot through post-movie stable, 59.94 NTSC clock, death family extinct; the front-end gate (title-to-attract) is the active research frontier.",
   "stats": [
-    { "value": "18,800+", "label": "functions recompiled" },
-    { "value": "0", "label": "undecoded instructions" },
-    { "value": "8", "label": "upstream PRs (#398–#405)" },
-    { "value": "0", "label": "deaths in 5+ h soak runs" }
+    {
+      "value": "18,800+",
+      "label": "functions recompiled"
+    },
+    {
+      "value": "0",
+      "label": "undecoded instructions"
+    },
+    {
+      "value": "8",
+      "label": "upstream PRs (#398–#405)"
+    },
+    {
+      "value": "0",
+      "label": "deaths in 5+ h soak runs"
+    },
+    {
+      "value": "360",
+      "label": "cd reads per run (past the old 270 wall)"
+    }
   ],
   "stages": [
     {
@@ -139,6 +155,11 @@
       "one_liner": "SetupThread main stack anchored at the top of RDRAM"
     },
     {
+      "name": "Dispatch-Yield Resume",
+      "status": "done",
+      "note": "yield-pending image guard — the 12-task death family extinct (0/3, was ~1/run); 6 divergence sites reverted live"
+    },
+    {
       "name": "Title→Attract Timeout",
       "status": "frontier",
       "one_liner": "the wall — post-movie circular idle; A/B vs PCSX2 is the named instrument"
@@ -157,24 +178,73 @@
   "fixes": {
     "upstream_base": "ran-j/PS2Recomp",
     "upstream": [
-      { "pr": 398, "title": "SetupThread anchor + metadata", "detail": "the automatic main stack anchored at the top of RDRAM, kernel-managed stack metadata recorded" },
-      { "pr": 399, "title": "Analyzer: 3 tiers", "detail": "data-, instruction- and table-referenced function pointers exposed as callable entry candidates" },
-      { "pr": 400, "title": "LQ/SQ 16-byte align", "detail": "EE LQ/SQ force 16-byte alignment as the hardware does" },
-      { "pr": 401, "title": "PMODE A+D", "detail": "GIF A+D 0x58 PMODE writes routed to the privileged register file" },
-      { "pr": 402, "title": "GIF DMA drain-to-END", "detail": "GIF chains drain through IRQ tags to the END-tag CHCR readback" },
-      { "pr": 403, "title": "cdvdfsv HLE + Scmd 0x27", "detail": "the cdvdfsv RPC family served from a ROM-resident HLE service" },
-      { "pr": 404, "title": "SIF bit31 sids + cid-1 reply", "detail": "temporary IOP sids (bit31) accepted; the loader queue's SifSendCmd gets its completion reply" },
-      { "pr": 405, "title": "Input script + MKB layer", "detail": "opt-in scripted input channel (PS2X_INPUT_SCRIPT) + MKB mouse-look layer" }
+      {
+        "pr": 398,
+        "title": "SetupThread anchor + metadata",
+        "detail": "the automatic main stack anchored at the top of RDRAM, kernel-managed stack metadata recorded"
+      },
+      {
+        "pr": 399,
+        "title": "Analyzer: 3 tiers",
+        "detail": "data-, instruction- and table-referenced function pointers exposed as callable entry candidates"
+      },
+      {
+        "pr": 400,
+        "title": "LQ/SQ 16-byte align",
+        "detail": "EE LQ/SQ force 16-byte alignment as the hardware does"
+      },
+      {
+        "pr": 401,
+        "title": "PMODE A+D",
+        "detail": "GIF A+D 0x58 PMODE writes routed to the privileged register file"
+      },
+      {
+        "pr": 402,
+        "title": "GIF DMA drain-to-END",
+        "detail": "GIF chains drain through IRQ tags to the END-tag CHCR readback"
+      },
+      {
+        "pr": 403,
+        "title": "cdvdfsv HLE + Scmd 0x27",
+        "detail": "the cdvdfsv RPC family served from a ROM-resident HLE service"
+      },
+      {
+        "pr": 404,
+        "title": "SIF bit31 sids + cid-1 reply",
+        "detail": "temporary IOP sids (bit31) accepted; the loader queue's SifSendCmd gets its completion reply"
+      },
+      {
+        "pr": 405,
+        "title": "Input script + MKB layer",
+        "detail": "opt-in scripted input channel (PS2X_INPUT_SCRIPT) + MKB mouse-look layer"
+      }
     ],
     "branch_only": [
-      { "name": "EE→IOP bridge wake + IOP endTimeslice" },
-      { "name": "Owner-stack invocation model" },
-      { "name": "Main-owned carve (async-callback invocation)" },
-      { "name": "Vsync-boundary deferral" },
-      { "name": "Timer/alarm delivery shaping" },
-      { "name": "Timers on wall clock" },
-      { "name": "Bounded beat replay" },
-      { "name": "The pending resume-fix", "note": "landing" }
+      {
+        "name": "EE→IOP bridge wake + IOP endTimeslice"
+      },
+      {
+        "name": "Owner-stack invocation model"
+      },
+      {
+        "name": "Main-owned carve (async-callback invocation)"
+      },
+      {
+        "name": "Vsync-boundary deferral"
+      },
+      {
+        "name": "Timer/alarm delivery shaping"
+      },
+      {
+        "name": "Timers on wall clock"
+      },
+      {
+        "name": "Bounded beat replay"
+      },
+      {
+        "name": "The pending resume-fix",
+        "note": "landing"
+      }
     ]
   },
   "links": {
