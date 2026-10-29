@@ -157,7 +157,8 @@
     {
       "name": "Dispatch-Yield Resume",
       "status": "done",
-      "note": "yield-pending image guard — the 12-task death family extinct (0/3, was ~1/run); 6 divergence sites reverted live"
+      "note": "yield-pending image guard — the 12-task death family extinct (0/3, was ~1/run); 6 divergence sites reverted live",
+      "one_liner": "yield-pending image guard: the 12-task death family extinct"
     },
     {
       "name": "Title→Attract Timeout",
