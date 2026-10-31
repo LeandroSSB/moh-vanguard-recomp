@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-10-31",
   "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
-  "status_note": "Film 6/8 STRICT and movie-era 6/8 — both M7 bars met (lineage best, zero guest crashes). One letter left: the attract — the host-crash family (our unhandled C++ exception) now takes the decisive 600s boots.",
+  "status_note": "Film up to 6/8 STRICT + movie-era 6/8 (both bars met); the host cannot die silently anymore (0/21, full 600s windows survive). One letter left: the attract — gated by the engloop-start consume gate.",
   "stats": [
     {
       "value": "18,800+",
@@ -211,9 +211,15 @@
       "one_liner": "the pump cannot capture its owner (T39)"
     },
     {
+      "name": "Host Terminate Guard",
+      "status": "done",
+      "note": "exception-safe render loop + throw-proof probe reads + self-naming catcher (T40) — 0/21 terminates; the 600s host survives the full window (first time)",
+      "one_liner": "the host cannot die silently anymore (T40)"
+    },
+    {
       "name": "Attract Gate",
       "status": "frontier",
-      "one_liner": "the last letter: the host-crash family (~29s) + the phase-4 consume gate (poster 140 vs 221) + the game-internal trample"
+      "one_liner": "the last letter: the engloop-start gate (consume=0 while the wheel fires) — T41"
     },
     {
       "name": "Audio SPU2",
