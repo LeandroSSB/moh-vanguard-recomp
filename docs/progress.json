@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-10-31",
   "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
-  "status_note": "Boot through post-movie stable, 59.94 NTSC clock, death family extinct; the front-end gate (title-to-attract) is the active research frontier.",
+  "status_note": "The EA film completes in 4/8 boots (best lineage rate, first mid-film recovery); the init driver completes 5/8. Frontier: the mid-load demand-stall class (the demand chain's re-arm at the stall).",
   "stats": [
     {
       "value": "18,800+",
@@ -25,8 +25,16 @@
       "label": "deaths in 5+ h soak runs"
     },
     {
-      "value": "360",
-      "label": "cd reads per run (past the old 270 wall)"
+      "value": "470",
+      "label": "cd reads per completor run (past the movie into post-movie load)"
+    },
+    {
+      "value": "521",
+      "label": "runtime tests green (clone + t2build)"
+    },
+    {
+      "value": "4/8",
+      "label": "boots completing the film (best lineage rate)"
     }
   ],
   "stages": [
@@ -75,9 +83,9 @@
     {
       "name": "Front-End Gate",
       "status": "current",
-      "evidence": "circular idle, decoded",
-      "evidence_full": "post-movie circular idle, decoded link-by-link (worker 0 tokens ← 0 outstanding reads; armer no-ops at gate ≠ 6)",
-      "unblocked_by": "the pending resume-fix (in flight — landing)"
+      "evidence": "film 4/8 · recovery seen",
+      "evidence_full": "the EA film completes in 4/8 boots (3/8 strict, best lineage rate) with the first mid-film stall recovery; the init driver completes 5/8; frontier: the mid-load demand-stall class",
+      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37)"
     },
     {
       "name": "Attract",
@@ -161,9 +169,39 @@
       "one_liner": "yield-pending image guard: the 12-task death family extinct"
     },
     {
-      "name": "Title→Attract Timeout",
+      "name": "MPEG Frame Loop",
+      "status": "done",
+      "note": "end-flag write + poll contract + need-data arm (T23–T28) — the movie frame-loop circle broken",
+      "one_liner": "end-flag + poll contract + need-data arm: the movie circle broken (T23–T28)"
+    },
+    {
+      "name": "Feeder/Capture",
+      "status": "done",
+      "note": "feeder-queue gate + carrier-not-main + dry-fetch episode refusal (T29–T34) — capture released; every movie-era boot that reached the era completed",
+      "one_liner": "feeder gates + dry-fetch refusal: capture released (T29–T34)"
+    },
+    {
+      "name": "RCMP Mutex",
+      "status": "done",
+      "note": "synthetic carrier tid 0x7FFF (T33) — the recursive-mutex take/release pairs; the signal leak extinct (count never passes 1)",
+      "one_liner": "carrier tid 0x7FFF: the recursive-mutex leak extinct (T33)"
+    },
+    {
+      "name": "Carrier Residency",
+      "status": "done",
+      "note": "every carrier frame bound outside main's declared stack (T35) — the boot-poison trample family extinct (was 5/14)",
+      "one_liner": "carrier frames outside main's stack: the poison family extinct (T35)"
+    },
+    {
+      "name": "Alarm Lane",
+      "status": "done",
+      "note": "next-pass delivery (T36) + accepted self-wake (T37) — the cb-table freeze dead in 9/9 boots; 64µs schedule kept",
+      "one_liner": "next-pass delivery + self-wake: the cb-freeze dead 9/9 (T36–T37)"
+    },
+    {
+      "name": "Mid-Load Demand Stall",
       "status": "frontier",
-      "one_liner": "the wall — post-movie circular idle; A/B vs PCSX2 is the named instrument"
+      "one_liner": "the demand chain's re-arm at the mid-load stall — recovery proven possible (T37 vfy7); T38 in flight"
     },
     {
       "name": "Audio SPU2",
@@ -243,8 +281,31 @@
         "name": "Bounded beat replay"
       },
       {
-        "name": "The pending resume-fix",
-        "note": "landing"
+        "name": "Dispatch-yield resume guard"
+      },
+      {
+        "name": "MPEG end-flag + poll contract + need-data arm + feeder-queue gates",
+        "note": "T23–T32"
+      },
+      {
+        "name": "RCMP recursive-mutex thread-id",
+        "note": "T33"
+      },
+      {
+        "name": "Dry-fetch episode refusal",
+        "note": "T34"
+      },
+      {
+        "name": "Carrier residency rules (band-bind extinction)",
+        "note": "T35"
+      },
+      {
+        "name": "Alarm-lane next-pass delivery",
+        "note": "T36"
+      },
+      {
+        "name": "Accepted self-wake",
+        "note": "T37"
       }
     ]
   },
