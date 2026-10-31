@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-10-31",
   "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
-  "status_note": "Film up to 6/8 STRICT + movie-era 6/8 (both bars met); the host cannot die silently anymore (0/21, full 600s windows survive). One letter left: the attract — gated by the engloop-start consume gate.",
+  "status_note": "4/8 boots finish the boot load and reach the movie region (first time); the first stall-recovery completor. The attract's last gates: the film-era handover and the ultra-early phase-2 stalls.",
   "stats": [
     {
       "value": "18,800+",
@@ -83,9 +83,9 @@
     {
       "name": "Front-End Gate",
       "status": "current",
-      "evidence": "film 6/8 · movie-era 6/8 · attract left",
-      "evidence_full": "the EA film completes 6/8 boots STRICT and movie-era reaches 6/8 (both bars met, lineage best); the pump-capture face extinct; the attract letter alone remains: the host-crash family (terminate unhandled exception) takes boots at ~29s",
-      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37); the runtime serves the overdue timer wheel (T38); the wheel-pump capture guard (T39)"
+      "evidence": "4/8 reach the movie · first recovery completor",
+      "evidence_full": "4/8 boots run the boot load to its END (phase 8) and read into the movie region — first time; the first stall-recovery completor in the lineage; frontier: the film-era handover (main dormant at poster~178 before the poster-221 engine-job handover) + phase-2 pre-read stalls",
+      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37); the runtime serves the overdue timer wheel (T38); the wheel-pump capture guard (T39); the wheel pump never nests onto a real guest thread (T41)"
     },
     {
       "name": "Attract",
@@ -207,8 +207,8 @@
     {
       "name": "Pump Capture Guard",
       "status": "done",
-      "note": "liveness gate on the wheel-pump invocation (T39) — the pump can no longer capture its owner in the JOBS helper; captured-main 0/9 boots",
-      "one_liner": "the pump cannot capture its owner (T39)"
+      "note": "liveness gate (T39) + the wheel pump diverts to the invocation carrier, never nests onto a real guest thread (T41) — captured-main 0/9, the wheel death extinct 9/9",
+      "one_liner": "the pump can never capture a guest thread (T39+T41)"
     },
     {
       "name": "Host Terminate Guard",
@@ -219,7 +219,7 @@
     {
       "name": "Attract Gate",
       "status": "frontier",
-      "one_liner": "the last letter: the engloop-start gate (consume=0 while the wheel fires) — T41"
+      "one_liner": "the last letter: the film-era handover (poster 178→221) + phase-2 pre-read stalls — T42"
     },
     {
       "name": "Audio SPU2",
