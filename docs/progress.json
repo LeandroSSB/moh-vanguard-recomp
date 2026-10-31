@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-10-31",
   "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
-  "status_note": "The EA film completes in 4/8 boots (best lineage rate, first mid-film recovery); the init driver completes 5/8. Frontier: the mid-load demand-stall class (the demand chain's re-arm at the stall).",
+  "status_note": "The EA film completes 5/8 STRICT (the bar met, lineage best; zero crashes, wheel-death extinct). The attract's last blockers: the phase-4 boot circle with the wheel alive (2/8) and the game-internal trample (the deepest 600s boot died 175 vsyncs before the flag).",
   "stats": [
     {
       "value": "18,800+",
@@ -33,8 +33,8 @@
       "label": "runtime tests green (clone + t2build)"
     },
     {
-      "value": "4/8",
-      "label": "boots completing the film (best lineage rate)"
+      "value": "5/8",
+      "label": "boots completing the film STRICT (≥4/8 bar met, lineage best)"
     }
   ],
   "stages": [
@@ -83,9 +83,9 @@
     {
       "name": "Front-End Gate",
       "status": "current",
-      "evidence": "film 4/8 · recovery seen",
-      "evidence_full": "the EA film completes in 4/8 boots (3/8 strict, best lineage rate) with the first mid-film stall recovery; the init driver completes 5/8; frontier: the mid-load demand-stall class",
-      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37)"
+      "evidence": "film 5/8 strict · bar met",
+      "evidence_full": "the EA film completes in 5/8 boots STRICT (the ≥4/8 bar met, lineage best); the wheel-death stall extinct (wheel tracks 9/9); frontier: the phase-4 boot-era circle with the wheel alive + the game-internal trample",
+      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37); the runtime serves the overdue timer wheel (T38)"
     },
     {
       "name": "Attract",
@@ -199,9 +199,15 @@
       "one_liner": "next-pass delivery + self-wake: the cb-freeze dead 9/9 (T36–T37)"
     },
     {
-      "name": "Mid-Load Demand Stall",
+      "name": "Timer Wheel Service",
+      "status": "done",
+      "note": "the runtime serves the game's overdue software timer wheel on the alarm-lane shape (T38) — the wheel-death mid-load stall extinct; wheel tracks 9/9 boots",
+      "one_liner": "the overdue wheel served: the wheel-death stall extinct (T38)"
+    },
+    {
+      "name": "Phase-4 Boot Circle",
       "status": "frontier",
-      "one_liner": "the demand chain's re-arm at the mid-load stall — recovery proven possible (T37 vfy7); T38 in flight"
+      "one_liner": "the walker/poster chain frozen with the wheel ALIVE + the game-internal trample — the attract blockers (T39)"
     },
     {
       "name": "Audio SPU2",
