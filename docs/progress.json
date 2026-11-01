@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
-  "status_note": "A 604-px band of REAL film content renders on screen (T47); the rest of the VU1-drawn mesh freezes at stale vertices. The VIF1→VU1 unpack delivery is the named last surface.",
+  "status_note": "The film-black mechanism is fixed at unit level (T48: the VIF1 straddling-UNPACK drop; partial-buffering + resume, suite 541/541). The in-vivo visual verification (logo visible?) is running.",
   "stats": [
     {
       "value": "18,800+",
@@ -29,7 +29,7 @@
       "label": "cd reads per completor run (past the movie into post-movie load)"
     },
     {
-      "value": "539",
+      "value": "541",
       "label": "runtime tests green (clone + t2build)"
     },
     {
@@ -219,8 +219,8 @@
     {
       "name": "VU1 Film Draw Path",
       "status": "partial",
-      "one_liner": "the film draws via VU1 XGKICK; a 604-px band of REAL film already renders; the vertex feed freezes (VIF1→VU1 partial delivery) — T48",
-      "note": "the film drawers now sample real texels in-vivo; remaining: per-frame tile coverage + the stub-fan read-at-drain (T47)"
+      "one_liner": "the film-black mechanism FIXED at unit level: VIF1 discarded straddling UNPACKs (HW FIFO spans transfers) — partial-buffering + resume (T48, suite 541/541)",
+      "note": "T48: processVIF1Data dropped whole any UNPACK straddling the call boundary; fix = partial-unpack buffering + stream resume; four more HW-faithful unpack quirks documented (upstream-PR material); in-vivo visual verification in flight"
     },
     {
       "name": "Audio SPU2",
