@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
-  "status_note": "M7 CLOSED (2026-10-31): handover 8/8, film strict 8/8, attract observed in telemetry (600s streaming loop), zero deaths. Next frontier: the film-era display path — flips advance 60/s but the frames are near-black; the decoded MPEG pictures are not on screen.",
+  "status_note": "First real game imagery on screen: the memory-card check renders bright after three general GS packed-path fixes (T46). The film's frame coverage (tile census + the stub-fan read-at-drain) is the last pixel letter.",
   "stats": [
     {
       "value": "18,800+",
@@ -29,7 +29,7 @@
       "label": "cd reads per completor run (past the movie into post-movie load)"
     },
     {
-      "value": "521",
+      "value": "539",
       "label": "runtime tests green (clone + t2build)"
     },
     {
@@ -90,9 +90,9 @@
     {
       "name": "Attract",
       "status": "current",
-      "evidence": "observed in telemetry · pixels next",
-      "evidence_full": "the attract era runs and lives; display config + struct + flip proven HW-identical (T45); the film's strip draws (picture pages as texture → fbp 140 → composite) render BLACK in our GS backend — presented frame 0 px >12 where PCSX2 shows the logo",
-      "unblocked_by": "the black strip draws: page pattern → measured register stream → harness assert fbp 140 non-black — T46"
+      "evidence": "first real imagery on screen",
+      "evidence_full": "the attract era runs and lives; three general GS packed-path bugs fixed (T46) — the film drawers sample real texels and the memory-card check screen renders correct and bright for the first time (10,118 px >12); remaining: the film frame's tile coverage + the stub-fan (T47)",
+      "unblocked_by": "per-frame tile coverage census + the stub-fan read-at-drain fix — T47"
     },
     {
       "name": "Menu",
@@ -218,8 +218,9 @@
     },
     {
       "name": "GS Strip Rendering",
-      "status": "frontier",
-      "one_liner": "display env PROVEN HW-identical; the film's textured strips render black into fbp 140 in our backend — T46"
+      "status": "partial",
+      "one_liner": "three general packed-path bugs fixed (XYZF2 Y-from-Z, PSM fallback, RGBAQ floats); the mem-card screen renders bright (10k px) — T46",
+      "note": "the film drawers now sample real texels in-vivo; remaining: per-frame tile coverage + the stub-fan read-at-drain (T47)"
     },
     {
       "name": "Audio SPU2",
