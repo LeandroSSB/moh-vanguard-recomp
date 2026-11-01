@@ -5,8 +5,8 @@
   "upstream_url": "https://github.com/ran-j/PS2Recomp",
   "branch": "vanguard-bringup",
   "updated": "2026-10-31",
-  "status_line": "Not playable end-to-end yet — the front-end gate is the active research frontier.",
-  "status_note": "4/8 boots finish the boot load and reach the movie region (first time); the first stall-recovery completor. The attract's last gates: the film-era handover and the ultra-early phase-2 stalls.",
+  "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
+  "status_note": "M7 CLOSED (2026-10-31): handover 8/8, film strict 8/8, attract observed in telemetry (600s streaming loop), zero deaths. Next frontier: the film-era display path — flips advance 60/s but the frames are near-black; the decoded MPEG pictures are not on screen.",
   "stats": [
     {
       "value": "18,800+",
@@ -33,8 +33,8 @@
       "label": "runtime tests green (clone + t2build)"
     },
     {
-      "value": "6/8",
-      "label": "boots completing the film STRICT (movie-era 6/8 too — both bars met)"
+      "value": "8/8",
+      "label": "boots completing the film STRICT (all of them, T42)"
     }
   ],
   "stages": [
@@ -81,18 +81,18 @@
       "unblocked_by": "timers-on-wall clock + timer/alarm shaping + bounded beat replay (branch)"
     },
     {
-      "name": "Front-End Gate",
-      "status": "current",
-      "evidence": "4/8 reach the movie · first recovery completor",
-      "evidence_full": "4/8 boots run the boot load to its END (phase 8) and read into the movie region — first time; the first stall-recovery completor in the lineage; frontier: the film-era handover (main dormant at poster~178 before the poster-221 engine-job handover) + phase-2 pre-read stalls",
-      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37); the runtime serves the overdue timer wheel (T38); the wheel-pump capture guard (T39); the wheel pump never nests onto a real guest thread (T41)"
+      "name": "Front-End Gate (protocol)",
+      "status": "done",
+      "evidence": "handover 8/8 · film 8/8 · attract observed",
+      "evidence_full": "the boot-era handover passes 8/8, the film completes 8/8 STRICT (flag+qd+rd=400), zero deaths, all windows delivered; the 600s boot lives the whole window in the attract streaming loop (poster=2688, reads=5276)",
+      "unblocked_by": "MPEG end-flag + poll contract + feeder gates (T23–T32); RCMP mutex tid (T33); dry-fetch refusal (T34); carrier band-bind extinction (T35); alarm-lane pace (T36); accepted self-wake (T37); the runtime serves the overdue timer wheel (T38); the wheel-pump capture guard (T39); the wheel pump never nests onto a real guest thread (T41); hardware-faithful mutex waiting (T42: the recursive job mutex declined-WaitSema phantom-owner fix)"
     },
     {
       "name": "Attract",
-      "status": "future",
-      "evidence": "—",
-      "evidence_full": "—",
-      "unblocked_by": "gated on the front-end gate"
+      "status": "current",
+      "evidence": "observed in telemetry · pixels next",
+      "evidence_full": "the attract era runs and lives (600s streaming loop); the display during the film/attract era shows near-black frames while flips advance 60/s — the decoded MPEG pictures are not reaching the display; the display path is the named frontier",
+      "unblocked_by": "the film-era display path (where the 639×448 pictures land vs what DISPFB reads) — T43"
     },
     {
       "name": "Menu",
@@ -217,9 +217,9 @@
       "one_liner": "the host cannot die silently anymore (T40)"
     },
     {
-      "name": "Attract Gate",
+      "name": "Film/Attract Display Path",
       "status": "frontier",
-      "one_liner": "the last letter: the film-era handover (poster 178→221) + phase-2 pre-read stalls — T42"
+      "one_liner": "film completes 8/8 but the pictures do not reach the display (near-black frames at 60 flips/s) — T43"
     },
     {
       "name": "Audio SPU2",
