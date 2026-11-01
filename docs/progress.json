@@ -91,8 +91,8 @@
       "name": "Attract",
       "status": "current",
       "evidence": "observed in telemetry · pixels next",
-      "evidence_full": "the attract era runs and lives; the film decodes HW-exactly into VRAM (the EA logo decodable from our memory at 0x348000) but the game drawer samples TEX0=4480 (the empty splash slot; HW samples 0x3c80) and the flip write never fires — the allocator divergence is the frontier (T44)",
-      "unblocked_by": "the TEX0 allocator divergence (the word + the runtime surface under it) — T44"
+      "evidence_full": "the attract era runs and lives; TEX0/packets/vertices/registers/VRAM all match HW byte-level (T44 refuted the slot theory); the flip writer 0x325654 is gated on mgr->0x98/0x34 which stay 0 the whole boot (HW: DBP 0x3000) — who writes the display-mgr config is the frontier (T45)",
+      "unblocked_by": "the display-manager config source (the writers of mgr->0x98/0x34 and their inputs) — T45"
     },
     {
       "name": "Menu",
@@ -219,7 +219,7 @@
     {
       "name": "Film/Attract Display Path",
       "status": "frontier",
-      "one_liner": "pipeline complete through VRAM (the EA logo decodes from our memory); the game drawer samples the wrong TEX0 slot — T44"
+      "one_liner": "everything matches HW byte-level; ONE door left: the display-mgr fields (mgr->0x98/0x34) that never get written — T45"
     },
     {
       "name": "Audio SPU2",
