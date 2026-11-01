@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
-  "status_note": "First real game imagery on screen: the memory-card check renders bright after three general GS packed-path fixes (T46). The film's frame coverage (tile census + the stub-fan read-at-drain) is the last pixel letter.",
+  "status_note": "A 604-px band of REAL film content renders on screen (T47); the rest of the VU1-drawn mesh freezes at stale vertices. The VIF1→VU1 unpack delivery is the named last surface.",
   "stats": [
     {
       "value": "18,800+",
@@ -91,8 +91,8 @@
       "name": "Attract",
       "status": "current",
       "evidence": "first real imagery on screen",
-      "evidence_full": "the attract era runs and lives; three general GS packed-path bugs fixed (T46) — the film drawers sample real texels and the memory-card check screen renders correct and bright for the first time (10,118 px >12); remaining: the film frame's tile coverage + the stub-fan (T47)",
-      "unblocked_by": "per-frame tile coverage census + the stub-fan read-at-drain fix — T47"
+      "evidence_full": "the attract era runs and lives; 9/9 full soak windows; the film draws via VU1 XGKICK with a 604-px band of REAL film content already rendering; the rest of the mesh freezes at stale-pattern vertices — the VIF1→VU1 unpack delivery is the named surface (T48)",
+      "unblocked_by": "the VIF1→VU1 unpack delivery (where the EE-fed vertex unpacks die) — T48"
     },
     {
       "name": "Menu",
@@ -217,9 +217,9 @@
       "one_liner": "the host cannot die silently anymore (T40)"
     },
     {
-      "name": "GS Strip Rendering",
+      "name": "VU1 Film Draw Path",
       "status": "partial",
-      "one_liner": "three general packed-path bugs fixed (XYZF2 Y-from-Z, PSM fallback, RGBAQ floats); the mem-card screen renders bright (10k px) — T46",
+      "one_liner": "the film draws via VU1 XGKICK; a 604-px band of REAL film already renders; the vertex feed freezes (VIF1→VU1 partial delivery) — T48",
       "note": "the film drawers now sample real texels in-vivo; remaining: per-frame tile coverage + the stub-fan read-at-drain (T47)"
     },
     {
