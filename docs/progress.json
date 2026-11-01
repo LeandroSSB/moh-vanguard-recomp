@@ -91,8 +91,8 @@
       "name": "Attract",
       "status": "current",
       "evidence": "observed in telemetry · pixels next",
-      "evidence_full": "the attract era runs and lives; TEX0/packets/vertices/registers/VRAM all match HW byte-level (T44 refuted the slot theory); the flip writer 0x325654 is gated on mgr->0x98/0x34 which stay 0 the whole boot (HW: DBP 0x3000) — who writes the display-mgr config is the frontier (T45)",
-      "unblocked_by": "the display-manager config source (the writers of mgr->0x98/0x34 and their inputs) — T45"
+      "evidence_full": "the attract era runs and lives; display config + struct + flip proven HW-identical (T45); the film's strip draws (picture pages as texture → fbp 140 → composite) render BLACK in our GS backend — presented frame 0 px >12 where PCSX2 shows the logo",
+      "unblocked_by": "the black strip draws: page pattern → measured register stream → harness assert fbp 140 non-black — T46"
     },
     {
       "name": "Menu",
@@ -217,9 +217,9 @@
       "one_liner": "the host cannot die silently anymore (T40)"
     },
     {
-      "name": "Film/Attract Display Path",
+      "name": "GS Strip Rendering",
       "status": "frontier",
-      "one_liner": "everything matches HW byte-level; ONE door left: the display-mgr fields (mgr->0x98/0x34) that never get written — T45"
+      "one_liner": "display env PROVEN HW-identical; the film's textured strips render black into fbp 140 in our backend — T46"
     },
     {
       "name": "Audio SPU2",
