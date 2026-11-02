@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
-  "status_note": "The VU1 data feed is byte-real and the outputs are stubs — the film black is bounded to the VU1 microprogram side (MPG delivery prime suspect, T49). Suite 541/541; 9/9 full windows.",
+  "status_note": "The presented pipeline is awake: real screens render to display (LOADING 30/30 frames, MC-check 10k px; T49, suite 543/543). One gate left for the EA logo: the film-era timing (T50).",
   "stats": [
     {
       "value": "18,800+",
@@ -29,7 +29,7 @@
       "label": "cd reads per completor run (past the movie into post-movie load)"
     },
     {
-      "value": "541",
+      "value": "543",
       "label": "runtime tests green (clone + t2build)"
     },
     {
@@ -90,9 +90,9 @@
     {
       "name": "Attract",
       "status": "current",
-      "evidence": "first real imagery on screen",
-      "evidence_full": "the attract era runs and lives; 9/9 full soak windows; the film draws via VU1 XGKICK with a 604-px band of REAL film content already rendering; the rest of the mesh freezes at stale-pattern vertices — the VIF1→VU1 unpack delivery is the named surface (T48)",
-      "unblocked_by": "the MPG microprogram delivery (straddle-class drop? code-mem A/B vs HW) — T49"
+      "evidence": "presented pipeline awake · logo next",
+      "evidence_full": "the visual pipeline works end-to-end (T49): screens render presented — LOADING 30/30 frames at ~1.9k px, the MC-check at ~10k px; the VU1 micro is proven HW-identical and HW's own snap IS the EA logo frame; the remaining gate: the film-era TIMING — boots park at LOADING/MC-check past HW's schedule (load-elastic?) — T50",
+      "unblocked_by": "the film-era timing (the LOADING→film transition gate; quiet-machine measurement) — T50"
     },
     {
       "name": "Menu",
@@ -219,7 +219,7 @@
     {
       "name": "VU1 Film Draw Path",
       "status": "partial",
-      "one_liner": "VU1 feed proven byte-real in-vivo; outputs stuck at stubs — the microprogram side: MPG delivery (the 0x4A all-or-nothing guard) — T49",
+      "one_liner": "the presented pipeline AWAKE: LOADING renders 30/30 frames (1.9k px), MC-check ~10k px; MPG+micro proven HW-identical (T49)",
       "note": "T48: processVIF1Data dropped whole any UNPACK straddling the call boundary; fix = partial-unpack buffering + stream resume; four more HW-faithful unpack quirks documented (upstream-PR material); in-vivo visual verification in flight"
     },
     {
