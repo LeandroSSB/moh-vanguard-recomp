@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
-  "status_note": "The film-black mechanism is fixed at unit level (T48: the VIF1 straddling-UNPACK drop; partial-buffering + resume, suite 541/541). The in-vivo visual verification (logo visible?) is running.",
+  "status_note": "The VU1 data feed is byte-real and the outputs are stubs — the film black is bounded to the VU1 microprogram side (MPG delivery prime suspect, T49). Suite 541/541; 9/9 full windows.",
   "stats": [
     {
       "value": "18,800+",
@@ -92,7 +92,7 @@
       "status": "current",
       "evidence": "first real imagery on screen",
       "evidence_full": "the attract era runs and lives; 9/9 full soak windows; the film draws via VU1 XGKICK with a 604-px band of REAL film content already rendering; the rest of the mesh freezes at stale-pattern vertices — the VIF1→VU1 unpack delivery is the named surface (T48)",
-      "unblocked_by": "the VIF1→VU1 unpack delivery (where the EE-fed vertex unpacks die) — T48"
+      "unblocked_by": "the MPG microprogram delivery (straddle-class drop? code-mem A/B vs HW) — T49"
     },
     {
       "name": "Menu",
@@ -219,7 +219,7 @@
     {
       "name": "VU1 Film Draw Path",
       "status": "partial",
-      "one_liner": "the film-black mechanism FIXED at unit level: VIF1 discarded straddling UNPACKs (HW FIFO spans transfers) — partial-buffering + resume (T48, suite 541/541)",
+      "one_liner": "VU1 feed proven byte-real in-vivo; outputs stuck at stubs — the microprogram side: MPG delivery (the 0x4A all-or-nothing guard) — T49",
       "note": "T48: processVIF1Data dropped whole any UNPACK straddling the call boundary; fix = partial-unpack buffering + stream resume; four more HW-faithful unpack quirks documented (upstream-PR material); in-vivo visual verification in flight"
     },
     {
