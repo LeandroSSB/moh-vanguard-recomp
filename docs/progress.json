@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "Front-end gate open in protocol — the film completes 8/8 and the attract runs; the pixels of the film era are the frontier.",
-  "status_note": "The film plays and completes (T50: timing closed, the pace loop byte-identical to HW). One pixel link left: the composite fbp140→fbp0 (T51). Suite 543/543; secondary face: the read-posting stall (3/8 tonight).",
+  "status_note": "The black film has an exact signature: strip vertices (x, 0, y-in-z, rgba=0) — real texels, real STs, scissored out. The producer is inside our surface, one dump away (T53).",
   "stats": [
     {
       "value": "18,800+",
@@ -92,7 +92,7 @@
       "status": "current",
       "evidence": "presented pipeline awake · logo next",
       "evidence_full": "the film PLAYS AND COMPLETES in healthy boots (getpic=432, qdtor 55.5s; T50 closed the timing letter — the pace loop is byte-identical to HW, the divergence is reachability); presented=0 nonblack px through the film window — the composite→fbp0 link is the isolated last gap (T51: fbp140 real? then the texture-from-framebuffer fetch; else the wash/DATE chain)",
-      "unblocked_by": "the film-era strip-draw capture (the 400-line cap fix) + the per-frame vertex writer that never fires — T52"
+      "unblocked_by": "the producer of the lane-shifted strip vertices (packet+vertex dump at the draw) — T53"
     },
     {
       "name": "Menu",
@@ -219,7 +219,7 @@
     {
       "name": "VU1 Film Draw Path",
       "status": "partial",
-      "one_liner": "composite exonerated (copies when fed); census errata fixed (544/544); the film's EE→VU1 vertex feed (dim pass + strips) is the gap — capture fix next (T52)",
+      "one_liner": "the black film has an exact signature: every strip vertex (x, 0, y-in-z, rgba=0) scissored out — produced inside our surface, one dump from the name (T53)",
       "note": "T48: processVIF1Data dropped whole any UNPACK straddling the call boundary; fix = partial-unpack buffering + stream resume; four more HW-faithful unpack quirks documented (upstream-PR material); in-vivo visual verification in flight"
     },
     {
