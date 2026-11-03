@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "The intro film PRESENTS on screen — the brightness envelope and the attract loop are the last pixels.",
-  "status_note": "The black film's root is named above the GS: the IPU never decodes — 215,040 zero bytes reach the film's textures (T54). T55 implements the decoder; everything visual waits on it. Suite 545/545.",
+  "status_note": "The IPU landed complete (TDD byte-exact, suite 558/558) and the census overturned the theory: this game decodes MPEG in SOFTWARE — the decoder runs, its output write never lands. The gated copy-out is T56's corner.",
   "stats": [
     {
       "value": "18,800+",
@@ -29,7 +29,7 @@
       "label": "cd reads per completor run (past the movie into post-movie load)"
     },
     {
-      "value": "545",
+      "value": "558",
       "label": "runtime tests green (clone + t2build)"
     },
     {
@@ -92,7 +92,7 @@
       "status": "current",
       "evidence": "root named: the IPU · T55 implements",
       "evidence_full": "The black film's root is NAMED (T54): the game reads decoded macroblocks from the IPU (0x10002000+ MMIO, FIFOs 0x10007010/20) and our runtime never decodes — 215,040 zero bytes in the film's CT24 uploads; the strips sample zeros and die at the (correct) alpha test; the movie player loops its last two frames forever without completion. Everything downstream (logo legible, film completing visually, title/menu/attract screens) waits on the IPU decoder (T55, the PCSX2 ~4k-line reference).",
-      "unblocked_by": "the IPU decoder implementation (IDEC/CSC per the PCSX2 reference) — T55"
+      "unblocked_by": "the software decoder's copy-out gate (scratch → the DMA source; the wake/flag it waits on) — T56"
     },
     {
       "name": "Menu",
@@ -218,8 +218,8 @@
     },
     {
       "name": "IPU Macroblock Decode",
-      "status": "frontier",
-      "one_liner": "THE ROOT (T54): the film's CT24 uploads are 215,040 ZERO bytes — the game reads decoded macroblocks from the IPU and our runtime records the MMIO but never decodes — T55 implements it",
+      "status": "done",
+      "one_liner": "the full IPU decoder implemented (PCSX2-faithful, TDD 23/23 byte-exact, suite 558/558) — kept for the films that use it; the census proved THIS game drives the IPU zero times (T55)",
       "note": "T48: processVIF1Data dropped whole any UNPACK straddling the call boundary; fix = partial-unpack buffering + stream resume; four more HW-faithful unpack quirks documented (upstream-PR material); in-vivo visual verification in flight"
     },
     {
