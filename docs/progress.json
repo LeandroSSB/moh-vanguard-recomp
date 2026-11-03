@@ -6,7 +6,7 @@
   "branch": "vanguard-bringup",
   "updated": "2026-11-01",
   "status_line": "The intro film PRESENTS on screen — the brightness envelope and the attract loop are the last pixels.",
-  "status_note": "THE FILM PRESENTS (T53): 285k px per film frame, the EA green bar on screen, film strict 7/8, suite 545/545. Last letters: the 127-dim brightness envelope (vs HW) and the attract-loop window.",
+  "status_note": "The black film's root is named above the GS: the IPU never decodes — 215,040 zero bytes reach the film's textures (T54). T55 implements the decoder; everything visual waits on it. Suite 545/545.",
   "stats": [
     {
       "value": "18,800+",
@@ -90,9 +90,9 @@
     {
       "name": "Attract",
       "status": "current",
-      "evidence": "the film PRESENTS · brightness next",
-      "evidence_full": "THE FILM PRESENTS (T53): full-frame real imagery in the film era — 285,504 nonblack px per frame (99.6%), 41 full-frame frames, film strict 7/8, the EA green bar visible; the packed-vertex lane rule (the PACKED XYZF2/RGBAQ lane misreads in gs_frontend.cpp) was the piece the T43-T52 lineage hunted. Remaining: the brightness envelope (the film draws at the 127-dim — the lettering reaches n40=366 bright px) + the attract-loop window",
-      "unblocked_by": "the dim-lane A/B (the 127-alpha blend vs HW) + the attract-loop 600s — T54"
+      "evidence": "root named: the IPU · T55 implements",
+      "evidence_full": "The black film's root is NAMED (T54): the game reads decoded macroblocks from the IPU (0x10002000+ MMIO, FIFOs 0x10007010/20) and our runtime never decodes — 215,040 zero bytes in the film's CT24 uploads; the strips sample zeros and die at the (correct) alpha test; the movie player loops its last two frames forever without completion. Everything downstream (logo legible, film completing visually, title/menu/attract screens) waits on the IPU decoder (T55, the PCSX2 ~4k-line reference).",
+      "unblocked_by": "the IPU decoder implementation (IDEC/CSC per the PCSX2 reference) — T55"
     },
     {
       "name": "Menu",
@@ -217,9 +217,9 @@
       "one_liner": "the host cannot die silently anymore (T40)"
     },
     {
-      "name": "VU1 Film Draw Path",
-      "status": "done",
-      "one_liner": "THE FILM PRESENTS: the packed-vertex lane rule fixed (T53) — 285,504 px per film frame, film strict 7/8, the EA green bar on screen",
+      "name": "IPU Macroblock Decode",
+      "status": "frontier",
+      "one_liner": "THE ROOT (T54): the film's CT24 uploads are 215,040 ZERO bytes — the game reads decoded macroblocks from the IPU and our runtime records the MMIO but never decodes — T55 implements it",
       "note": "T48: processVIF1Data dropped whole any UNPACK straddling the call boundary; fix = partial-unpack buffering + stream resume; four more HW-faithful unpack quirks documented (upstream-PR material); in-vivo visual verification in flight"
     },
     {
